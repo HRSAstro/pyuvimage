@@ -1,0 +1,12 @@
+numpy
+scipy
+astropy
+matplotlib
+autogalaxy
+
+[jax]
+jax
+nufftax<0.7.0,>=0.6.1
+
+[ms]
+python-casacore
