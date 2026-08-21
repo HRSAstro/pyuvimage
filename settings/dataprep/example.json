@@ -1,0 +1,6 @@
+{
+  "uid": "example",
+  "width": "30kms",
+  "outputvis": "/path/to/your/measurement_set.ms",
+  "filename_suffix": "_contsub"
+}

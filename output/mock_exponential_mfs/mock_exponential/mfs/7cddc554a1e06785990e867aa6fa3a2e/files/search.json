@@ -1,0 +1,56 @@
+{
+    "type": "instance",
+    "class_path": "autofit.non_linear.search.mle.bfgs.search.LBFGS",
+    "arguments": {
+        "iterations_per_full_update": 1e+99,
+        "gtol": 1e-05,
+        "name": "mfs",
+        "ftol": 2.220446049250313e-09,
+        "initializer": {
+            "type": "instance",
+            "class_path": "autofit.non_linear.initializer.InitializerBall",
+            "arguments": {
+                "lower_limit": 0.49,
+                "upper_limit": 0.51
+            }
+        },
+        "maxls": 20,
+        "number_of_cores": 1,
+        "maxcor": 10,
+        "silence": false,
+        "eps": 1e-08,
+        "iprint": -1.0,
+        "disp": false,
+        "live_visual_update": false,
+        "inplace": false,
+        "iterations_per_quick_update": 1e+99,
+        "unique_tag": null,
+        "tol": null,
+        "paths": {
+            "type": "instance",
+            "class_path": "autofit.non_linear.paths.directory.DirectoryPaths",
+            "arguments": {
+                "parent": null,
+                "image_path_suffix": "",
+                "identifier": "7cddc554a1e06785990e867aa6fa3a2e",
+                "unique_tag": null,
+                "path_prefix": {
+                    "type": "path",
+                    "path": "mock_exponential"
+                },
+                "is_identifier_in_paths": true,
+                "name": "mfs"
+            }
+        },
+        "initial_values": {
+            "type": "dict",
+            "arguments": {}
+        },
+        "path_prefix": {
+            "type": "path",
+            "path": "mock_exponential"
+        },
+        "maxfun": 15000,
+        "maxiter": 100
+    }
+}

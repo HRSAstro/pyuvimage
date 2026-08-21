@@ -1,0 +1,3 @@
+galaxies.source.pixelization.regularization.coefficient,    log_likelihood,          log_prior,     log_posterior,weight
+                                      9.615637987838353,252197.79852075735,-2.2633907302287786,252195.53513002713,   1.0
+                                    0.20349726378286692,  252197.847780678, 1.5921027199743205,252199.43988339798,   1.0

@@ -1,0 +1,105 @@
+{
+    "type": "collection",
+    "arguments": {
+        "galaxies": {
+            "type": "collection",
+            "arguments": {
+                "lens": {
+                    "class_path": "autogalaxy.galaxy.galaxy.Galaxy",
+                    "type": "instance",
+                    "arguments": {
+                        "redshift": {
+                            "type": "Constant",
+                            "value": 0.5
+                        },
+                        "mass": {
+                            "class_path": "autogalaxy.profiles.mass.total.power_law.PowerLaw",
+                            "type": "instance",
+                            "arguments": {
+                                "centre": {
+                                    "type": "tuple",
+                                    "values": [
+                                        0.0,
+                                        0.0
+                                    ]
+                                },
+                                "ell_comps": {
+                                    "type": "tuple",
+                                    "values": [
+                                        0.0,
+                                        0.0
+                                    ]
+                                },
+                                "einstein_radius": {
+                                    "type": "Constant",
+                                    "value": 0.0
+                                },
+                                "slope": {
+                                    "type": "Constant",
+                                    "value": 2.0
+                                }
+                            }
+                        },
+                        "shear": {
+                            "class_path": "autogalaxy.profiles.mass.sheets.external_shear.ExternalShear",
+                            "type": "instance",
+                            "arguments": {
+                                "gamma_1": {
+                                    "type": "Constant",
+                                    "value": 0.0
+                                },
+                                "gamma_2": {
+                                    "type": "Constant",
+                                    "value": 0.0
+                                }
+                            }
+                        }
+                    }
+                },
+                "source": {
+                    "class_path": "autogalaxy.galaxy.galaxy.Galaxy",
+                    "type": "model",
+                    "arguments": {
+                        "redshift": {
+                            "type": "Constant",
+                            "value": 1.0
+                        },
+                        "pixelization": {
+                            "class_path": "autoarray.inversion.pixelization.Pixelization",
+                            "type": "model",
+                            "arguments": {
+                                "mesh": {
+                                    "class_path": "autoarray.inversion.mesh.mesh.rectangular_uniform.RectangularUniform",
+                                    "type": "instance",
+                                    "arguments": {
+                                        "shape": {
+                                            "type": "tuple",
+                                            "values": [
+                                                40,
+                                                40
+                                            ]
+                                        },
+                                        "bandwidth": null,
+                                        "n_knots": null
+                                    }
+                                },
+                                "regularization": {
+                                    "class_path": "autoarray.inversion.regularization.constant.Constant",
+                                    "type": "model",
+                                    "arguments": {
+                                        "coefficient": {
+                                            "type": "LogUniform",
+                                            "id": 13,
+                                            "lower_limit": 0.0001,
+                                            "upper_limit": 1000000.0
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

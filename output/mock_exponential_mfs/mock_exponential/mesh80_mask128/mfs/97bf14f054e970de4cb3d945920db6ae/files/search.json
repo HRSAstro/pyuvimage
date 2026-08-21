@@ -1,0 +1,56 @@
+{
+    "type": "instance",
+    "class_path": "autofit.non_linear.search.mle.bfgs.search.LBFGS",
+    "arguments": {
+        "maxcor": 10,
+        "initial_values": {
+            "type": "dict",
+            "arguments": {}
+        },
+        "paths": {
+            "type": "instance",
+            "class_path": "autofit.non_linear.paths.directory.DirectoryPaths",
+            "arguments": {
+                "parent": null,
+                "is_identifier_in_paths": true,
+                "identifier": "97bf14f054e970de4cb3d945920db6ae",
+                "unique_tag": "mesh80_mask128",
+                "name": "mfs",
+                "path_prefix": {
+                    "type": "path",
+                    "path": "mock_exponential"
+                },
+                "image_path_suffix": ""
+            }
+        },
+        "name": "mfs",
+        "inplace": false,
+        "live_visual_update": false,
+        "maxfun": 15000,
+        "eps": 1e-08,
+        "number_of_cores": 1,
+        "ftol": 2.220446049250313e-09,
+        "iprint": -1.0,
+        "disp": false,
+        "gtol": 1e-05,
+        "initializer": {
+            "type": "instance",
+            "class_path": "autofit.non_linear.initializer.InitializerBall",
+            "arguments": {
+                "upper_limit": 0.51,
+                "lower_limit": 0.49
+            }
+        },
+        "unique_tag": "mesh80_mask128",
+        "iterations_per_quick_update": 1e+99,
+        "path_prefix": {
+            "type": "path",
+            "path": "mock_exponential"
+        },
+        "tol": null,
+        "silence": false,
+        "iterations_per_full_update": 1e+99,
+        "maxiter": 150,
+        "maxls": 20
+    }
+}

@@ -1,0 +1,37 @@
+{
+  "config_path": "./config",
+  "output_path": "./output/example_cube/",
+  "data_directory": "./data/example",
+  "uids": ["example"],
+  "width": "30kms",
+  "data_patterns": {
+    "frequencies": "frequencies_{uid}_width_{width}_contsub.fits",
+    "uv_wavelengths": "uv_wavelengths_{uid}_width_{width}_contsub.fits",
+    "visibilities": "visibilities_{uid}_width_{width}_contsub.fits",
+    "sigma": "sigma_statwt_{uid}_width_{width}_contsub.fits"
+  },
+  "mode": "cube",
+  "fov": 5.0,
+  "source_pixel_scale": "nyquist",
+  "mask_n_pixels": 40,
+  "transformer": "dft",
+  "mesh_type": "rectangular_uniform",
+  "regularization": {
+    "type": "constant",
+    "prior_type": "log_uniform",
+    "lower_limit": 1e-2,
+    "upper_limit": 1e6
+  },
+  "cube": {
+    "regularization": "from_mfs"
+  },
+  "search": {
+    "path_prefix": "example_cube",
+    "name": "cube",
+    "optimizer": "LBFGS",
+    "maxiter": 200,
+    "figure_of_merit": "log_likelihood_with_regularization"
+  },
+  "use_positive_only_solver": true,
+  "use_jax": true
+}

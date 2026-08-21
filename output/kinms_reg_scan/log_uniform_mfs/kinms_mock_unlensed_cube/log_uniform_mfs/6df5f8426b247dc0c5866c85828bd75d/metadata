@@ -1,0 +1,3 @@
+name=log_uniform_mfs
+non_linear_search=lbfgs
+            

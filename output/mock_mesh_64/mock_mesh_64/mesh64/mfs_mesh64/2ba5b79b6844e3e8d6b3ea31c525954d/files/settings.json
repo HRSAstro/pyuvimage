@@ -1,0 +1,14 @@
+{
+    "type": "instance",
+    "class_path": "autoarray.settings.Settings",
+    "arguments": {
+        "use_border_relocator": true,
+        "nnls_solver_tol": null,
+        "log_det_method": "cholesky",
+        "use_mixed_precision": false,
+        "use_edge_zeroed_pixels": true,
+        "use_positive_only_solver": true,
+        "no_regularization_add_to_curvature_diag_value": 0.001,
+        "nnls_max_iter": null
+    }
+}

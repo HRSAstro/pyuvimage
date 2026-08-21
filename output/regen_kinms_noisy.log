@@ -1,0 +1,42 @@
+2026-08-20 11:34:04,610 - jax._src.xla_bridge - INFO - Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: dlopen(libtpu.so, 0x0001): tried: 'libtpu.so' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibtpu.so' (no such file), '/Users/hstacey/packages/miniforge3/envs/autolens_native/bin/../lib/libtpu.so' (no such file), '/usr/lib/libtpu.so' (no such file, not in dyld cache), 'libtpu.so' (no such file)
+2026-08-20 11:34:05,517 - GalPaK: PSF - WARNING - Package "maoppy" is not installed [not required]. Cannot use MAOPPY PSF model.
+2026-08-20 11:34:05,901 - GalPaK: Plots - INFO - bottleneck (optional) not installed, performances will be degraded
+2026-08-20 11:34:06,115 - GalPaK - INFO -  bottleneck (optional) not installed, performances will be degraded
+2026-08-20 11:34:06,116 - GalPaK - INFO -  PyFFTW (optional) not installed, performances will be degraded
+2026-08-20 11:34:06,116 - GalPaK - WARNING -  MPDAF (optional) not installed / not required
+2026-08-20 11:34:06,116 - GalPaK - INFO - Found EMCEE version 3.1.6
+2026-08-20 11:34:06,116 - GalPaK - WARNING - EMCEE tested for version > 3.0
+2026-08-20 11:34:06,156 - GalPaK - INFO - Found Dynesty version 2.1.5 
+ EXPERIMENTAL and UNSUPPORTED
+2026-08-20 11:34:06,157 - GalPaK - WARNING -  PyMultinest (optional) not installed / not required. 
+2026-08-20 11:34:06,159 - GalPaK - INFO -  Running galpak 1.34.0
+
+=== Generate unlensed mock visibilities ===
+
+  template = data/kinms_mock_pixelized (uid=kinms_mock)
+  output   = /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy (uid=kinms_mock_unlensed)
+  lensing.enabled = False
+  θ_E      = 0.0
+  add_noise = True
+  noise_scale = 1.0
+  pad_channels_each_side = 4
+  padded spectral axis by ±4 channels -> n_chan=24, half-width≈359.8 km/s
+  wrote /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy/frequencies_kinms_mock_unlensed_width_30kms_contsub.fits
+  wrote /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy/uv_wavelengths_kinms_mock_unlensed_width_30kms_contsub.fits
+  wrote /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy/sigma_statwt_kinms_mock_unlensed_width_30kms_contsub.fits
+Analysis spectral conventions: flip_velocity_axis=False (settings=set; source cubes are Autolens-native — no y-flip in lensing)
+  injected Gaussian noise (seed=0, amplitude=1.0×σ)
+  wrote /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy/visibilities_kinms_mock_unlensed_width_30kms_contsub.fits
+  wrote /Users/hstacey/Work/pyuvimage_dev/data/kinms_mock_unlensed_noisy/frozen_source_cube.npy
+Analysis spectral conventions: flip_velocity_axis=False (settings=set; source cubes are Autolens-native — no y-flip in lensing)
+
+=== Unlensed truth diagnostics ===
+
+  source cubes Autolens-native (no lensing y-flip)
+  flip_velocity = False
+  θ_E = 0.0
+  plots -> /Users/hstacey/Work/pyuvimage_dev/output/kinms_mock_unlensed_noisy_gen
+  frozen cube:  chi2/N=9.993776e-01  logL=446858.31
+  regenerated:  chi2/N=0.999378  logL=446858.31  cube_corr=0.5328
+
+  Done. Inspect plots under /Users/hstacey/Work/pyuvimage_dev/output/kinms_mock_unlensed_noisy_gen

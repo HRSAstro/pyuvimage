@@ -1,0 +1,47 @@
+{
+  "config_path": "./config",
+  "output_path": "./output/mock_exponential_faint1000x_logsky/",
+  "data_directory": "./data/mock_exponential_faint1000x",
+  "uids": ["mock_exponential"],
+  "width": "mfs",
+  "data_patterns": {
+    "frequencies": "frequencies_{uid}_width_{width}_contsub.fits",
+    "uv_wavelengths": "uv_wavelengths_{uid}_width_{width}_contsub.fits",
+    "visibilities": "visibilities_{uid}_width_{width}_contsub.fits",
+    "sigma": "sigma_statwt_{uid}_width_{width}_contsub.fits"
+  },
+  "mode": "mfs",
+  "reconstructor": "log_sky",
+  "fov": 2.5,
+  "source_pixel_scale": "nyquist",
+  "mesh_type": "rectangular_uniform",
+  "mesh_shape": [40, 40],
+  "mask_n_pixels": 64,
+  "mask_pad_pixels": 28,
+  "transformer": "nufft",
+  "log_sky": {
+    "i0": "auto",
+    "smooth": 3000.0,
+    "maxiter": 5000,
+    "pixel_scale": "mask",
+    "edge_frac": 0.1,
+    "edge_prior": 300000.0
+  },
+  "regularization": {
+    "type": "constant",
+    "prior_type": "fixed",
+    "value": 100.0
+  },
+  "search": {
+    "path_prefix": "mock_exponential_faint1000x",
+    "name": "logsky",
+    "optimizer": "LBFGS",
+    "maxiter": 100,
+    "figure_of_merit": "log_likelihood_with_regularization",
+    "number_of_cores": 1
+  },
+  "use_positive_only_solver": true,
+  "use_edge_zeroed_pixels": true,
+  "use_border_relocator": false,
+  "use_jax": true
+}

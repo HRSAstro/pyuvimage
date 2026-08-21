@@ -1,0 +1,10 @@
+Generating initial samples of model using JAX LH Function cores
+Initial samples generated, starting non-linear search
+Starting new L-BFGS-B non-linear search (no previous samples found).
+Visualizing Starting Point Model in image_start folder.
+JAX: Applying jit to likelihood function -- may take a few seconds.
+JAX: jit applied in 0.0001418590545654297 seconds.
+Fit Running: Updating results (see output folder).
+Samples with weight less than 1e-10 removed from samples.csv.
+Creating latent samples by drawing 100 from the PDF.
+Drawing via PDF not available for this search, using all samples above the samples weight threshold instead.
