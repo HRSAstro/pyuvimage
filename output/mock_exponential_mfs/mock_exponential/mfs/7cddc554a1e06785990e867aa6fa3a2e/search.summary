@@ -1,7 +1,0 @@
-Total Samples = 14
-Time To Run = 0:00:07.248432
-Time Per Sample (seconds) = 0.5177451542445591
-Log Likelihood Function Evaluation Time (seconds) = 0.4338998794555664
-Expected Time To Run (seconds) = 0:00:06.074598
-Speed Up Factor (e.g. due to parallelization) = 0.8380568192394954
-Visualization Time (seconds) = 6.9141387939453125e-06
