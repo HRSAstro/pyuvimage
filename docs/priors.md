@@ -91,7 +91,7 @@ finer product grid, where the block-replicated model saturates around 0.9.
 model of the variants tested without overfitting, and — the decisive
 measurement — it removes a central residual that `gibbs` leaves behind and
 that does *not* scale with source brightness (see "Reading the residual
-map" in the README).
+map" in `design-notes.md`).
 `gibbs` shortens the prior's correlation *length* where the source is bright,
 which strengthens the penalty there and suppresses the peak; `adaptive`
 loosens the prior's *amplitude* instead. On a single bright compact peak
@@ -138,7 +138,7 @@ That last line is why `gibbs` was briefly the default. It is still the right
 choice for a single bright compact feature, but it buys that sharpness by
 strengthening the prior at the source centre, and on an extended source that
 leaves a central residual which does not scale with brightness (see "Reading
-the residual map"). `adaptive` with power 2 does not, so it is the default;
+the residual map" in `design-notes.md`). `adaptive` with power 2 does not, so it is the default;
 `--reg gibbs` is one flag away.
 
 These are one mock and one noise realisation; differences of ~0.01 in

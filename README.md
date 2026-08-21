@@ -153,27 +153,6 @@ chi^2 target, because the residual is then model error rather than sky.
 
 Details: [docs/point-sources.md](docs/point-sources.md).
 
-## Reading the residual map
-
-**A residual quoted in sigma means nothing on its own.** A regularised model
-under-fits a bright compact peak by some *fraction* of that peak, and a
-fraction of a very bright peak is a lot of sigma. Every run prints the context:
-
-```
-peak brightness 0.00632 Jy/beam = 1095 sigma; largest residual 4.0 sigma
-  = 0.37% of the peak (dynamic range 274:1)
-```
-
-and `summary.png` states it in the residual panel's title. CLEAN behaves the
-same way.
-
-**A residual that does *not* scale with the source is a different problem.**
-If you halve the source brightness and the residual stays put in sigma, it is
-the prior, not the dynamic range. That is how `adaptive` became the default:
-the `gibbs` prior leaves a central residual flat at ~9-10 sigma across a factor
-of ten in source flux, where `adaptive` leaves ~1 sigma. If you see one, try
-`--reg adaptive` (if you have moved off it) and `--point-sources`.
-
 ## Troubleshooting
 
 **`AttributeError: partially initialized module 'jax' has no attribute
@@ -199,21 +178,16 @@ these docs was measured on it.
 
 ## When not to trust a fit
 
-- **`chi^2/N` well above 1.** The model cannot represent the data. Almost
-  always `--fov` is too small for the emission. The run says so loudly and
-  refuses to fit point sources.
-- **More model pixels than data points.** Faint structure is then set by the
-  prior rather than the data, and the residual map can sit below the noise even
-  at `chi^2/N = 1`. pyuvimage warns. Real datasets are nowhere near this, but
-  sparse or heavily-averaged data can be.
+- **`chi^2/N` well above 1.** The model cannot represent the data. The run
+  says so loudly and refuses to fit point sources.
+- **Sparsely sampled uv plane.** In cases where the uv plane is very sparsely
+  sampled, faint structure is then set by the prior rather than the data.
+  pyuvimage gives a warning in this case.
 - **The mask edge.** On mocks the largest residual is often at the mask
   boundary rather than the source: edge mesh pixels are poorly constrained and
   absorb flux. Judge a fit from the interior.
-- **A point on top of bright compact extended emission** is genuinely
-  degenerate with it; it can come back under-flux or be missed entirely.
 - **A "the non-negative solver is unreliable" warning.** Positivity has been
-  disabled for that fit and the model may contain small negative values. This
-  is an upstream solver problem, detected rather than hidden.
+  disabled for that fit and the model may contain small negative values.
 
 ## Run time
 
@@ -269,12 +243,13 @@ resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
 
 ## Caveats
 
-- Stokes I only; w-term neglected (small-field approximation); single
-  field/spw per dataset.
-- Total flux is only constrained down to the shortest measured baseline:
-  emission resolved out by the array cannot be recovered (same as CLEAN).
-- Everything is validated on simulated data so far, with 400-1200 visibilities.
-  Validation on a real measurement set is the main outstanding risk.
+- Only Stokes I is currently supported.
+- Only single field and single spws are currently supported.
+- The w-term is neglected (small-field approximation), so very large fields are
+  not supported.
+- Total flux cannot be resolved beyond the maximum recovery scale of the data
+  set, which is determined by the baseline length distribution: emission
+  resolved out by the array cannot be recovered (same as CLEAN).
 
 ## Further reading
 
@@ -284,7 +259,7 @@ resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
 | [docs/uncertainty.md](docs/uncertainty.md) | the uncertainty map in full, with the Monte Carlo validation |
 | [docs/point-sources.md](docs/point-sources.md) | how delta components are solved, and the detection guards |
 | [docs/generalisation.md](docs/generalisation.md) | the generalisation suite: a crowded field, four arrays, three noise levels |
-| [docs/design-notes.md](docs/design-notes.md) | the grid trap, under-constrained fits, and other things that bite |
+| [docs/design-notes.md](docs/design-notes.md) | the grid trap, reading the residual map, under-constrained fits, and other things that bite |
 
 ## Development
 
