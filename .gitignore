@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# pyuvimage outputs
+pyuvimage_out/
+pyuvimage_demo/
+*.fits
+!figures/*.fits
+
+# transfer scratch (this is what got committed by accident)
+_to_delete_tmp/
+*.tgz

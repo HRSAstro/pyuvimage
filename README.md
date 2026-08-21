@@ -18,6 +18,8 @@ the noise level rather than through it, with nothing to tune by hand.
 pip install -e .            # core (numpy backend)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax: strongly recommended above ~10^4 vis
+                            #   (if JAX misbehaves, see Troubleshooting below —
+                            #    the NumPy path is fully supported)
 ```
 
 Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
@@ -171,6 +173,29 @@ the prior, not the dynamic range. That is how `adaptive` became the default:
 the `gibbs` prior leaves a central residual flat at ~9-10 sigma across a factor
 of ten in source flux, where `adaptive` leaves ~1 sigma. If you see one, try
 `--reg adaptive` (if you have moved off it) and `--point-sources`.
+
+## Troubleshooting
+
+**`AttributeError: partially initialized module 'jax' has no attribute
+'version'`** (or any other crash mentioning jax). Your JAX install is broken,
+not pyuvimage. The PyAuto libraries decide whether JAX exists by looking for it
+on disk rather than importing it, so a broken install passes that check and
+then fails deep inside a fit.
+
+pyuvimage now detects this at startup, falls back to the NumPy path, and tells
+you. To fix JAX itself, in the environment you run pyuvimage from:
+
+```bash
+python -c 'import jax; print(jax.__version__)'   # see the real error
+pip uninstall -y jax jaxlib jax-metal
+pip install -U 'jax[cpu]'                        # a matched jax/jaxlib pair
+```
+
+A jax/jaxlib version mismatch is the usual cause; on Apple silicon the
+`jax-metal` plugin is another; mixing conda-forge and pip installs of jax in one
+environment does it too. If you would rather not use JAX, `pip uninstall jax
+jaxlib` is a clean answer — the NumPy path is fully supported and everything in
+these docs was measured on it.
 
 ## When not to trust a fit
 

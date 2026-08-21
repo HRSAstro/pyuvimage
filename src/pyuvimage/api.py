@@ -107,6 +107,9 @@ def run(
         dish_diameter: antenna diameter [m] for the primary beam; defaults to
             the value stored at import.
     """
+    from ._jax_guard import report_if_disabled
+
+    report_if_disabled()
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
     uvd = dataset if isinstance(dataset, UVData) else UVData.read(dataset)

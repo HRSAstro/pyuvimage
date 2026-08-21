@@ -162,6 +162,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
+    from ._jax_guard import report_if_disabled
+
+    report_if_disabled()
+
     if args.command == "import":
         from .ms_import import import_ms
 
