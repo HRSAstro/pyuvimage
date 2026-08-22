@@ -26,7 +26,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | Parameter | Default | Meaning |
 |---|---|---|
 | `--fov` | *required* | Full field of view in arcsec. Must cover all emission. |
-| `--pixel-scale` | **auto** | Pixel scale of *every* product: `auto` = half-Nyquist (`0.25/b_max`, ~4 pixels per beam, the usual imaging convention), `nyquist` = `0.5/b_max` (~2 per beam, ~4x cheaper), or a value in arcsec. |
+| `--pixel-scale` | **auto** | Model-mesh scale. `auto` = `0.5/b_95`, Nyquist of the baseline 95% of unflagged samples fall within — what the bulk of the data actually supports. `nyquist` = `0.5/b_max`, Nyquist of the *longest* baseline: finer, several times slower, and more mesh than a sparse long-baseline tail can constrain. `fine` = half that again. Or a value in arcsec. Products are written on a grid `--oversample` times finer, so they are always finer than the mesh. |
 | `--mesh` | derived | Mesh pixels per side; overrides `--pixel-scale`. |
 | (oversample) | **2** | Image grid / model mesh ratio. Products are written on a grid twice as fine as the model mesh. It must be >1: see "the grid trap" in `design-notes.md`. |
 | `mask_shape` | **square** | Reconstruction region. A circular mask leaves the mesh's corner pixels covering no image pixels, so no data constrains them and the prior alone sets their value — worth ~29% of the source flux in spurious corner blobs on one test. |
@@ -54,5 +54,6 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
 | `--transformer` | **auto** | `dft` below 20k visibilities, else `nufft` (JAX). |
 | `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with the prior frozen from the MFS fit. |
-| `--noise` (on `pyuvimage import`) | **difference** | Noise from pairwise time-differenced visibilities; `sigma` trusts the MS column instead. |
+| `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
+| `--noise` (on `pyuvimage import`) | **difference** | How the per-visibility noise is set. MS weights are relative, not absolute, so the scale is recomputed from the data either way. `difference`: time-difference each baseline, ignoring the weight column. `scaled`: keep the `WEIGHT`/`WEIGHT_SPECTRUM` shape (Tsys, band edges, atmospheric lines) and take only the scale from the differences — better when baselines have few integrations. `sigma`: trust the `SIGMA` column as absolute, and warn. Every import prints the ratio between the column and the data. |
 | `--dish-diameter`, `--no-pb` | from MS | Gaussian primary beam, FWHM = `1.13 lambda/D`. |

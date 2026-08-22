@@ -28,8 +28,9 @@ Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
 ## Use
 
 ```bash
-# one-off: convert the measurement set (calibrated data, one field/spw)
-pyuvimage import obs.ms mydata/
+# one-off: convert the measurement set (calibrated data, one field)
+pyuvimage import obs.ms mydata/            # spw 0
+pyuvimage import obs.ms mydata/ --spw all  # or every spectral window
 
 # reconstruct — fov must cover ALL the emission in the field
 pyuvimage fit mydata/ --fov 3.0
@@ -39,7 +40,8 @@ No python-casacore? Export the target data from CASA with the bundled script,
 then fit the `.npz` directly:
 
 ```bash
-casa --nologger --nogui -c src/pyuvimage/casa_export.py obs.ms mydata.npz
+# field 0, spw 0; spw may also be a list (0,2), a range (0-3), or "all"
+casa --nologger --nogui -c src/pyuvimage/casa_export.py obs.ms mydata.npz 0 all
 pyuvimage fit mydata.npz --fov 3.0
 ```
 
@@ -84,7 +86,7 @@ meant to be left alone. These are the ones worth reaching for:
 | `--reg gibbs` | a single bright compact feature you want as sharp as possible (see [docs/priors.md](docs/priors.md)) |
 | `--reg gaussian` | very sparse visibilities, where a stationary prior lets sidelobes leak into the model |
 | `--point-sources` | there is a genuine point source in the field — no pixel grid can represent one |
-| `--pixel-scale nyquist` | a quick look, or a small machine: ~4× cheaper |
+| `--pixel-scale nyquist` | you want the longest baselines sampled — finer mesh, several times slower, and only worth it if the long baselines are well populated |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
 | `--mode cube` | per-channel images instead of one MFS image |
 
@@ -153,6 +155,43 @@ chi^2 target, because the residual is then model error rather than sky.
 
 Details: [docs/point-sources.md](docs/point-sources.md).
 
+## Several spectral windows
+
+`--spw` takes one window (`0`), a list or range (`0,2`, `0-3`), or `all`.
+Multiple windows are imported into one dataset and imaged together by
+multifrequency synthesis as a single image:
+
+```bash
+pyuvimage import obs.ms mydata/ --spw all
+pyuvimage fit mydata/ --fov 3.0
+```
+
+Nothing is averaged or resampled to make them fit together. Every visibility
+already carries its own (u, v) computed at its own channel frequency, so
+combining windows is the same operation the single-window path has always
+performed across channels — splitting a dataset into spectral windows and
+imaging it gives a bit-identical image, which is a regression test.
+
+Windows keep their own channels, their own rows and their own noise estimate,
+because in a measurement set all three differ between them. On disk the
+dataset becomes `spw000/`, `spw001/`, ...; single-window datasets written
+before this keep working unchanged.
+
+**MFS fits one frequency-independent image.** That is mild within one window
+and can be strong across several: at fractional bandwidth *B*, a source with
+spectral index α is mis-modelled by roughly |α|·*B* across the band — about
+40% for α = −0.7 over a 2:1 frequency range. pyuvimage has no Taylor-term
+expansion (CLEAN's `mtmfs`), so it warns above 20% fractional bandwidth and
+leaves the judgement to you. The fit will still reach its chi^2 target by
+absorbing the spectral structure into the image; read the result as a
+band-averaged sky, and image the windows separately if you need spectra.
+
+`--mode cube` also works across windows: channels are ordered by frequency and
+fitted independently. Their spacing is then irregular, which a linear FITS
+frequency axis cannot express, so the true per-plane frequencies are written to
+the header as `FRQ0000...` and to `frequencies.json`, and `FREQIRR` marks that
+`CDELT3` is only indicative.
+
 ## Troubleshooting
 
 **`AttributeError: partially initialized module 'jax' has no attribute
@@ -178,6 +217,27 @@ these docs was measured on it.
 
 ## When not to trust a fit
 
+- **A structure ratio above ~1.5.** Every run prints one:
+
+  ```
+  residual map rms 4.28 sigma against 1.00 expected for white noise
+  at chi2/N = 1.008: structure ratio 4.28
+  ```
+
+  If the residual visibilities were noise, the residual dirty image would have
+  rms `sqrt(chi^2/N)` in sigma, because incoherent residuals average down as
+  `1/sqrt(N)`. Coherent residuals — sky the model failed to reproduce — add in
+  phase instead and land `sqrt(N)` higher. So the ratio says whether what is
+  left over is *noise or signal*, which `chi^2` cannot: **`chi^2` constrains
+  the residual's total power, not its structure**, and a fit can sit exactly on
+  `chi^2/N = 1` with the whole source still in `residual.fits`.
+
+  This is the single most useful number the tool prints. It caught a noise map
+  inflated 1.4x by a bug in the export, on a fit whose `chi^2/N` read 1.0076.
+  The usual cause is a noise map that **over**estimates the noise, which stops
+  the fit early; also check `--fov` and whether the source has structure finer
+  than the model pixel scale.
+
 - **`chi^2/N` well above 1.** The model cannot represent the data. The run
   says so loudly and refuses to fit point sources.
 - **Sparsely sampled uv plane.** In cases where the uv plane is very sparsely
@@ -200,7 +260,10 @@ Rough CPU figures (2 cores, NumPy backend, no JAX) for a single-channel fit:
 | 4096 (64x64) | ~5 min |
 
 Point detection adds ~1 s per candidate, and the retune iteration 10-60 s.
-`--pixel-scale nyquist` is ~4x cheaper than the default. For real work install
+Cost is set by the mesh, which `--pixel-scale auto` sizes from the baseline
+95% of samples fall within. `--pixel-scale nyquist` sizes it from the *longest*
+baseline instead: on an array with a sparse long-baseline tail that can be
+several times finer and tens of times slower. For real work install
 `pyuvimage[jax]`, which is where this stack is designed to run.
 
 **Averaging the data down first is usually the bigger win.** The fit cost
@@ -224,11 +287,45 @@ Both effects are worst at the field edge, so size them for the most distant
 emission you care about, not for the phase centre. Averaging past those limits
 resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
 
+## Noise and the MS weights
+
+**The noise is recomputed on every import.** `SIGMA` is nominally
+`1/√(2Δν Δt)` — an absolute number — but that only holds if the calibration
+put it on an absolute scale. In practice a pipeline sets weights *proportional*
+to the true inverse variance without being equal to it, and every `split`,
+`mstransform` or averaging step rescales them again. See the
+[CASA memo on data weights](https://casa.nrao.edu/Memos/CASA-data-weights.pdf).
+
+This matters more than it sounds. Everything downstream scales with σ: `χ²`,
+the discrepancy criterion that chooses how much to smooth, and every
+uncertainty in `uncertainty.fits`. A weight column off by 40% stops the fit
+early and leaves real emission in the residual — which is exactly what
+happened on the first dataset this was tried on.
+
+Every import prints the comparison, whichever mode you use:
+
+```
+noise check: MS weights imply median sigma 5.111e-03 Jy,
+time-differenced visibilities give 3.696e-03 Jy (ratio 1.383)
+```
+
+| `--noise` | what it does |
+|---|---|
+| **`difference`** (default) | Times-differences each baseline; ignores the weight column entirely. Falls back to one pooled value for baselines with too few integrations to measure their own σ. |
+| `scaled` | Keeps the **shape** of `WEIGHT` / `WEIGHT_SPECTRUM` — which does carry real Tsys, band-edge and atmospheric structure — and takes only the **scale** from the same time differences. Better than `difference` when baselines have few integrations, since the per-baseline and per-channel structure survives. It assumes the column's shape is right; if you don't believe that, use `difference`. |
+| `sigma` | Trusts the column as an absolute level. Warns, because it usually isn't one. |
+
+`WEIGHT_SPECTRUM` is used when present, for both the Stokes I average and the
+noise shape; without it every channel in a row shares one weight, which is
+wrong at the edges of any real spw.
+
 ## How it works
 
 1. **Import** forms Stokes I from the parallel hands (respecting flags) and
-   estimates per-visibility noise from pairwise time-differenced visibilities
-   on each baseline (σ = std(diff)/√2) — no reliance on the MS weights.
+   **recomputes the per-visibility noise from the data**, by differencing
+   visibilities adjacent in time on the same baseline (σ = std(diff)/√2). The
+   MS weight column is never trusted for scale — see *Noise and the MS weights*
+   below.
 2. **MFS** fits all channels jointly, each with its exact uv coordinates in
    wavelengths (no channel-averaging approximation). **Cube** mode fits each
    channel with the regularisation frozen from an MFS fit.
@@ -244,7 +341,7 @@ resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
 ## Caveats
 
 - Only Stokes I is currently supported.
-- Only single field and single spws are currently supported.
+- Only a single field is currently supported; several spectral windows can be imaged together (see below).
 - The w-term is neglected (small-field approximation), so very large fields are
   not supported.
 - Total flux cannot be resolved beyond the maximum recovery scale of the data

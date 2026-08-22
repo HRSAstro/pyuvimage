@@ -26,6 +26,12 @@ logger = logging.getLogger("pyuvimage")
 # The DFT is exact but O(n_vis * n_pix); beyond this many visibilities the
 # NUFFT (JAX-based) is required for sane runtimes.
 DFT_MAX_VIS = 20_000
+# The direct DFT builds n_image_pixels x n_vis float64 temporaries, so its cost
+# is the *product*, not either factor. 2e8 elements is ~1.6 GB per temporary.
+# Found the hard way on the first well-formed real dataset: 5158 visibilities
+# (well under DFT_MAX_VIS) on a 30" field at 0.19" resolution is 384400 image
+# pixels, and autoarray asked the OS for 14.8 GB.
+DFT_MAX_PRODUCT = 2e8
 
 REGULARIZATIONS = ("gibbs", "adaptive", "matern", "gaussian", "exponential", "constant")
 
@@ -74,22 +80,41 @@ def jax_available() -> bool:
         return False
 
 
-def resolve_transformer(n_vis: int, transformer: str = "auto"):
-    """Pick the Fourier transform implementation."""
+def resolve_transformer(
+    n_vis: int, transformer: str = "auto", n_image_pixels: int | None = None
+):
+    """Pick the Fourier transform implementation.
+
+    ``n_image_pixels`` matters as much as ``n_vis``: the direct DFT allocates
+    ``n_image_pixels x n_vis`` float64 temporaries, so a modest number of
+    visibilities on a large field is just as fatal as a large number on a small
+    one. Both limits are checked.
+    """
     if transformer == "dft":
         return ag.TransformerDFT
     if transformer == "nufft":
         return ag.TransformerNUFFT
     if transformer != "auto":
         raise ValueError(f"unknown transformer {transformer!r}")
-    if n_vis <= DFT_MAX_VIS:
+
+    product = n_vis * (n_image_pixels or 1)
+    too_big = n_vis > DFT_MAX_VIS or product > DFT_MAX_PRODUCT
+    if not too_big:
         return ag.TransformerDFT
     if jax_available():
         return ag.TransformerNUFFT
+    if n_vis > DFT_MAX_VIS:
+        why = f"{n_vis} visibilities"
+    else:
+        why = (
+            f"{n_vis} visibilities on a {n_image_pixels}-pixel image "
+            f"({product / 1e6:.0f}e6 DFT elements, ~{product * 8 / 1e9:.1f} GB "
+            "per temporary)"
+        )
     warnings.warn(
-        f"{n_vis} visibilities with no JAX/nufftax installed: falling back to "
-        "the direct DFT, which will be slow. Install pyuvimage[jax] for the "
-        "fast NUFFT.",
+        f"{why} with no JAX/nufftax installed: falling back to the direct "
+        "DFT, which will be slow and may run out of memory. Install "
+        "pyuvimage[jax] for the fast NUFFT, or reduce --fov.",
         stacklevel=2,
     )
     return ag.TransformerDFT
@@ -124,7 +149,11 @@ def make_dataset(
         )
     else:
         raise ValueError("mask_shape must be 'square' or 'circular'")
-    cls = resolve_transformer(n_vis=len(data), transformer=transformer)
+    cls = resolve_transformer(
+        n_vis=len(data),
+        transformer=transformer,
+        n_image_pixels=int(np.prod(geometry.shape_native)),
+    )
     return ag.Interferometer(
         data=ag.Visibilities(np.asarray(data, dtype=complex)),
         noise_map=ag.VisibilitiesNoiseMap(np.asarray(noise, dtype=complex)),

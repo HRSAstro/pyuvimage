@@ -13,6 +13,27 @@ import logging
 import sys
 
 
+
+def _parse_spw(text: str):
+    """"0" -> 0;  "all" -> "all";  "0,2" / "0-3" / "0-1,4" -> [0, 2] / ... ."""
+    text = str(text).strip()
+    if text.lower() == "all":
+        return "all"
+    ids: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part[1:]:  # allow a leading minus to fail as an int instead
+            lo, hi = part.split("-", 1)
+            ids.extend(range(int(lo), int(hi) + 1))
+        else:
+            ids.append(int(part))
+    if not ids:
+        raise ValueError(f"could not parse --spw {text!r}")
+    return ids[0] if len(ids) == 1 else sorted(set(ids))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pyuvimage",
@@ -26,14 +47,25 @@ def main(argv: list[str] | None = None) -> int:
     p_imp.add_argument("ms")
     p_imp.add_argument("out")
     p_imp.add_argument("--field", type=int, default=0)
-    p_imp.add_argument("--spw", type=int, default=0)
+    p_imp.add_argument(
+        "--spw", default="0",
+        help='spectral window(s): a DATA_DESC_ID ("0"), a comma-separated '
+             'list or range ("0,2", "0-3"), or "all". Several windows are '
+             "imaged together by MFS.",
+    )
     p_imp.add_argument(
         "--column", default="auto", choices=["auto", "data", "corrected"]
     )
     p_imp.add_argument(
-        "--noise", default="difference", choices=["difference", "sigma"],
-        help="noise from time-differenced visibilities (default) or the MS "
-        "SIGMA column",
+        "--noise", default="difference",
+        choices=["difference", "scaled", "sigma"],
+        help="how to set the per-visibility noise. MS weights are relative, "
+        "not absolute, so the scale is recomputed from the data either way: "
+        '"difference" (default) times-differences each baseline and ignores '
+        'the weight column; "scaled" keeps the WEIGHT/WEIGHT_SPECTRUM shape '
+        "(Tsys, band edges, atmospheric lines) and takes only the scale from "
+        'the differences; "sigma" trusts the SIGMA column and warns, because '
+        "it is usually wrong in scale",
     )
     p_imp.add_argument("--overwrite", action="store_true")
 
@@ -54,8 +86,12 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument("--out", default="pyuvimage_out")
     p_fit.add_argument(
         "--pixel-scale", default="auto",
-        help='pixel scale of every output product: "auto" (half-Nyquist, '
-        '~4 pixels per beam), "nyquist" (~2 per beam, cheaper), or arcsec',
+        help='model-mesh scale: "auto" (Nyquist of the baseline 95%% of '
+        'samples fall within -- what the bulk of the data supports), '
+        '"nyquist" (Nyquist of the *longest* baseline: finer, much slower, '
+        'and more mesh than a sparse long-baseline tail constrains), '
+        '"fine" (half that again), or a value in arcsec. Products are '
+        'written on a grid --oversample times finer.',
     )
     p_fit.add_argument(
         "--reg", default="adaptive",
@@ -171,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
 
         import_ms(
             args.ms, args.out, data_column=args.column, field=args.field,
-            spw=args.spw, noise_estimate=args.noise, overwrite=args.overwrite,
+            spw=_parse_spw(args.spw), noise_estimate=args.noise,
+            overwrite=args.overwrite,
         )
         return 0
 

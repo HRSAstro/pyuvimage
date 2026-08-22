@@ -18,11 +18,24 @@ import numpy as np
 
 from . import beam as beam_mod
 from . import fitting, primary_beam
-from .grids import ImageGeometry, resolve_geometry
+from .grids import (
+    ImageGeometry,
+    nyquist_pixel_scale_arcsec,
+    resolve_geometry,
+)
 from .products import ProductSet, upsample_model, write_products
-from .uvdata import UVData
+from .uvdata import MultiSpwUVData, UVData, read_dataset
 
 logger = logging.getLogger("pyuvimage")
+
+# Which baseline length the automatic mesh scale is sized from. The longest
+# baseline is the information limit, but on a real array only a handful of
+# samples reach it: PJ0116 at 245 GHz has a median baseline of 213 klambda and
+# a maximum of 1054 klambda, so `0.5 / b_max` asks for a mesh ~30x finer than
+# the data constrain -- minutes per likelihood evaluation, and prior-dominated
+# where it is not constrained. The 95th percentile is within ~2% of the maximum
+# for a compact, uniformly filled uv plane, so this changes nothing for mocks.
+BASELINE_PERCENTILE = 95.0
 
 
 @dataclass
@@ -112,26 +125,56 @@ def run(
     report_if_disabled()
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
-    uvd = dataset if isinstance(dataset, UVData) else UVData.read(dataset)
-    logger.info(
-        "dataset: %d visibilities x %d channel(s), central frequency %.6g GHz",
-        uvd.n_vis, uvd.n_chan, uvd.central_frequency / 1e9,
+    uvd = (
+        dataset
+        if isinstance(dataset, (UVData, MultiSpwUVData))
+        else read_dataset(dataset)
     )
+    if uvd.n_spw > 1:
+        logger.info(
+            "dataset: %d spectral windows, %d channels and %d samples in "
+            "total, %.6g-%.6g GHz (centre %.6g GHz)",
+            uvd.n_spw, uvd.n_chan, uvd.n_samples,
+            float(np.min(uvd.frequencies)) / 1e9,
+            float(np.max(uvd.frequencies)) / 1e9,
+            uvd.central_frequency / 1e9,
+        )
+    else:
+        logger.info(
+            "dataset: %d visibilities x %d channel(s), central frequency %.6g GHz",
+            uvd.n_vis, uvd.n_chan, uvd.central_frequency / 1e9,
+        )
+    # a single very wide spw deserves the same warning as several combined
+    _warn_wide_band(uvd, mode)
 
+    b_max = uvd.max_baseline_wavelengths
+    b_eff = uvd.baseline_percentile_wavelengths(BASELINE_PERCENTILE)
     geometry = resolve_geometry(
         fov_arcsec=fov,
-        max_baseline_wavelengths=uvd.max_baseline_wavelengths,
+        max_baseline_wavelengths=b_max,
         pixel_scale=pixel_scale,
         mesh_shape=mesh_shape,
         oversample=oversample,
+        effective_baseline_wavelengths=b_eff,
     )
     logger.info(
         "mesh %dx%d at %.4g\"/pix (Nyquist %.4g\"), image grid %dx%d",
         *geometry.mesh_shape, geometry.mesh_pixel_scale,
         geometry.nyquist_pixel_scale, *geometry.shape_native,
     )
+    if b_max > 1.5 * b_eff:
+        logger.info(
+            "  baselines have a sparse long tail: %.0f%% of samples are within "
+            "%.0f klambda but the longest is %.0f klambda, so the mesh is sized "
+            "at %.3g\" rather than %.3g\". Use --pixel-scale nyquist to sample "
+            "the longest baselines instead.",
+            BASELINE_PERCENTILE, b_eff / 1e3, b_max / 1e3,
+            nyquist_pixel_scale_arcsec(b_eff), nyquist_pixel_scale_arcsec(b_max),
+        )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
-    n_data_all = 2 * uvd.n_vis * uvd.n_chan
+    # the real sample count: flags remove samples, and for ragged multi-spw
+    # data n_vis * n_chan is not even a meaningful product
+    n_data_all = 2 * uvd.n_samples
     if n_pix > n_data_all:
         logger.warning(
             "the model has more pixels (%d) than data points (%d): the "
@@ -333,7 +376,7 @@ def run(
                           oversample, uncertainty_map)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
-        _report_dynamic_range(products[0])
+        _report_dynamic_range(products[0], n_data_all)
     else:
         frozen = mfs_fit.prior
         logger.info(
@@ -406,6 +449,9 @@ def _parameter_record(
         "data": {
             "n_visibilities": int(uvd.n_vis),
             "n_channels": int(uvd.n_chan),
+            "n_spw": int(uvd.n_spw),
+            "n_samples": int(uvd.n_samples),
+            "fractional_bandwidth": float(uvd.fractional_bandwidth),
             "central_frequency_hz": float(uvd.central_frequency),
             "max_baseline_wavelengths": float(uvd.max_baseline_wavelengths),
             "noise_estimate": uvd.meta.get("noise_estimate", "from file"),
@@ -455,14 +501,49 @@ def _parameter_record(
         ),
         "fit_quality": {
             "chi_squared": fit.chi_squared,
-            "n_data": int(2 * uvd.n_vis * uvd.n_chan),
+            "n_data": int(2 * uvd.n_samples),
             "log_evidence": fit.log_evidence,
         },
     }
 
 
 
-def _report_dynamic_range(p) -> None:
+
+def _warn_wide_band(uvd, mode: str) -> None:
+    """MFS fits one frequency-independent image; say so when that starts to bite.
+
+    Combining spectral windows widens the fractional bandwidth, and a source
+    with a spectral index is then not the same source at both ends of the band.
+    pyuvimage has no Taylor-term expansion (CLEAN's `mtmfs`), so the honest
+    thing is to quantify the assumption rather than hide it: at fractional
+    bandwidth B a spectral index alpha changes the flux across the band by
+    roughly |alpha| * B.
+    """
+    if mode != "mfs":
+        return
+    b = uvd.fractional_bandwidth
+    if b < 0.2:
+        return
+    logger.warning(
+        "combined fractional bandwidth is %.0f%% (%.4g-%.4g GHz). MFS fits a "
+        "single frequency-independent image, so a source with spectral index "
+        "alpha is mis-modelled by roughly |alpha| x %.0f%% across the band "
+        "(~%.0f%% for alpha = -0.7). The fit will still reach its chi^2 "
+        "target by absorbing that into the image; treat the result as a "
+        "band-averaged sky, and split the spws if you need spectral "
+        "information.",
+        100 * b, float(np.min(uvd.frequencies)) / 1e9,
+        float(np.max(uvd.frequencies)) / 1e9, 100 * b, 70 * b,
+    )
+
+
+# Residual-structure ratio above which the leftover is not credibly noise.
+# 1.0 is white; the ratio scatters a little with the number of independent
+# beams in the field, so leave room before complaining.
+STRUCTURE_RATIO_WARN = 1.5
+
+
+def _report_dynamic_range(p, n_data: int | None = None) -> None:
     """Put the residual in proportion to how bright the source is.
 
     A residual quoted in sigma is meaningless on its own: the same 1% error on
@@ -470,6 +551,21 @@ def _report_dynamic_range(p) -> None:
     Regularised fits leave a residual roughly proportional to the source
     brightness, so on a bright, compact, high-dynamic-range source a
     double-digit sigma residual is normal and is not evidence of a bad fit.
+
+    The *structure ratio* is the part that catches real trouble. If the
+    residual visibilities were white with variance chi^2/N, the residual dirty
+    image would have rms sqrt(chi^2/N) in sigma units, because incoherent
+    residuals average down as 1/sqrt(N) in the image plane. A *coherent*
+    residual -- sky the model failed to reproduce -- adds in phase instead and
+    lands sqrt(N) higher. The ratio of measured to expected rms therefore says
+    whether what is left over is noise or signal, which chi^2 alone cannot:
+    chi^2 constrains the residual's total power, not its structure.
+
+    On PJ0116 at 245 GHz this was the only diagnostic that caught a noise map
+    inflated 1.4x by a bug in the export. chi^2/N read 1.0076 -- a perfect fit
+    -- while the whole Einstein ring sat in the residual map at 26.8 sigma and
+    the ratio read 4.3. With the noise corrected: chi^2/N 1.0073, residual
+    3.7 sigma, ratio 0.93.
     """
     import numpy as np
 
@@ -483,6 +579,31 @@ def _report_dynamic_range(p) -> None:
         "sigma = %.2f%% of the peak (dynamic range %.0f:1)",
         peak, dr, resid, 100.0 * resid / max(dr, 1e-30), dr / max(resid, 1e-30),
     )
+
+    if not n_data:
+        return
+    chi2_per_datum = float(p.chi_squared) / n_data
+    expected = np.sqrt(chi2_per_datum)
+    measured = float(np.nanstd(np.asarray(p.residual_sigma, dtype=float)))
+    if not (np.isfinite(expected) and expected > 0 and np.isfinite(measured)):
+        return
+    ratio = measured / expected
+    logger.info(
+        "residual map rms %.2f sigma against %.2f expected for white noise "
+        "at chi2/N = %.3f: structure ratio %.2f",
+        measured, expected, chi2_per_datum, ratio,
+    )
+    if ratio > STRUCTURE_RATIO_WARN:
+        logger.warning(
+            "the residual map is %.1fx more structured than noise of the same "
+            "total power (structure ratio %.2f). chi^2 only constrains the "
+            "residual's total power, so a fit can pass it while leaving real "
+            "emission unmodelled -- look at residual.fits before trusting "
+            "anything. The usual cause is a noise map that overestimates the "
+            "noise, which stops the fit early; also check --fov and whether "
+            "the source has structure finer than the model pixel scale.",
+            ratio, ratio,
+        )
 
 
 def _products_for(

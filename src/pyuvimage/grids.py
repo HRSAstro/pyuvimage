@@ -47,6 +47,7 @@ def resolve_geometry(
     pixel_scale: float | str = "auto",
     mesh_shape: tuple[int, int] | None = None,
     oversample: float = 2.0,
+    effective_baseline_wavelengths: float | None = None,
 ) -> ImageGeometry:
     """Derive all grid quantities from the field of view and the uv coverage.
 
@@ -72,13 +73,28 @@ def resolve_geometry(
         and goes to zero exactly where the prior is weak.
     """
     nyq = nyquist_pixel_scale_arcsec(max_baseline_wavelengths)
+    # Nyquist of the baseline length most of the samples actually reach. For a
+    # compact, near-uniformly filled uv plane -- every mock in this project --
+    # this is within a couple of per cent of `nyq`. For a real array with a
+    # sparse long-baseline tail it is several times coarser, and that coarser
+    # value is the honest one: see `UVData.baseline_percentile_wavelengths`.
+    eff = (
+        nyq
+        if effective_baseline_wavelengths is None
+        else nyquist_pixel_scale_arcsec(effective_baseline_wavelengths)
+    )
 
     if isinstance(pixel_scale, str):
-        if pixel_scale in ("auto", "nyquist"):
-            # Nyquist sampling of the longest baseline: the information limit
-            # of the data. Products are written on a grid `oversample` times
-            # finer, which keeps the residual map diagnostic (see above) and
-            # gives ~4 pixels across the beam for viewing and beam fitting.
+        if pixel_scale == "auto":
+            # The scale the bulk of the data supports. Products are written on
+            # a grid `oversample` times finer, which keeps the residual map
+            # diagnostic (see above) and gives ~4 pixels across the beam for
+            # viewing and beam fitting.
+            mesh_scale = eff
+        elif pixel_scale == "nyquist":
+            # Nyquist sampling of the *longest* baseline: the information limit
+            # of the data, and more mesh than a sparse long-baseline tail can
+            # constrain. Explicit opt-in.
             mesh_scale = nyq
         elif pixel_scale in ("fine", "nyquist/2"):
             mesh_scale = nyq / 2.0

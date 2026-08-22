@@ -61,7 +61,22 @@ def build_header(
         h["CUNIT3"] = "Hz"
         h["CRPIX3"] = 1.0
         h["CRVAL3"] = f[0]
-        h["CDELT3"] = float(f[1] - f[0]) if len(f) > 1 else 1.0
+        steps = np.diff(f)
+        h["CDELT3"] = float(steps[0])
+        # A linear frequency axis is a lie for a cube built from several
+        # spectral windows: the channels are not evenly spaced, so CRVAL3 +
+        # n*CDELT3 puts later planes at frequencies that were never observed.
+        # Record the truth per plane and say so, rather than quietly shipping
+        # a WCS that mislabels the data.
+        if not np.allclose(steps, steps[0], rtol=1e-6, atol=0.0):
+            h["CDELT3"] = float(np.median(steps))
+            h["FREQIRR"] = (
+                True, "channel spacing is irregular; see FRQnnnn / .json"
+            )
+            for i, freq in enumerate(f):
+                if i < 999:
+                    h[f"FRQ{i:04d}"] = (float(freq), f"plane {i + 1} freq [Hz]")
+            # logged once per run by write_products, not once per file
     elif frequencies_hz is not None:
         h["RESTFRQ"] = float(np.mean(frequencies_hz))
     if beam is not None:
@@ -247,6 +262,23 @@ def write_products(
     if pts:
         (out / "point_sources.json").write_text(json.dumps(
             {"points": [p.as_dict() for p in pts]}, indent=2))
+    if is_cube:
+        even = bool(
+            len(freqs) < 3
+            or np.allclose(np.diff(freqs), np.diff(freqs)[0], rtol=1e-6)
+        )
+        if not even:
+            logger.warning(
+                "the cube's channels are not evenly spaced (they span several "
+                "spectral windows), so the linear FITS frequency axis cannot "
+                "describe them: CDELT3 is the median step and is only "
+                "indicative. The true per-plane frequencies are in each "
+                "header as FRQ0000... and in frequencies.json."
+            )
+        (out / "frequencies.json").write_text(json.dumps(
+            {"frequencies_hz": [float(x) for x in freqs],
+             "evenly_spaced": even},
+            indent=2))
     if scan is not None:
         (out / "prior_scan.json").write_text(json.dumps(scan, indent=2))
     if parameters is not None:

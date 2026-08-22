@@ -363,3 +363,86 @@ def make_field_dataset(
         "points": [{"flux": f, "centre": c} for f, c in points],
     }
     return uvd, truth, geom, components
+
+
+def split_into_spws(uvd, n_spw: int = 2):
+    """Split one dataset's channels into `n_spw` spectral windows.
+
+    Used to test that imaging several spws together reproduces imaging them as
+    one block: the samples are identical, only the container differs, so the
+    two fits must agree to numerical precision.
+    """
+    from .uvdata import MultiSpwUVData, UVData
+
+    edges = np.linspace(0, uvd.n_chan, n_spw + 1).astype(int)
+    spws = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        if hi <= lo:
+            continue
+        spws.append(UVData(
+            uvw=uvd.uvw.copy(),
+            frequencies=uvd.frequencies[lo:hi].copy(),
+            data=uvd.data[lo:hi].copy(),
+            noise=uvd.noise[lo:hi].copy(),
+            flags=None if uvd.flags is None else uvd.flags[lo:hi].copy(),
+            meta=dict(uvd.meta),
+        ))
+    return MultiSpwUVData(spws=spws, meta=dict(uvd.meta))
+
+
+def make_multi_spw_dataset(
+    n_vis: int = 400,
+    spw_frequencies_hz=(230e9, 232e9, 234e9),
+    n_chan_per_spw=(2, 3, 2),
+    channel_width_hz: float = 2e8,
+    fov_arcsec: float = 3.0,
+    sigma_jy: float = 3e-4,
+    seed: int = 5,
+    mesh_n: int = 24,
+    flux_jy: float = 0.05,
+    point_flux_jy: float = 0.0,
+    point_centre: tuple[float, float] = (0.8, -0.6),
+):
+    """Several spectral windows of the same sky, deliberately ragged.
+
+    Different channel counts *and* different rows per spw, which is what a real
+    measurement set looks like and what a rectangular array cannot hold. The
+    sky is frequency-independent, so MFS across the whole set is exact and any
+    disagreement is a bug rather than a spectral-index effect.
+
+    Returns (MultiSpwUVData, truth, geometry).
+    """
+    from .pointsource import point_visibilities, sky_to_grid
+    from .uvdata import MultiSpwUVData
+
+    fov_rad = fov_arcsec / 206265.0
+    ref = float(np.max(spw_frequencies_hz))
+    max_b = (mesh_n / (2.0 * fov_rad)) * C_M_S / ref
+    geom = resolve_geometry(
+        fov_arcsec,
+        max_baseline_wavelengths=max_b * ref / C_M_S,
+        mesh_shape=(mesh_n, mesh_n),
+    )
+    truth = exponential_image(
+        geom.mesh_shape, geom.mesh_pixel_scale, flux_jy=flux_jy,
+        r_eff_arcsec=fov_arcsec / 8,
+    )
+    spws = []
+    for i, (f0, n_chan) in enumerate(zip(spw_frequencies_hz, n_chan_per_spw)):
+        # each spw gets its own rows, as in a real MS
+        uvw = random_uv_coverage(n_vis + 37 * i, max_b, f0, seed=seed + i)
+        freqs = f0 + channel_width_hz * np.arange(n_chan)
+        uvd = simulate(
+            truth, geom.mesh_pixel_scale, uvw, freqs,
+            sigma_jy=sigma_jy, seed=seed + 100 + i,
+            meta={"telescope": "mock", "dish_diameter_m": 12.0,
+                  "phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0,
+                  "spw": i},
+        )
+        if point_flux_jy:
+            y, x = sky_to_grid(*point_centre)
+            for c, f in enumerate(freqs):
+                uv = uvw[:, :2] * (f / C_M_S)
+                uvd.data[c] += point_flux_jy * point_visibilities(uv, y, x)
+        spws.append(uvd)
+    return MultiSpwUVData(spws=spws), truth, geom
