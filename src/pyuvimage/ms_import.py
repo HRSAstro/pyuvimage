@@ -44,6 +44,7 @@ def import_ms(
     field: int = 0,
     spw: int | str | Sequence[int] = 0,
     noise_estimate: str = "difference",
+    noise_chunk_seconds: float = noise_mod.DEFAULT_CHUNK_SECONDS,
     overwrite: bool = False,
 ) -> "UVData | MultiSpwUVData":
     """Read an MS and (optionally) write a pyuvimage dataset directory.
@@ -92,7 +93,7 @@ def import_ms(
         if len(wanted) == 1:
             uvd = _import_from_open_ms(
                 ms_path, main, table, data_column, field, wanted[0],
-                noise_estimate,
+                noise_estimate, noise_chunk_seconds,
             )
         else:
             logger.info("importing %d spectral windows: %s",
@@ -102,7 +103,7 @@ def import_ms(
                 try:
                     spws.append(_import_from_open_ms(
                         ms_path, main, table, data_column, field, w,
-                        noise_estimate,
+                        noise_estimate, noise_chunk_seconds,
                     ))
                 except ValueError as e:
                     # an empty or fully flagged window is normal in a real MS;
@@ -169,7 +170,8 @@ def _cell(tab, column: str, row: int) -> np.ndarray:
         return np.asarray(col[int(row)])
 
 
-def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_estimate):
+def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
+                         noise_estimate, noise_chunk_seconds=noise_mod.DEFAULT_CHUNK_SECONDS):
     # ANTENNA1 != ANTENNA2 drops autocorrelations: they sit at u = v = 0 and
     # carry total power, not a visibility, so an unflagged one would act as a
     # bogus zero-spacing constraint on the total flux.
@@ -308,6 +310,24 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_es
     )
     med_diff = float(np.median(differenced.real))
 
+    # Does the noise level change over the track? `difference` returns one
+    # sigma per baseline for the whole observation, so if the target rose and
+    # set -- airmass, Tsys -- it delivers the quadratic mean everywhere and
+    # over-weights the noisiest data. The fit cannot see that, so say it.
+    var_ratio, blocks = noise_mod.noise_time_variation(
+        vis, antenna1=ant1, antenna2=ant2, time=time
+    )
+    if np.isfinite(var_ratio) and var_ratio > 1.25:
+        logger.warning(
+            "the noise level changes by at least %.2fx over the track "
+            "(thirds: %s mJy) -- elevation and Tsys, most likely. --noise "
+            "difference gives every integration on a baseline the same sigma, "
+            "so the noisiest data ends up over-weighted. --noise scaled "
+            "follows the weight column's time dependence instead.",
+            var_ratio,
+            ", ".join("%.3g" % (1e3 * b) for b in blocks),
+        )
+
     # Always report how far the column is from the data. This is the cheapest
     # possible check that the weights mean what they claim, and it costs one
     # estimate we have already made.
@@ -329,6 +349,31 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_es
                 ratio,
             )
 
+    # Is there baseline-dependent structure the weight column is blind to?
+    # Decorrelation grows with baseline length -- the atmosphere loses
+    # coherence faster over longer separations -- and the weights, being purely
+    # radiometric, cannot see it. Nor can they see an antenna whose calibration
+    # is worse than its Tsys suggests.
+    b_len = np.hypot(uvw[:, 0], uvw[:, 1])
+    b_ratio, b_short, b_long = noise_mod.baseline_weight_disagreement(
+        vis, sigma_rel, ant1, ant2, time, b_len
+    )
+    if np.isfinite(b_ratio):
+        logger.info(
+            "noise vs baseline length: measured/claimed is %.2f on the "
+            "shortest quartile and %.2f on the longest (ratio %.2f)",
+            b_short, b_long, b_ratio,
+        )
+        if b_ratio > 1.2:
+            logger.warning(
+                "the long baselines are %.2fx noisier than the weight column "
+                "claims, relative to the short ones -- decorrelation or "
+                "calibration quality, which the weights cannot see because "
+                "they are purely radiometric. --noise scaled would discard "
+                "that; --noise difference or hybrid measures it.",
+                b_ratio,
+            )
+
     if noise_estimate == "sigma":
         logger.warning(
             "--noise sigma trusts the MS SIGMA column as an absolute noise "
@@ -342,6 +387,30 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_es
         noise = noise + 1j * noise
         bad = ~np.isfinite(noise.real) | (noise.real <= 0)
         noise[bad] = med_diff * (1 + 1j)
+    elif noise_estimate == "chunked":
+        noise = noise_mod.sigma_in_time_chunks(
+            vis, antenna1=ant1, antenna2=ant2, time=time,
+            chunk_seconds=float(noise_chunk_seconds),
+        )
+        logger.info(
+            "noise time-differenced in %.0f s chunks: median sigma %.4g Jy "
+            "(%.2fx spread across the track)",
+            float(noise_chunk_seconds), float(np.median(noise.real)),
+            float(np.max(noise.real) / max(np.min(noise.real), 1e-30)),
+        )
+    elif noise_estimate == "hybrid":
+        noise = noise_mod.hybrid_sigma(
+            vis, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
+        )
+        bad = (
+            ~np.isfinite(noise.real) | (noise.real <= 0)
+            | ~np.isfinite(noise.imag) | (noise.imag <= 0)
+        )
+        noise[bad] = differenced[bad]
+        logger.info(
+            "noise per baseline from the data, time profile from the weights: "
+            "median sigma %.4g Jy", float(np.median(noise.real)),
+        )
     elif noise_estimate == "scaled":
         noise = noise_mod.scale_relative_sigma(
             vis, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
@@ -376,6 +445,9 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_es
         "dish_diameter_m": dish_m,
         "telescope": telescope,
         "noise_estimate": noise_estimate,
+        "noise_chunk_seconds": (
+            float(noise_chunk_seconds) if noise_estimate == "chunked" else None
+        ),
     }
     return UVData(
         uvw=np.asarray(uvw, dtype=float),

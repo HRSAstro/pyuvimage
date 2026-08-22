@@ -12,6 +12,15 @@ import argparse
 import logging
 import sys
 
+import numpy as np
+
+
+
+def _all_sigma(uvd):
+    """Median-able view of a dataset's sigma, single- or multi-spw."""
+    import numpy as _np
+
+    return _np.concatenate([_np.asarray(s.noise).real.ravel() for s in uvd.spws])
 
 
 def _parse_spw(text: str):
@@ -58,14 +67,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_imp.add_argument(
         "--noise", default="difference",
-        choices=["difference", "scaled", "sigma"],
+        choices=["difference", "chunked", "hybrid", "scaled", "sigma"],
         help="how to set the per-visibility noise. MS weights are relative, "
         "not absolute, so the scale is recomputed from the data either way: "
         '"difference" (default) times-differences each baseline and ignores '
         'the weight column; "scaled" keeps the WEIGHT/WEIGHT_SPECTRUM shape '
         "(Tsys, band edges, atmospheric lines) and takes only the scale from "
-        'the differences; "sigma" trusts the SIGMA column and warns, because '
-        "it is usually wrong in scale",
+        'the differences; "chunked" time-differences within blocks of the '
+        "track (--noise-chunk seconds) so the noise can change as the target "
+        'rises and sets, using no weights at all; "hybrid" takes the '
+        "per-baseline level from the data and only the time profile from the "
+        'weights, which is where each is strongest; "sigma" trusts the SIGMA '
+        "column and warns, because it is usually wrong in scale",
+    )
+    p_imp.add_argument(
+        "--noise-chunk", type=float, default=600.0,
+        help="chunk length in seconds for --noise chunked (default 600). A "
+        "typical ALMA execution is 1-1.5 h including calibrators, which take "
+        "30-40%% of it, so only ~45-60 min of target time is there to divide "
+        "up; 600 s leaves 5-6 chunks of it. Shorter follows the track more "
+        "closely but measures each sigma from fewer differences. A chunk as "
+        "long as the track reduces to --noise difference",
     )
     p_imp.add_argument("--overwrite", action="store_true")
 
@@ -75,6 +97,18 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("npz")
     p_conv.add_argument("out")
     p_conv.add_argument("--overwrite", action="store_true")
+    p_conv.add_argument(
+        "--noise", default="keep",
+        choices=["keep", "difference", "chunked", "hybrid", "scaled"],
+        help="re-estimate the noise while converting, and store the result so "
+        "no later run pays for it again. Default 'keep' uses the map already "
+        "in the .npz. Needs the antenna/time columns the export stores; "
+        "'hybrid' and 'scaled' additionally need the weight column",
+    )
+    p_conv.add_argument(
+        "--noise-chunk", type=float, default=None,
+        help="chunk length in seconds for --noise chunked (default 600)",
+    )
 
     p_fit = sub.add_parser("fit", help="reconstruct an image or cube")
     p_fit.add_argument("dataset", help="dataset directory or .npz")
@@ -208,14 +242,25 @@ def main(argv: list[str] | None = None) -> int:
         import_ms(
             args.ms, args.out, data_column=args.column, field=args.field,
             spw=_parse_spw(args.spw), noise_estimate=args.noise,
+            noise_chunk_seconds=args.noise_chunk,
             overwrite=args.overwrite,
         )
         return 0
 
     if args.command == "convert":
-        from .uvdata import UVData
+        from .uvdata import read_dataset, recompute_noise
 
-        UVData.read(args.npz).write(args.out, overwrite=args.overwrite)
+        uvd = read_dataset(args.npz)
+        if args.noise != "keep":
+            before = float(np.median(_all_sigma(uvd)))
+            uvd = recompute_noise(uvd, args.noise, args.noise_chunk)
+            after = float(np.median(_all_sigma(uvd)))
+            print(
+                "noise re-estimated (%s): median sigma %.4g -> %.4g Jy "
+                "(x%.3f); stored in the dataset, so fits do not repeat it"
+                % (args.noise, before, after, after / max(before, 1e-30))
+            )
+        uvd.write(args.out, overwrite=args.overwrite)
         print(f"dataset written to {args.out}")
         return 0
 

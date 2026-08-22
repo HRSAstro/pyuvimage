@@ -134,3 +134,56 @@ def test_multichannel_shape_is_carried_through():
     interior = np.median(out.real[1:-1])
     assert np.median(out.real[0]) == pytest.approx(3.0 * interior, rel=0.05)
     assert np.median(out.real[-1]) == pytest.approx(3.0 * interior, rel=0.05)
+
+
+def test_weights_that_change_between_integrations_do_not_leak_the_sky():
+    """Difference first, normalise after -- the order is the whole point.
+
+    Whitening first and differencing the result gives
+        d(V/s) = dV/s_bar + V d(1/s)
+    and the second term is the sky coming back in whenever the weight changes
+    between two integrations, which flagging routinely makes it do. That is
+    precisely what differencing exists to prevent.
+
+    Measured on this mock, with a source 12x the noise: whitening first was
+    harmless at constant weights, tripled the error at 5% weight jitter, and at
+    20% was an order of magnitude worse than ignoring the weight column
+    entirely. Differencing the raw visibilities and dividing by the pair's
+    combined sigma cancels the sky in the numerator exactly.
+    """
+    rng = np.random.default_rng(11)
+    n_baselines, n_times = 66, 10
+    rows = n_baselines * n_times
+    ant1 = np.repeat(np.arange(n_baselines), n_times)
+    ant2 = ant1 + 1
+    time = np.tile(np.arange(float(n_times)), n_baselines)
+
+    sigma_true = 0.004 * np.repeat(rng.uniform(1.0, 2.5, n_baselines), n_times)
+    sigma_true = sigma_true[None, :]
+    # a source 12x the noise: the term that leaks is proportional to it
+    sky = np.repeat(rng.normal(0.0, 0.05, n_baselines), n_times)[None, :]
+    data = (
+        sky
+        + rng.normal(0, 1, sigma_true.shape) * sigma_true
+        + 1j * rng.normal(0, 1, sigma_true.shape) * sigma_true
+    )
+
+    def error(jitter):
+        rel = 7.0 * sigma_true * (1 + 1j)
+        rel = rel * (1.0 + jitter * rng.normal(0, 1, rel.shape))
+        out = scale_relative_sigma(data, rel, ant1, ant2, time)
+        return np.median(np.abs(out.real / sigma_true - 1.0))
+
+    steady = error(0.0)
+    jittered = error(0.20)
+    plain = np.median(
+        np.abs(
+            sigma_from_time_differences(data, ant1, ant2, time).real / sigma_true
+            - 1.0
+        )
+    )
+
+    assert steady < 0.05
+    # 20% jitter means the shape really is ~20% wrong, so some loss is honest.
+    # What must not happen is blowing past the estimator that ignores weights.
+    assert jittered < 1.5 * plain

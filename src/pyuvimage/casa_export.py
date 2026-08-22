@@ -145,6 +145,19 @@ def _export_one(ms_path, field, spw, data_column):
     # was run on, one unflagged NaN in 6930 visibilities made every sigma NaN,
     # because np.std of a window containing it is NaN and the global fallback
     # was pooled from the same poisoned differences.
+    # A difference is only meaningful between samples adjacent in time. Across
+    # a calibrator visit -- 30-40% of a typical ALMA execution -- the earth has
+    # turned a long baseline through several klambda, so the difference
+    # measures the source, not the noise. Three median steps, matching
+    # pyuvimage.noise.auto_max_gap.
+    unique_t = np.unique(np.asarray(time, dtype=float))
+    if unique_t.size >= 3:
+        steps = np.diff(unique_t)
+        steps = steps[np.isfinite(steps) & (steps > 0)]
+        max_gap = 3.0 * float(np.median(steps)) if steps.size else np.inf
+    else:
+        max_gap = np.inf
+
     baseline = ant1.astype(np.int64) * 100000 + ant2.astype(np.int64)
     sigma = np.zeros(vis.shape, dtype=complex)
     usable_cell = ~flags & np.isfinite(vis.real) & np.isfinite(vis.imag)
@@ -158,6 +171,7 @@ def _export_one(ms_path, field, spw, data_column):
         diff = np.diff(vis[:, rows], axis=1)
         ok = usable_cell[:, rows]
         good = ok[:, 1:] & ok[:, :-1]   # both endpoints usable
+        good = good & (np.diff(time[rows]) <= max_gap)[None, :]
         # Contribute to the global pool FIRST, whatever the per-baseline count.
         # MIN_DIFFS decides only whether *this baseline's own* sigma can be
         # trusted; the differences themselves are still perfectly good noise
@@ -252,6 +266,13 @@ def _export_one(ms_path, field, spw, data_column):
         "antenna1": np.asarray(ant1, dtype=np.int32),
         "antenna2": np.asarray(ant2, dtype=np.int32),
         "time": np.asarray(time, dtype=np.float64),
+        # The weight column's *relative* sigma, 1/sqrt(sum w) over the hands
+        # actually averaged. Its scale is not trusted (pipeline weights are
+        # relative), but its shape carries Tsys, band edges and atmospheric
+        # lines, which --noise hybrid and scaled use. Stored so that choice
+        # does not require going back to the MS.
+        "weight_sigma_re": np.where(wsum > 0, 1.0 / np.sqrt(wsum), np.nan),
+        "weight_sigma_im": np.where(wsum > 0, 1.0 / np.sqrt(wsum), np.nan),
     }
     print("  spw %s: %d vis x %d chan, %s" % (
         spw, vis.shape[1], vis.shape[0], "+".join(names)))

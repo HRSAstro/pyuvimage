@@ -30,6 +30,11 @@ _FILES = {
     "data": "data.fits",
     "noise": "noise.fits",
     "flags": "flags.fits",
+    # optional, and only written when present
+    "antenna1": "antenna1.fits",
+    "antenna2": "antenna2.fits",
+    "time": "time.fits",
+    "weight_sigma": "weight_sigma.fits",
 }
 
 
@@ -43,6 +48,24 @@ class UVData:
     noise: np.ndarray  # (n_chan, n_vis) complex (sigma_re + 1j sigma_im) Jy
     flags: np.ndarray | None = None  # (n_chan, n_vis) bool
     meta: dict = field(default_factory=dict)
+
+    # Ingredients for re-estimating the noise, carried so the choice of
+    # estimator is not frozen at import time. Without them a dataset's noise
+    # map can only be replaced by going back to the measurement set, which on
+    # the first real export meant an unusable map and no way to repair it.
+    antenna1: np.ndarray | None = None      # (n_vis,) int
+    antenna2: np.ndarray | None = None      # (n_vis,) int
+    time: np.ndarray | None = None          # (n_vis,) seconds
+    weight_sigma: np.ndarray | None = None  # (n_chan, n_vis) relative sigma
+
+    @property
+    def can_reestimate_noise(self) -> bool:
+        """Whether `recompute_noise` has what it needs for this dataset."""
+        return (
+            self.antenna1 is not None
+            and self.antenna2 is not None
+            and self.time is not None
+        )
 
     # ------------------------------------------------------------------ basic
     @property
@@ -192,6 +215,15 @@ class UVData:
         _write("noise", _complex_to_reim(self.noise))
         if self.flags is not None and np.any(self.flags):
             _write("flags", self.flags.astype(np.uint8))
+        # optional re-estimation ingredients
+        if self.antenna1 is not None:
+            _write("antenna1", np.asarray(self.antenna1, dtype=np.int32))
+        if self.antenna2 is not None:
+            _write("antenna2", np.asarray(self.antenna2, dtype=np.int32))
+        if self.time is not None:
+            _write("time", np.asarray(self.time, dtype=np.float64))
+        if self.weight_sigma is not None:
+            _write("weight_sigma", _complex_to_reim(self.weight_sigma))
         (path / "meta.json").write_text(json.dumps(self.meta, indent=2))
         return path
 
@@ -216,9 +248,23 @@ class UVData:
         flags = _getdata(flags_path).astype(bool) if flags_path.exists() else None
         meta_path = path / "meta.json"
         meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+        def _optional(name, dtype=None, complex_pair=False):
+            f = path / _FILES[name]
+            if not f.exists():
+                return None
+            raw = _getdata(f)
+            if complex_pair:
+                return _reim_to_complex(raw)
+            return raw if dtype is None else raw.astype(dtype)
+
         obj = cls(
             uvw=uvw, frequencies=frequencies, data=data, noise=noise,
             flags=flags, meta=meta,
+            antenna1=_optional("antenna1", np.int64),
+            antenna2=_optional("antenna2", np.int64),
+            time=_optional("time", np.float64),
+            weight_sigma=_optional("weight_sigma", complex_pair=True),
         )
         obj.validate()
         return obj
@@ -243,6 +289,7 @@ class UVData:
             noise=np.asarray(z["noise_re"]) + 1j * np.asarray(z["noise_im"]),
             flags=flags,
             meta=meta,
+            **_npz_optional(z),
         )
         obj.validate()
         return obj
@@ -547,6 +594,26 @@ class MultiSpwUVData:
         return obj
 
 
+def _npz_optional(z, prefix: str = ""):
+    """Pull the re-estimation ingredients out of an npz if the export saved them."""
+    def get(name, dtype=None):
+        key = prefix + name
+        return np.asarray(z[key], dtype=dtype) if key in z else None
+
+    weight_sigma = None
+    if prefix + "weight_sigma_re" in z:
+        weight_sigma = (
+            np.asarray(z[prefix + "weight_sigma_re"])
+            + 1j * np.asarray(z[prefix + "weight_sigma_im"])
+        )
+    return {
+        "antenna1": get("antenna1", np.int64),
+        "antenna2": get("antenna2", np.int64),
+        "time": get("time", np.float64),
+        "weight_sigma": weight_sigma,
+    }
+
+
 def _read_multi_npz(path: Path) -> "MultiSpwUVData":
     """Read a multi-spw .npz written by casa_export.py.
 
@@ -571,6 +638,7 @@ def _read_multi_npz(path: Path) -> "MultiSpwUVData":
             noise=z[pre + "noise_re"] + 1j * z[pre + "noise_im"],
             flags=flags,
             meta=dict(per_spw[i]) if i < len(per_spw) else dict(meta),
+            **_npz_optional(z, pre),
         ))
     obj = MultiSpwUVData(spws=spws, meta=meta)
     obj.validate()
@@ -594,3 +662,107 @@ def read_dataset(path: str | Path) -> "UVData | MultiSpwUVData":
         if any(d.is_dir() for d in path.glob("spw*")):
             return MultiSpwUVData.read(path)
     return UVData.read(path)
+
+
+NOISE_MODES = ("keep", "difference", "chunked", "hybrid", "scaled")
+
+
+def recompute_noise(
+    dataset: "UVData | MultiSpwUVData",
+    mode: str = "difference",
+    chunk_seconds: float | None = None,
+) -> "UVData | MultiSpwUVData":
+    """Re-estimate a dataset's noise map without going back to the MS.
+
+    The choice of estimator should not be frozen at import time. It was, until
+    the first real dataset arrived with a noise map that measured the source
+    rather than the noise -- and nothing in the file to rebuild it from. Exports
+    now carry `antenna1`, `antenna2`, `time` and, where the MS had them, the
+    weight-derived relative sigma, so any estimator can be applied later.
+
+    `mode="keep"` returns the dataset untouched. Anything else needs the row
+    metadata; `scaled` and `hybrid` additionally need `weight_sigma`.
+
+    Returns a new object -- the input is not modified.
+    """
+    from . import noise as noise_mod
+
+    if mode == "keep":
+        return dataset
+    if mode not in NOISE_MODES:
+        raise ValueError(
+            f"unknown noise mode {mode!r}; choose from {', '.join(NOISE_MODES)}"
+        )
+
+    if isinstance(dataset, MultiSpwUVData):
+        return MultiSpwUVData(
+            spws=[recompute_noise(s, mode, chunk_seconds) for s in dataset.spws],
+            meta=dict(dataset.meta),
+        )
+
+    if not dataset.can_reestimate_noise:
+        raise ValueError(
+            "this dataset does not carry antenna1/antenna2/time, so its noise "
+            "cannot be re-estimated here -- it was written by an older export. "
+            "Re-run the import or casa_export.py, or keep the stored map with "
+            "--noise keep."
+        )
+    if mode in ("scaled", "hybrid") and dataset.weight_sigma is None:
+        raise ValueError(
+            f"--noise {mode} needs the MS weight column, which this dataset "
+            "does not carry. Re-export to store it, or use difference/chunked, "
+            "which need only the visibilities."
+        )
+
+    a1 = np.asarray(dataset.antenna1)
+    a2 = np.asarray(dataset.antenna2)
+    t = np.asarray(dataset.time, dtype=float)
+    # flagged samples must not steer the estimate
+    vis = np.asarray(dataset.data, dtype=complex)
+    if dataset.flags is not None:
+        vis = np.where(dataset.flags, np.nan, vis)
+
+    if mode == "difference":
+        sigma = noise_mod.sigma_from_time_differences(vis, a1, a2, t)
+    elif mode == "chunked":
+        sigma = noise_mod.sigma_in_time_chunks(
+            vis, a1, a2, t,
+            chunk_seconds=(
+                noise_mod.DEFAULT_CHUNK_SECONDS
+                if chunk_seconds is None
+                else float(chunk_seconds)
+            ),
+        )
+    elif mode == "hybrid":
+        sigma = noise_mod.hybrid_sigma(vis, dataset.weight_sigma, a1, a2, t)
+    else:  # scaled
+        sigma = noise_mod.scale_relative_sigma(vis, dataset.weight_sigma, a1, a2, t)
+
+    bad = (
+        ~np.isfinite(sigma.real) | (sigma.real <= 0)
+        | ~np.isfinite(sigma.imag) | (sigma.imag <= 0)
+    )
+    if np.any(bad):
+        good = sigma.real[~bad]
+        fill = float(np.median(good)) if good.size else 1.0
+        sigma = np.where(bad, fill * (1 + 1j), sigma)
+
+    meta = dict(dataset.meta)
+    meta["noise_estimate"] = mode
+    if mode == "chunked":
+        meta["noise_chunk_seconds"] = float(
+            noise_mod.DEFAULT_CHUNK_SECONDS if chunk_seconds is None
+            else chunk_seconds
+        )
+    return UVData(
+        uvw=dataset.uvw,
+        frequencies=dataset.frequencies,
+        data=dataset.data,
+        noise=sigma,
+        flags=dataset.flags,
+        meta=meta,
+        antenna1=dataset.antenna1,
+        antenna2=dataset.antenna2,
+        time=dataset.time,
+        weight_sigma=dataset.weight_sigma,
+    )

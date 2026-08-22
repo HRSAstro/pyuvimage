@@ -322,9 +322,141 @@ time-differenced visibilities give 3.696e-03 Jy (ratio 1.383)
 
 | `--noise` | what it does |
 |---|---|
-| **`difference`** (default) | Times-differences each baseline; ignores the weight column entirely. Falls back to one pooled value for baselines with too few integrations to measure their own σ. |
-| `scaled` | Keeps the **shape** of `WEIGHT` / `WEIGHT_SPECTRUM` — which does carry real Tsys, band-edge and atmospheric structure — and takes only the **scale** from the same time differences. Better than `difference` when baselines have few integrations, since the per-baseline and per-channel structure survives. It assumes the column's shape is right; if you don't believe that, use `difference`. |
+| **`difference`** (default) | Times-differences each baseline; ignores the weight column entirely. One σ per baseline, pooled over the whole track. |
+| `chunked` | The same, but within blocks of the track (`--noise-chunk`, default 600 s), so σ can change as the target rises and sets. Uses no weights. A chunk as long as the track reduces to `difference`. |
+| `hybrid` | Per-baseline level from the differences, **time profile** from the weights. Reduces to `difference` exactly when the weights carry no time dependence, so it cannot do worse. |
+| `scaled` | Whole shape from `WEIGHT` / `WEIGHT_SPECTRUM`, scale from the differences. |
 | `sigma` | Trusts the column as an absolute level. Warns, because it usually isn't one. |
+
+![which effect is visible to what](figures/noise_axes.png)
+
+**The two sources of information are blind on different axes**, which is why
+there is more than one mode.
+
+The weight column is *radiometric*: Tsys, bandwidth, integration time, flagged
+fraction. It therefore knows exactly what happens along the **time** axis —
+your target rises and sets, airmass and Tsys follow, and the column tracks it —
+and it knows per-antenna receiver temperature and a heterogeneous array. What
+it cannot know is anything downstream of the radiometry: **decorrelation**,
+which grows with baseline length because the atmosphere loses coherence faster
+over longer separations, or an antenna whose calibration is simply worse than
+its Tsys suggests. Two baselines with the same Tsys look identical to it.
+
+Differencing is the reverse. It measures whatever really made the data scatter,
+decorrelation included, so the **baseline** axis is honest — but
+`sigma_from_time_differences` pools each baseline's whole track into one
+number, the quadratic mean of σ(t), so it has no time resolution at all. On a
+30→70° track that hands the noisiest data ~2.3× more weight than it deserves.
+
+With both effects present neither wins: on a mock carrying 1.9× of elevation
+variation *and* 3.1× of baseline-dependent decorrelation, the median error in σ
+was 16.7% for `difference` and 17.0% for `scaled`. Taking each axis from the
+source that can see it gave **10.2%**.
+
+**You do not have to guess which regime your data is in — the import measures
+it.** Two checks run on every import and print what they find:
+
+```
+noise vs baseline length: measured/claimed is 0.16 on the shortest
+quartile and 0.23 on the longest (ratio 1.47)
+
+WARNING: the long baselines are 1.47x noisier than the weight column
+claims, relative to the short ones -- decorrelation or calibration
+quality, which the weights cannot see because they are purely
+radiometric. --noise scaled would discard that.
+```
+
+```
+WARNING: the noise level changes by at least 1.30x over the track
+(thirds: 6.92, 5.32, 6.92 mJy) -- elevation and Tsys, most likely.
+--noise difference gives every integration on a baseline the same
+sigma, so the noisiest data ends up over-weighted.
+```
+
+If the first fires, the weight column is missing baseline structure — stay off
+`scaled`. If the second fires, `difference` is missing the time dependence —
+`chunked` or `hybrid` recovers it. If neither fires, the default is fine.
+
+### When the noise is estimated, and how to change it later
+
+The estimate is made **once, when the data leaves the measurement set**, and
+stored in the dataset — `pyuvimage fit` never recomputes it, so a fit costs the
+same however the noise was derived.
+
+That used to mean the choice was frozen at import. It is not any more: exports
+carry `antenna1`, `antenna2`, `time` and the weight column's relative sigma, so
+any estimator can be applied afterwards without going back to the MS.
+
+```bash
+pyuvimage convert export.npz mydata/ --noise chunked
+```
+
+recomputes and **stores the result**, so no later run pays for it again. Use
+`--noise keep` (the default) to leave the map the export already wrote.
+
+Which matters, because the two paths in do not offer the same thing:
+
+| | `pyuvimage import` (needs python-casacore) | `casa_export.py` (runs inside CASA) |
+|---|---|---|
+| modes available at that step | all of them | `difference` only |
+| stores what is needed to change later | yes | yes |
+
+So on the CASA-script route you export once and pick the estimator at
+`convert` time. A dataset written by an older export has no antenna or time
+columns and will say so rather than guessing.
+
+### Choosing between `chunked` and `hybrid`
+
+Both fix the time axis; they differ in what they need. `chunked` measures it
+from the data, so it sees Tsys *and* phase together and needs no weight column
+at all — but it has to spend differences on it, and a σ from `n` differences
+carries about `1/√(2n)`. `hybrid` reads the time profile off the weights for
+free, but the weights are radiometric, and since decorrelation is driven by the
+same airmass as Tsys they get the direction of the time dependence right and
+the amplitude wrong.
+
+So it comes down to how many integrations land in a chunk — and **how much
+target time there is to divide up in the first place**. A typical ALMA
+execution runs 1–1.5 h *including* calibrator visits, which take 30–40% of it,
+so the target gets roughly 45–60 minutes. That is what the chunks have to
+split, and it is why the default is 600 s rather than something longer: it
+leaves 5–6 chunks of the track.
+
+Median error in σ on a simulated 75-minute execution with interleaved
+calibrators (48 min on source), carrying elevation-driven Tsys *and*
+decorrelation correlated with it:
+
+| chunk | 300 s | 450 s | **600 s** | 900 s | 1200 s | 1800 s | (`difference`) |
+|---|---|---|---|---|---|---|---|
+| 6 s integrations | 7.9% | 7.1% | **7.1%** | 8.1% | 8.2% | 10.7% | 22.4% |
+| 30 s integrations | 15.5% | 14.6% | **13.9%** | 12.7% | 12.2% | 14.2% | 22.1% |
+| 60 s integrations | 13.5% | 14.4% | **16.8%** | 18.0% | 17.3% | 18.3% | 26.0% |
+
+Too short and each σ comes from too few differences; too long and there is no
+time resolution left — by 1800 s it is most of the way back to `difference`.
+
+Two practical notes. Differences that span a **calibrator gap** are excluded
+automatically: over a 90 s gap the earth turns a 1.5 km baseline through
+~8 kλ, which changes the visibility of anything larger than an arcsecond, so
+such a difference would measure the source rather than the noise. And heavily
+averaged data — a continuum MS with a handful of timestamps — cannot be chunked
+at all; `chunked` detects that and falls back to `difference`.
+
+![difference vs scaled](figures/noise_methods.png)
+
+**Both `difference` and `scaled` difference in time; neither takes a plain std
+of the visibilities.** That matters, because a plain std measures the *source*
+as well as the noise — on a source 12× the noise it comes out ~650% high,
+which would over-smooth every fit. Differencing consecutive integrations on one
+baseline cancels the sky exactly, since it is the same sky both times.
+
+The two differ only in **how σ is allowed to vary** across the dataset.
+Estimating a baseline's own σ from `n` differences has a fractional error of
+about `1/√(2n)` — ±32% from five differences — and that noise in the noise map
+randomly up- and down-weights baselines. The weight column supplies the same
+shape essentially noise-free, at the cost of assuming its ratios are right.
+Below `MIN_DIFFS` differences per baseline, `difference` has no shape at all
+and every baseline takes the same pooled number.
 
 `WEIGHT_SPECTRUM` is used when present, for both the Stokes I average and the
 noise shape; without it every channel in a row shares one weight, which is
