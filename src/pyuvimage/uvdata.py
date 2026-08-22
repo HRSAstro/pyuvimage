@@ -664,7 +664,7 @@ def read_dataset(path: str | Path) -> "UVData | MultiSpwUVData":
     return UVData.read(path)
 
 
-NOISE_MODES = ("keep", "difference", "chunked", "hybrid", "scaled")
+NOISE_MODES = ("keep", "difference", "hybrid", "scaled")
 
 
 def recompute_noise(
@@ -722,16 +722,18 @@ def recompute_noise(
     if dataset.flags is not None:
         vis = np.where(dataset.flags, np.nan, vis)
 
+    chunk = (
+        noise_mod.DEFAULT_CHUNK_SECONDS
+        if chunk_seconds is None
+        else float(chunk_seconds)
+    )
     if mode == "difference":
-        sigma = noise_mod.sigma_from_time_differences(vis, a1, a2, t)
-    elif mode == "chunked":
-        sigma = noise_mod.sigma_in_time_chunks(
-            vis, a1, a2, t,
-            chunk_seconds=(
-                noise_mod.DEFAULT_CHUNK_SECONDS
-                if chunk_seconds is None
-                else float(chunk_seconds)
-            ),
+        # resolved in time where the data supports it, pooled per baseline
+        # where it does not -- `sigma_in_time_chunks` falls back on its own
+        sigma = (
+            noise_mod.sigma_in_time_chunks(vis, a1, a2, t, chunk_seconds=chunk)
+            if chunk > 0
+            else noise_mod.sigma_from_time_differences(vis, a1, a2, t)
         )
     elif mode == "hybrid":
         sigma = noise_mod.hybrid_sigma(vis, dataset.weight_sigma, a1, a2, t)
@@ -749,11 +751,8 @@ def recompute_noise(
 
     meta = dict(dataset.meta)
     meta["noise_estimate"] = mode
-    if mode == "chunked":
-        meta["noise_chunk_seconds"] = float(
-            noise_mod.DEFAULT_CHUNK_SECONDS if chunk_seconds is None
-            else chunk_seconds
-        )
+    if mode == "difference":
+        meta["noise_chunk_seconds"] = float(chunk)
     return UVData(
         uvw=dataset.uvw,
         frequencies=dataset.frequencies,

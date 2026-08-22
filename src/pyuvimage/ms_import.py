@@ -64,9 +64,10 @@ def import_ms(
         *scale* from the data:
 
         "difference" (default)
-            Pairwise time differences per baseline. Ignores the weight column
-            entirely. Falls back to one pooled number when a baseline has too
-            few integrations to measure its own sigma.
+            Pairwise time differences per baseline, resolved into blocks of
+            the track (`noise_chunk_seconds`) where there are enough
+            integrations and collapsing to one sigma per baseline where there
+            are not. Ignores the weight column entirely.
         "scaled"
             Take the *shape* from WEIGHT / WEIGHT_SPECTRUM -- which does carry
             real Tsys, band-edge and atmospheric structure -- and the absolute
@@ -305,9 +306,20 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         sigma_rel_2d = np.where(wsum > 0, 1.0 / np.sqrt(wsum), np.nan)
     sigma_rel = np.ascontiguousarray(sigma_rel_2d.T)   # (n_chan, n_vis)
 
-    differenced = noise_mod.sigma_from_time_differences(
-        vis, antenna1=ant1, antenna2=ant2, time=time
-    )
+    # Time-differencing, resolved into blocks of the track where there are
+    # enough integrations to support it and collapsing to one sigma per
+    # baseline where there are not -- `sigma_in_time_chunks` falls back on its
+    # own, so this is one mode, not two. `--noise-chunk 0` forces the pooled
+    # whole-track estimate.
+    if float(noise_chunk_seconds) > 0:
+        differenced = noise_mod.sigma_in_time_chunks(
+            vis, antenna1=ant1, antenna2=ant2, time=time,
+            chunk_seconds=float(noise_chunk_seconds),
+        )
+    else:
+        differenced = noise_mod.sigma_from_time_differences(
+            vis, antenna1=ant1, antenna2=ant2, time=time
+        )
     med_diff = float(np.median(differenced.real))
 
     # Does the noise level change over the track? `difference` returns one
@@ -387,17 +399,6 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         noise = noise + 1j * noise
         bad = ~np.isfinite(noise.real) | (noise.real <= 0)
         noise[bad] = med_diff * (1 + 1j)
-    elif noise_estimate == "chunked":
-        noise = noise_mod.sigma_in_time_chunks(
-            vis, antenna1=ant1, antenna2=ant2, time=time,
-            chunk_seconds=float(noise_chunk_seconds),
-        )
-        logger.info(
-            "noise time-differenced in %.0f s chunks: median sigma %.4g Jy "
-            "(%.2fx spread across the track)",
-            float(noise_chunk_seconds), float(np.median(noise.real)),
-            float(np.max(noise.real) / max(np.min(noise.real), 1e-30)),
-        )
     elif noise_estimate == "hybrid":
         noise = noise_mod.hybrid_sigma(
             vis, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
@@ -427,9 +428,13 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         )
     else:
         noise = differenced
+        spread = float(
+            np.max(noise.real) / max(np.min(noise.real), 1e-30)
+        )
         logger.info(
-            "noise from time-differenced visibilities: median sigma %.4g Jy",
-            med_diff,
+            "noise from time-differenced visibilities: median sigma %.4g Jy "
+            "(%.2fx spread across baselines and time)",
+            float(np.median(noise.real)), spread,
         )
 
     meta = {
@@ -446,7 +451,7 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         "telescope": telescope,
         "noise_estimate": noise_estimate,
         "noise_chunk_seconds": (
-            float(noise_chunk_seconds) if noise_estimate == "chunked" else None
+            float(noise_chunk_seconds) if noise_estimate == "difference" else None
         ),
     }
     return UVData(

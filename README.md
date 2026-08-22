@@ -298,177 +298,37 @@ Both effects are worst at the field edge, so size them for the most distant
 emission you care about, not for the phase centre. Averaging past those limits
 resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
 
-## Noise and the MS weights
+## Noise
 
-**The noise is recomputed on every import.** `SIGMA` is nominally
-`1/√(2Δν Δt)` — an absolute number — but that only holds if the calibration
-put it on an absolute scale. In practice a pipeline sets weights *proportional*
-to the true inverse variance without being equal to it, and every `split`,
-`mstransform` or averaging step rescales them again. See the
-[CASA memo on data weights](https://casa.nrao.edu/Memos/CASA-data-weights.pdf).
+**pyuvimage estimates the noise from the visibilities themselves and does not
+use the MS weights for it.** `SIGMA` and `WEIGHT` are nominally absolute but in
+practice only relative — a pipeline sets them proportional to the true inverse
+variance, and `split`, `mstransform` and averaging rescale them again. Since
+everything downstream scales with σ (χ², the smoothing criterion,
+`uncertainty.fits`), a weight column off by 40% quietly changes the answer.
 
-This matters more than it sounds. Everything downstream scales with σ: `χ²`,
-the discrepancy criterion that chooses how much to smooth, and every
-uncertainty in `uncertainty.fits`. A weight column off by 40% stops the fit
-early and leaves real emission in the residual — which is exactly what
-happened on the first dataset this was tried on.
+The estimate differences visibilities adjacent in time on the same baseline, so
+the sky cancels and what is left is noise. It is made **once**, when the data
+leaves the measurement set, and stored — fits never recompute it.
 
-Every import prints the comparison, whichever mode you use:
+`--noise difference` (the default) needs nothing but the visibilities and is
+the right answer for almost everyone. Three alternatives use the weight column
+to varying degrees, and every import prints diagnostics saying whether your
+data would benefit: see **[docs/noise.md](docs/noise.md)**.
 
-```
-noise check: MS weights imply median sigma 5.111e-03 Jy,
-time-differenced visibilities give 3.696e-03 Jy (ratio 1.383)
-```
-
-| `--noise` | what it does |
-|---|---|
-| **`difference`** (default) | Times-differences each baseline; ignores the weight column entirely. One σ per baseline, pooled over the whole track. |
-| `chunked` | The same, but within blocks of the track (`--noise-chunk`, default 600 s), so σ can change as the target rises and sets. Uses no weights. A chunk as long as the track reduces to `difference`. |
-| `hybrid` | Per-baseline level from the differences, **time profile** from the weights. Reduces to `difference` exactly when the weights carry no time dependence, so it cannot do worse. |
-| `scaled` | Whole shape from `WEIGHT` / `WEIGHT_SPECTRUM`, scale from the differences. |
-| `sigma` | Trusts the column as an absolute level. Warns, because it usually isn't one. |
-
-![which effect is visible to what](figures/noise_axes.png)
-
-**The two sources of information are blind on different axes**, which is why
-there is more than one mode.
-
-The weight column is *radiometric*: Tsys, bandwidth, integration time, flagged
-fraction. It therefore knows exactly what happens along the **time** axis —
-your target rises and sets, airmass and Tsys follow, and the column tracks it —
-and it knows per-antenna receiver temperature and a heterogeneous array. What
-it cannot know is anything downstream of the radiometry: **decorrelation**,
-which grows with baseline length because the atmosphere loses coherence faster
-over longer separations, or an antenna whose calibration is simply worse than
-its Tsys suggests. Two baselines with the same Tsys look identical to it.
-
-Differencing is the reverse. It measures whatever really made the data scatter,
-decorrelation included, so the **baseline** axis is honest — but
-`sigma_from_time_differences` pools each baseline's whole track into one
-number, the quadratic mean of σ(t), so it has no time resolution at all. On a
-30→70° track that hands the noisiest data ~2.3× more weight than it deserves.
-
-With both effects present neither wins: on a mock carrying 1.9× of elevation
-variation *and* 3.1× of baseline-dependent decorrelation, the median error in σ
-was 16.7% for `difference` and 17.0% for `scaled`. Taking each axis from the
-source that can see it gave **10.2%**.
-
-**You do not have to guess which regime your data is in — the import measures
-it.** Two checks run on every import and print what they find:
-
-```
-noise vs baseline length: measured/claimed is 0.16 on the shortest
-quartile and 0.23 on the longest (ratio 1.47)
-
-WARNING: the long baselines are 1.47x noisier than the weight column
-claims, relative to the short ones -- decorrelation or calibration
-quality, which the weights cannot see because they are purely
-radiometric. --noise scaled would discard that.
-```
-
-```
-WARNING: the noise level changes by at least 1.30x over the track
-(thirds: 6.92, 5.32, 6.92 mJy) -- elevation and Tsys, most likely.
---noise difference gives every integration on a baseline the same
-sigma, so the noisiest data ends up over-weighted.
-```
-
-If the first fires, the weight column is missing baseline structure — stay off
-`scaled`. If the second fires, `difference` is missing the time dependence —
-`chunked` or `hybrid` recovers it. If neither fires, the default is fine.
-
-### When the noise is estimated, and how to change it later
-
-The estimate is made **once, when the data leaves the measurement set**, and
-stored in the dataset — `pyuvimage fit` never recomputes it, so a fit costs the
-same however the noise was derived.
-
-That used to mean the choice was frozen at import. It is not any more: exports
-carry `antenna1`, `antenna2`, `time` and the weight column's relative sigma, so
-any estimator can be applied afterwards without going back to the MS.
+To change the estimate on an existing dataset without re-exporting:
 
 ```bash
-pyuvimage convert export.npz mydata/ --noise chunked
+pyuvimage convert export.npz mydata/ --noise difference
 ```
-
-recomputes and **stores the result**, so no later run pays for it again. Use
-`--noise keep` (the default) to leave the map the export already wrote.
-
-Which matters, because the two paths in do not offer the same thing:
-
-| | `pyuvimage import` (needs python-casacore) | `casa_export.py` (runs inside CASA) |
-|---|---|---|
-| modes available at that step | all of them | `difference` only |
-| stores what is needed to change later | yes | yes |
-
-So on the CASA-script route you export once and pick the estimator at
-`convert` time. A dataset written by an older export has no antenna or time
-columns and will say so rather than guessing.
-
-### Choosing between `chunked` and `hybrid`
-
-Both fix the time axis; they differ in what they need. `chunked` measures it
-from the data, so it sees Tsys *and* phase together and needs no weight column
-at all — but it has to spend differences on it, and a σ from `n` differences
-carries about `1/√(2n)`. `hybrid` reads the time profile off the weights for
-free, but the weights are radiometric, and since decorrelation is driven by the
-same airmass as Tsys they get the direction of the time dependence right and
-the amplitude wrong.
-
-So it comes down to how many integrations land in a chunk — and **how much
-target time there is to divide up in the first place**. A typical ALMA
-execution runs 1–1.5 h *including* calibrator visits, which take 30–40% of it,
-so the target gets roughly 45–60 minutes. That is what the chunks have to
-split, and it is why the default is 600 s rather than something longer: it
-leaves 5–6 chunks of the track.
-
-Median error in σ on a simulated 75-minute execution with interleaved
-calibrators (48 min on source), carrying elevation-driven Tsys *and*
-decorrelation correlated with it:
-
-| chunk | 300 s | 450 s | **600 s** | 900 s | 1200 s | 1800 s | (`difference`) |
-|---|---|---|---|---|---|---|---|
-| 6 s integrations | 7.9% | 7.1% | **7.1%** | 8.1% | 8.2% | 10.7% | 22.4% |
-| 30 s integrations | 15.5% | 14.6% | **13.9%** | 12.7% | 12.2% | 14.2% | 22.1% |
-| 60 s integrations | 13.5% | 14.4% | **16.8%** | 18.0% | 17.3% | 18.3% | 26.0% |
-
-Too short and each σ comes from too few differences; too long and there is no
-time resolution left — by 1800 s it is most of the way back to `difference`.
-
-Two practical notes. Differences that span a **calibrator gap** are excluded
-automatically: over a 90 s gap the earth turns a 1.5 km baseline through
-~8 kλ, which changes the visibility of anything larger than an arcsecond, so
-such a difference would measure the source rather than the noise. And heavily
-averaged data — a continuum MS with a handful of timestamps — cannot be chunked
-at all; `chunked` detects that and falls back to `difference`.
-
-![difference vs scaled](figures/noise_methods.png)
-
-**Both `difference` and `scaled` difference in time; neither takes a plain std
-of the visibilities.** That matters, because a plain std measures the *source*
-as well as the noise — on a source 12× the noise it comes out ~650% high,
-which would over-smooth every fit. Differencing consecutive integrations on one
-baseline cancels the sky exactly, since it is the same sky both times.
-
-The two differ only in **how σ is allowed to vary** across the dataset.
-Estimating a baseline's own σ from `n` differences has a fractional error of
-about `1/√(2n)` — ±32% from five differences — and that noise in the noise map
-randomly up- and down-weights baselines. The weight column supplies the same
-shape essentially noise-free, at the cost of assuming its ratios are right.
-Below `MIN_DIFFS` differences per baseline, `difference` has no shape at all
-and every baseline takes the same pooled number.
-
-`WEIGHT_SPECTRUM` is used when present, for both the Stokes I average and the
-noise shape; without it every channel in a row shares one weight, which is
-wrong at the edges of any real spw.
 
 ## How it works
 
 1. **Import** forms Stokes I from the parallel hands (respecting flags) and
    **recomputes the per-visibility noise from the data**, by differencing
    visibilities adjacent in time on the same baseline (σ = std(diff)/√2). The
-   MS weight column is never trusted for scale — see *Noise and the MS weights*
-   below.
+   MS weight column is never trusted for scale — see
+   [docs/noise.md](docs/noise.md).
 2. **MFS** fits all channels jointly, each with its exact uv coordinates in
    wavelengths (no channel-averaging approximation). **Cube** mode fits each
    channel with the regularisation frozen from an MFS fit.
@@ -495,6 +355,7 @@ wrong at the edges of any real spw.
 
 | doc | what is in it |
 |---|---|
+| [docs/noise.md](docs/noise.md) | why the MS weights are not trusted, the four estimators, and the diagnostics that pick between them |
 | [docs/priors.md](docs/priors.md) | what each prior is, and how they compare across three mocks |
 | [docs/uncertainty.md](docs/uncertainty.md) | the uncertainty map in full, with the Monte Carlo validation |
 | [docs/point-sources.md](docs/point-sources.md) | how delta components are solved, and the detection guards |
@@ -503,6 +364,6 @@ wrong at the edges of any real spw.
 
 ## Development
 
-`python -m pytest tests/` — 58 tests, including end-to-end regressions on
+`python -m pytest tests/` — 159 tests, including end-to-end regressions on
 simulated data (adjoint consistency, flux conservation, WCS, restore centring,
 the noise estimator, and one test per bug listed in the docs above).

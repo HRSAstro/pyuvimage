@@ -1,15 +1,20 @@
-"""Time-differencing in chunks: recover the time axis from the data alone.
+"""How `--noise difference` resolves the noise in time.
 
-Hannah's suggestion, and it fills the gap the other modes leave. `difference`
-pools a baseline's whole track into one number and cannot see elevation. The
-weight column can, but only radiometrically: it stops at Tsys and is blind to
-decorrelation. Since decorrelation is driven by the *same* airmass as Tsys, the
-weights get the direction of the time dependence right and the amplitude wrong.
-Chunking measures the real scatter inside each block of the track, so it sees
-Tsys and phase together, and needs no weights.
+Hannah's suggestion, and it is not a separate mode: `difference` chunks the
+track where there are enough integrations to support it and collapses to one
+sigma per baseline where there is not, so the two reduce to the same thing.
+`sigma_in_time_chunks` is the implementation and `sigma_from_time_differences`
+is the limit it falls back to.
+
+Why it is worth doing at all: pooling a baseline's whole track cannot see
+elevation. The weight column can, but only radiometrically -- it stops at Tsys
+and is blind to decorrelation. Since decorrelation is driven by the *same*
+airmass as Tsys, the weights get the direction of the time dependence right and
+the amplitude wrong. Chunking measures the real scatter inside each block, so
+it sees Tsys and phase together, and needs no weights.
 
 The cost is estimation noise: a sigma from `n` differences carries ~1/sqrt(2n),
-so the chunk has to be long enough to hold enough of them.
+so a block has to be long enough to hold enough of them.
 """
 
 import numpy as np

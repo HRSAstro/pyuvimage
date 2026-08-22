@@ -58,7 +58,7 @@ def _dataset(seed=0, with_weights=True, with_rows=True, wrong_noise=0.09):
 
 def test_every_mode_recovers_the_real_level():
     uvd, truth = _dataset()
-    for mode in ("difference", "chunked", "hybrid", "scaled"):
+    for mode in ("difference", "hybrid", "scaled"):
         out = recompute_noise(uvd, mode)
         assert np.median(out.noise.real) == pytest.approx(
             np.median(truth), rel=0.25
@@ -127,12 +127,12 @@ def test_flagged_samples_do_not_steer_the_estimate():
 def test_it_round_trips_through_a_dataset_directory(tmp_path):
     """The point of caching: write once, and later runs just read it."""
     uvd, truth = _dataset()
-    fixed = recompute_noise(uvd, "chunked")
+    fixed = recompute_noise(uvd, "difference")
     fixed.write(tmp_path / "ds")
 
     back = read_dataset(tmp_path / "ds")
     assert np.allclose(back.noise, fixed.noise)
-    assert back.meta["noise_estimate"] == "chunked"
+    assert back.meta["noise_estimate"] == "difference"
     # and the ingredients survived, so the mode can still be changed later
     assert back.can_reestimate_noise
     assert back.weight_sigma is not None
@@ -151,4 +151,4 @@ def test_multi_spw_recomputes_every_window(tmp_path):
 
 def test_the_mode_list_is_what_the_cli_offers():
     assert NOISE_MODES[0] == "keep"
-    assert set(NOISE_MODES) == {"keep", "difference", "chunked", "hybrid", "scaled"}
+    assert set(NOISE_MODES) == {"keep", "difference", "hybrid", "scaled"}

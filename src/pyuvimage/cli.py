@@ -67,27 +67,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_imp.add_argument(
         "--noise", default="difference",
-        choices=["difference", "chunked", "hybrid", "scaled", "sigma"],
+        choices=["difference", "hybrid", "scaled", "sigma"],
         help="how to set the per-visibility noise. MS weights are relative, "
-        "not absolute, so the scale is recomputed from the data either way: "
-        '"difference" (default) times-differences each baseline and ignores '
-        'the weight column; "scaled" keeps the WEIGHT/WEIGHT_SPECTRUM shape '
-        "(Tsys, band edges, atmospheric lines) and takes only the scale from "
-        'the differences; "chunked" time-differences within blocks of the '
-        "track (--noise-chunk seconds) so the noise can change as the target "
-        'rises and sets, using no weights at all; "hybrid" takes the '
-        "per-baseline level from the data and only the time profile from the "
-        'weights, which is where each is strongest; "sigma" trusts the SIGMA '
-        "column and warns, because it is usually wrong in scale",
+        "not absolute, so the scale is always recomputed from the data. "
+        '"difference" (default) times-differences the visibilities and uses '
+        'no weights; "hybrid" adds the weight column\'s time profile; '
+        '"scaled" takes the whole shape from the weights; "sigma" trusts the '
+        "SIGMA column and warns. See docs/noise.md",
     )
     p_imp.add_argument(
         "--noise-chunk", type=float, default=600.0,
-        help="chunk length in seconds for --noise chunked (default 600). A "
-        "typical ALMA execution is 1-1.5 h including calibrators, which take "
-        "30-40%% of it, so only ~45-60 min of target time is there to divide "
-        "up; 600 s leaves 5-6 chunks of it. Shorter follows the track more "
-        "closely but measures each sigma from fewer differences. A chunk as "
-        "long as the track reduces to --noise difference",
+        help="how finely --noise difference resolves the noise in time, in "
+        "seconds (default 600). Blocks with too few integrations fall back to "
+        "one sigma per baseline automatically; 0 forces that everywhere. "
+        "See docs/noise.md",
     )
     p_imp.add_argument("--overwrite", action="store_true")
 
@@ -99,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
     p_conv.add_argument("--overwrite", action="store_true")
     p_conv.add_argument(
         "--noise", default="keep",
-        choices=["keep", "difference", "chunked", "hybrid", "scaled"],
+        choices=["keep", "difference", "hybrid", "scaled"],
         help="re-estimate the noise while converting, and store the result so "
         "no later run pays for it again. Default 'keep' uses the map already "
         "in the .npz. Needs the antenna/time columns the export stores; "
@@ -107,7 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_conv.add_argument(
         "--noise-chunk", type=float, default=None,
-        help="chunk length in seconds for --noise chunked (default 600)",
+        help="how finely --noise difference resolves the noise in time, in "
+        "seconds (default 600); 0 for one sigma per baseline",
     )
 
     p_fit = sub.add_parser("fit", help="reconstruct an image or cube")
