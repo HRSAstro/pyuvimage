@@ -76,6 +76,17 @@ with a colour bar), `fit_parameters.json` (every parameter of the run),
 `prior_scan.json` (every hyperparameter trial), and `point_sources.json` when
 point components are fitted.
 
+![summary.png for PJ0116 at 245 GHz](figures/pj0116_summary.png)
+
+A real one: PJ0116 at 245 GHz, an ALMA Band 6 continuum observation of a
+lensed source (2 spectral windows x 1 channel, 5158 visibility samples,
+`--fov 8`). The arc and its counter-image are reconstructed at χ²/N = 1.007,
+the residual peaks at 3.7σ — 5% of the source peak, a dynamic range of 20:1 —
+and the residual map is featureless, which is what you want to see. The model
+panel is in Jy/pixel and the reconvolved panel in Jy/beam, which is why they
+look so different: the model is the sky at the mesh scale, not smoothed by the
+beam.
+
 ## The settings worth knowing about
 
 `--fov` is the only required input; everything else has a default that is

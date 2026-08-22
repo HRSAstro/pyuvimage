@@ -200,7 +200,10 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw, noise_es
     ant1 = sel.getcol("ANTENNA1")
     ant2 = sel.getcol("ANTENNA2")
     time = sel.getcol("TIME")
-    sigma_col = sel.getcol("SIGMA")  # (n_row, n_corr)
+    # SIGMA is not read: it is 1/sqrt(WEIGHT) by definition, and the Stokes I
+    # noise has to be derived from the *same* weights used to form the average
+    # (1/sqrt(sum w)), or the two are inconsistent. See "Noise and the MS
+    # weights" in the README.
     # WEIGHT_SPECTRUM is optional (CASA 4.3+) and is the only place per-channel
     # sensitivity lives: band edges, atmospheric lines, spectral Tsys. Without
     # it every channel of a row shares one weight, which is wrong at the band
