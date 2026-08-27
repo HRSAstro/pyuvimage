@@ -119,7 +119,6 @@ def test_visibilities_match_the_dft(problem):
     assert np.max(np.abs(got - ref)) / np.std(np.abs(ref)) < 1e-3
 
 
-@pynufft_only
 def _skip_without_upstream_legacy_class():
     """Two tests demonstrate the *upstream* class's half-pixel bug by running
     it uncorrected. PyAutoArray PR #475 (2026.8.23.1) deleted that class, so
@@ -129,10 +128,16 @@ def _skip_without_upstream_legacy_class():
         pytest.skip("autoarray no longer ships TransformerNUFFTPyNUFFT")
 
 
+@pynufft_only
 def test_the_uncorrected_transformer_really_is_off(problem):
-    _skip_without_upstream_legacy_class()
     """Guard against the correction being quietly removed as a no-op -- and
-    against upstream fixing it, which would make the wrapper double-shift."""
+    against upstream fixing it, which would make the wrapper double-shift.
+
+    Doubly conditional: it needs pynufft installed *and* an autoarray old
+    enough to still ship the legacy class. `@pynufft_only` used to sit on the
+    helper below rather than on the tests, where a mark does nothing, so
+    without pynufft this failed instead of skipping."""
+    _skip_without_upstream_legacy_class()
     uv, _, _, _, mask, image = problem
     ref = np.asarray(
         ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)

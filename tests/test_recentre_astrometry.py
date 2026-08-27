@@ -21,7 +21,9 @@ import pyuvimage
 from pyuvimage import mock
 
 # a source well off the phase centre, asymmetric in both axes so that no sign
-# error can hide behind a coincidence
+# error can hide behind a coincidence. X, Y are what a user types (image axes);
+# D_RA, D_DEC are the sky pair every product is written in.
+X, Y = -0.9, -1.3
 D_RA, D_DEC = 0.9, -1.3
 
 
@@ -33,7 +35,7 @@ def recentred(tmp_path_factory):
     )
     out = tmp_path_factory.mktemp("recentred")
     pyuvimage.run(
-        uvd, fov=2.0, out=out, image_centre=(D_RA, D_DEC),
+        uvd, fov=2.0, out=out, image_centre=(X, Y),
         reg="matern", coefficient=1e4, uncertainty_map=False,
         pb_correction=False, mask_shape="square",
     )

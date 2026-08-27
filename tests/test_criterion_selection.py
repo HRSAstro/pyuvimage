@@ -265,3 +265,59 @@ def test_an_untroubled_fit_records_positivity_as_asked(demo_geometry):
         prior={"coefficient": 1e3},
     )
     assert sf.positive_only is True
+
+
+# --- controlling the positivity fallback -----------------------------------
+
+def test_enforce_positive_keeps_positivity_through_a_bad_solver(
+    monkeypatch, demo_geometry
+):
+    """By default a solver caught ignoring the prior gets switched off, which
+    is right when the goal is a good image and wrong when a strictly
+    non-negative model is the point. `enforce_positive` picks the other
+    side."""
+    dataset, geometry = demo_geometry
+    n_data = 2 * len(np.asarray(dataset.data))
+    monkeypatch.setattr(
+        fitting, "fit_at",
+        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
+    )
+    default = fitting.fit_dataset(
+        dataset, geometry, reg_kind="constant", positive_only=True
+    )
+    forced = fitting.fit_dataset(
+        dataset, geometry, reg_kind="constant", positive_only=True,
+        enforce_positive=True,
+    )
+    assert default.positive_only is False
+    assert forced.positive_only is True
+
+
+def test_enforce_positive_still_says_the_solver_looked_wrong(
+    monkeypatch, demo_geometry, caplog
+):
+    """Keeping positivity must not mean hiding why that is a compromise."""
+    import logging
+
+    dataset, geometry = demo_geometry
+    n_data = 2 * len(np.asarray(dataset.data))
+    monkeypatch.setattr(
+        fitting, "fit_at",
+        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
+    )
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        fitting.fit_dataset(
+            dataset, geometry, reg_kind="constant", positive_only=True,
+            enforce_positive=True,
+        )
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "unreliable" in said and "enforce_positive" in said
+
+
+def test_enforce_positive_does_nothing_when_the_solver_is_fine(demo_geometry):
+    dataset, geometry = demo_geometry
+    sf = fitting.fit_dataset(
+        dataset, geometry, reg_kind="constant", positive_only=True,
+        prior={"coefficient": 1e3}, enforce_positive=True,
+    )
+    assert sf.positive_only is True

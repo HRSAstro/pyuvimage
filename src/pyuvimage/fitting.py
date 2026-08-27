@@ -12,6 +12,7 @@ maximisation is available as an alternative criterion.
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass, field
 
@@ -222,6 +223,64 @@ def pynufft_transformer_class():
     return _PYNUFFT_CLASS
 
 
+_CHUNKED_NUFFT_CLASS = None
+
+
+def chunked_nufft_transformer_class():
+    """`TransformerNUFFT` with the mapping-matrix transform split into blocks.
+
+    Upstream passes every mesh pixel through one batched `nufft2d2`, and
+    nufftax materialises a `n_mesh x n_vis x nspread^2` complex gather buffer
+    for it (see `nufftax_gather_gb`). On any real dataset that is tens to
+    hundreds of GB, and the process is killed with no traceback -- `Killed: 9`
+    and nothing else. autoarray's own `chunk_size` argument caps exactly this
+    buffer, but `transform_mapping_matrix` is the one path that ignores it.
+
+    Splitting by mesh pixel is the safe axis: the columns are independent, so
+    the blocks concatenate with no accumulation and no change to the result.
+    The cost is one nufft2d2 call per block instead of one in total.
+
+    Built lazily, and never used unless the whole-stack call would not fit --
+    `nufftax_block_columns` returns the full width whenever it would.
+    """
+    global _CHUNKED_NUFFT_CLASS
+    if _CHUNKED_NUFFT_CLASS is not None:
+        return _CHUNKED_NUFFT_CLASS
+
+    class TransformerNUFFTChunked(ag.TransformerNUFFT):
+        def transform_mapping_matrix(self, mapping_matrix, xp=np):
+            n_src = int(mapping_matrix.shape[1])
+            block = nufftax_block_columns(
+                int(self.total_visibilities), n_src, eps=self.eps
+            )
+            if block >= n_src:
+                return super().transform_mapping_matrix(mapping_matrix, xp=xp)
+            if not getattr(self, "_chunk_reported", False):
+                self._chunk_reported = True
+                logger.warning(
+                    "the JAX NUFFT would need %.0f GB to transform this "
+                    "mapping matrix in one batch, so it is being split into "
+                    "%d blocks of %d mesh pixel(s) -- correct, but %d times "
+                    "the NUFFT calls, on every trial of the hyperparameter "
+                    "search. `--transformer pynufft` avoids the batching "
+                    "entirely and is the faster path at this size.",
+                    nufftax_gather_gb(
+                        int(self.total_visibilities), n_src, self.eps
+                    ),
+                    -(-n_src // block), block, -(-n_src // block),
+                )
+            parts = [
+                super(TransformerNUFFTChunked, self).transform_mapping_matrix(
+                    mapping_matrix[:, j : j + block], xp=xp
+                )
+                for j in range(0, n_src, block)
+            ]
+            return xp.concatenate(parts, axis=1)
+
+    _CHUNKED_NUFFT_CLASS = TransformerNUFFTChunked
+    return _CHUNKED_NUFFT_CLASS
+
+
 def _require_pynufft():
     cls = pynufft_transformer_class()
     if cls is None:
@@ -230,6 +289,209 @@ def _require_pynufft():
             "`pip install pynufft`."
         )
     return cls
+
+
+# Peak resident memory of one inversion, per (visibility x mesh pixel).
+#
+# The inversion builds a transformed mapping matrix of n_vis x n_mesh complex
+# entries -- 16 bytes each -- and holds roughly three of them at once (the
+# matrix, its real/imaginary split, and the curvature product). Measured on
+# Ruby (148,477 visibilities) on the NumPy/pynufft path:
+#
+#     mesh 16 (256 px)    3.8e7 elements    1.90 GB    50 B/element
+#     mesh 24 (576 px)    8.6e7 elements    3.78 GB    44 B/element
+#     mesh 32 (1024 px)   1.5e8 elements    OOM >7 GB  (~46 B/element)
+#
+# so ~44 B/element plus a fixed overhead. This is a floor, not a guarantee:
+# JAX holds its own buffers and can need more.
+BYTES_PER_MAPPING_ELEMENT = 44
+MEMORY_BASE_GB = 0.4
+
+
+def estimate_peak_memory_gb(n_vis: int, n_mesh_pixels: int) -> float:
+    """Rough peak RSS for one inversion, in GB.
+
+    Note what it scales with: **n_vis x n_mesh**, not the number of image
+    pixels. That is why a small field over a large dataset can need far more
+    memory than a large field over a small one -- Ruby at a 26x26 mesh needs
+    ~8x what PJ0116 needs at 50x50, because Ruby has 29x the visibilities.
+    """
+    elements = float(n_vis) * float(n_mesh_pixels)
+    return MEMORY_BASE_GB + elements * BYTES_PER_MAPPING_ELEMENT / 1e9
+
+
+# --------------------------------------------------------------------------
+# The nufftax (JAX) path is a different memory regime entirely
+# --------------------------------------------------------------------------
+#
+# `TransformerNUFFT.transform_mapping_matrix` scatters every mesh pixel into
+# its own image and passes the whole stack through one batched `nufft2d2`
+# call. Inside nufftax the type-2 interpolation materialises its gather
+# buffer in full (`core/spread.py::interp_2d_impl`):
+#
+#     fw_gathered = fw_flat[:, indices_flat].reshape(-1, M, nspread, nspread)
+#     c = jnp.sum(fw_gathered * weights_2d[None], axis=(-2, -1))
+#
+# so the peak is `n_mesh x n_vis x nspread^2` complex128, twice over -- the
+# gather and the weighted product are separate arrays, and nufftax is not
+# jitted, so nothing fuses them away. autoarray knows about this buffer (its
+# `chunk_size` argument exists to cap it) but `transform_mapping_matrix`
+# never uses `chunk_size`; only the plain forward/adjoint calls do.
+#
+# `nspread` follows the requested precision, and autoarray asks for
+# `eps=1e-12` by default, which is the widest kernel nufftax will build.
+NUFFTAX_DEFAULT_EPS = 1e-12
+NUFFTAX_MAX_KERNEL_WIDTH = 16
+# Fraction of available memory the gather buffer may occupy before the
+# batched call is split (or another transformer preferred).
+NUFFTAX_GATHER_BUDGET = 0.25
+
+
+def nufftax_kernel_width(eps: float = NUFFTAX_DEFAULT_EPS) -> int:
+    """`nspread` for a requested precision -- nufftax's own heuristic.
+
+    From `nufftax.core.kernel.compute_kernel_params`: `ceil(log10(1/eps) + 1)`,
+    rounded up to even and capped at 16. eps=1e-12 gives 14, so 196 grid taps
+    per visibility per mesh pixel; eps=1e-6 gives 8, so 64.
+    """
+    width = int(math.ceil(math.log10(1.0 / float(eps)) + 1.0))
+    width = max(2, min(width, NUFFTAX_MAX_KERNEL_WIDTH))
+    return width + 1 if width % 2 else width
+
+
+def nufftax_gather_gb(
+    n_vis: int, n_mesh_pixels: int, eps: float = NUFFTAX_DEFAULT_EPS
+) -> float:
+    """Peak GB of the batched nufft2d2 gather buffer, in one call.
+
+    This dwarfs everything else in the inversion. Ruby at a 20x20 mesh --
+    148,477 visibilities, 400 mesh pixels, the fit whose mapping matrix is a
+    harmless 0.5 GB -- needs 186 GB here.
+    """
+    width = nufftax_kernel_width(eps)
+    elements = float(n_mesh_pixels) * float(n_vis) * width * width
+    return 2.0 * elements * 16.0 / 1e9
+
+
+def nufftax_block_columns(
+    n_vis: int,
+    n_mesh_pixels: int,
+    eps: float = NUFFTAX_DEFAULT_EPS,
+    available_gb: float | None = None,
+) -> int:
+    """Mesh pixels per batched nufft2d2 call that keep the gather buffer down.
+
+    Returns `n_mesh_pixels` when the whole stack already fits, so the
+    unchunked upstream call is used unchanged wherever it is affordable.
+    """
+    if available_gb is None:
+        available_gb = available_memory_gb()
+    if not available_gb or available_gb <= 0:
+        return n_mesh_pixels
+    per_column = nufftax_gather_gb(n_vis, 1, eps)
+    if per_column <= 0:
+        return n_mesh_pixels
+    budget = NUFFTAX_GATHER_BUDGET * available_gb
+    return int(max(1, min(n_mesh_pixels, math.floor(budget / per_column))))
+
+
+def available_memory_gb() -> float | None:
+    """Usable memory in GB, or None if it cannot be determined.
+
+    Deliberately best-effort: a wrong number here must never stop a fit that
+    would have worked.
+    """
+    try:  # pragma: no cover - platform dependent
+        import psutil
+
+        return float(psutil.virtual_memory().available) / 1e9
+    except Exception:
+        pass
+    try:  # pragma: no cover - Linux
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) * 1024 / 1e9
+    except Exception:
+        pass
+    try:  # pragma: no cover - macOS and other POSIX: total, not available
+        import os
+
+        return (
+            os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        )
+    except Exception:
+        return None
+
+
+def transformer_memory_gb(transformer_cls, n_vis: int, n_mesh_pixels: int) -> float:
+    """Extra GB the chosen transformer needs on top of the mapping matrix.
+
+    Only the nufftax-backed `TransformerNUFFT` has one worth counting, and it
+    is not a correction -- it is usually the whole bill. Chunking bounds it,
+    so the figure follows the block size the transform will actually use.
+    """
+    if transformer_cls is None:
+        return 0.0
+    try:
+        is_nufftax = issubclass(transformer_cls, ag.TransformerNUFFT)
+    except TypeError:
+        return 0.0
+    if not is_nufftax:
+        return 0.0
+    chunked = _CHUNKED_NUFFT_CLASS is not None and issubclass(
+        transformer_cls, _CHUNKED_NUFFT_CLASS
+    )
+    block = (
+        nufftax_block_columns(n_vis, n_mesh_pixels)
+        if chunked else n_mesh_pixels
+    )
+    return nufftax_gather_gb(n_vis, block)
+
+
+def check_memory(
+    n_vis: int, n_mesh_pixels: int, transformer_cls=None
+) -> None:
+    """Say what the fit will need, and warn before it is killed.
+
+    An OOM kill gives the user nothing -- `Killed: 9` and no traceback -- so
+    the useful moment to speak is before the allocation, while a smaller
+    --mesh or --fov is still an option.
+
+    ``transformer_cls`` matters more than everything else put together on the
+    JAX path: the mapping matrix for Ruby at a 20x20 mesh is 0.5 GB, and the
+    batched nufft2d2 that transforms it asks for 186 GB.
+    """
+    need = estimate_peak_memory_gb(n_vis, n_mesh_pixels)
+    need += transformer_memory_gb(transformer_cls, n_vis, n_mesh_pixels)
+    have = available_memory_gb()
+    if have is None:
+        logger.info("this fit needs roughly %.1f GB of memory", need)
+        return
+    logger.info(
+        "this fit needs roughly %.1f GB; about %.1f GB is available", need, have
+    )
+    if need > have:
+        logger.warning(
+            "estimated peak memory (%.1f GB) exceeds what looks available "
+            "(%.1f GB), so this fit may be killed outright -- an OOM kill "
+            "prints nothing useful. Memory scales as n_vis x n_mesh, so the "
+            "levers are --mesh (or a coarser --pixel-scale) and --fov, not "
+            "the image size. A mesh of %d per side would fit.",
+            need, have, _mesh_that_fits(n_vis, have),
+        )
+    elif need > 0.8 * have:
+        logger.info(
+            "  that is most of the available memory; if it is killed, reduce "
+            "--mesh or --fov"
+        )
+
+
+def _mesh_that_fits(n_vis: int, available_gb: float) -> int:
+    """Largest square mesh whose estimate stays under 80% of `available_gb`."""
+    budget = max(0.8 * available_gb - MEMORY_BASE_GB, 0.0) * 1e9
+    n_pix = budget / (BYTES_PER_MAPPING_ELEMENT * max(n_vis, 1))
+    return max(int(np.sqrt(max(n_pix, 1.0))), 1)
 
 
 def jax_available() -> bool:
@@ -280,20 +542,49 @@ def jax_path_diagnosis() -> str | None:
     return None
 
 
+def _jax_nufft_class(n_vis: int, n_mesh_pixels: int | None):
+    """`TransformerNUFFT`, chunked if its one-shot gather buffer will not fit.
+
+    The chunked subclass is a no-op wherever the plain call is affordable, so
+    this is safe to return unconditionally -- but only return the chunked one
+    when we have the mesh size to judge with.
+    """
+    if not n_mesh_pixels:
+        return ag.TransformerNUFFT
+    if nufftax_block_columns(n_vis, n_mesh_pixels) >= n_mesh_pixels:
+        return ag.TransformerNUFFT
+    return chunked_nufft_transformer_class()
+
+
 def resolve_transformer(
-    n_vis: int, transformer: str = "auto", n_image_pixels: int | None = None
+    n_vis: int,
+    transformer: str = "auto",
+    n_image_pixels: int | None = None,
+    n_mesh_pixels: int | None = None,
 ):
     """Pick the Fourier transform implementation.
 
-    ``n_image_pixels`` matters as much as ``n_vis``: the direct DFT allocates
-    ``n_image_pixels x n_vis`` float64 temporaries, so a modest number of
-    visibilities on a large field is just as fatal as a large number on a small
-    one. Both limits are checked.
+    Three quantities decide this, and each one kills a different backend:
+
+    * ``n_image_pixels x n_vis`` -- the direct DFT's float64 temporary. A
+      modest number of visibilities on a large field is just as fatal as a
+      large number on a small one.
+    * ``n_mesh_pixels x n_vis x nspread^2`` -- the JAX/nufftax gather buffer
+      in the batched mapping-matrix transform (`nufftax_gather_gb`). This is
+      by far the largest of the three and the one nothing upstream guards, so
+      when it will not fit we prefer pynufft, whose mapping-matrix transform
+      is a per-column loop that never allocates more than one column.
+    * everything else -- `estimate_peak_memory_gb`.
+
+    ``n_mesh_pixels`` is optional only so that older callers keep working; pass
+    it whenever it is known, or the nufftax check cannot be made.
     """
+    if not isinstance(transformer, str):
+        return transformer  # already a class: pass it through untouched
     if transformer == "dft":
         return ag.TransformerDFT
     if transformer == "nufft":
-        return ag.TransformerNUFFT
+        return _jax_nufft_class(n_vis, n_mesh_pixels)
     if transformer == "pynufft":
         return _require_pynufft()
     if transformer != "auto":
@@ -304,7 +595,24 @@ def resolve_transformer(
     if not too_big:
         return ag.TransformerDFT
     if jax_available():
-        return ag.TransformerNUFFT
+        gather = (
+            nufftax_gather_gb(n_vis, n_mesh_pixels)
+            if n_mesh_pixels else 0.0
+        )
+        have = available_memory_gb()
+        fits = not have or gather <= NUFFTAX_GATHER_BUDGET * have
+        if fits or not pynufft_available():
+            return _jax_nufft_class(n_vis, n_mesh_pixels)
+        logger.info(
+            "the JAX NUFFT would need a %.0f GB gather buffer to transform "
+            "the mapping matrix in one batch (%d mesh pixels x %d "
+            "visibilities x a %d-tap kernel), against %.1f GB available: "
+            "using the pynufft transformer instead, which loops over mesh "
+            "pixels and never holds more than one at a time.",
+            gather, n_mesh_pixels, n_vis,
+            nufftax_kernel_width() ** 2, have,
+        )
+        return pynufft_transformer_class()
     if pynufft_available():
         # No JAX, but pynufft is a pure NumPy/SciPy NUFFT and is the
         # difference between "impossible" and "an hour": on 164k visibilities
@@ -1273,6 +1581,7 @@ def fit_dataset(
     reg_kind: str = "matern",
     prior: dict | None = None,
     positive_only: bool = True,
+    enforce_positive: bool = False,
     criterion: str = "discrepancy",
     nu: float = DEFAULT_NU,
     fixed_scale: float | None = None,
@@ -1298,6 +1607,7 @@ def fit_dataset(
             dataset, geometry, reg_kind="matern", prior=None,
             positive_only=positive_only, criterion=criterion, nu=nu,
             fixed_scale=fixed_scale, chi2_target=chi2_target,
+            enforce_positive=enforce_positive,
         )
         envelope["brightness"] = np.clip(first.model_mesh_image.ravel(), 0.0, None)
         logger.info(
@@ -1354,11 +1664,19 @@ def fit_dataset(
                     f"regularisation strengths twelve decades apart, so it is "
                     f"ignoring the prior entirely"
                 )
-        if reason is not None:
+        if reason is not None and enforce_positive:
+            logger.warning(
+                "the non-negative solver looks unreliable on this data: %s. "
+                "Keeping positivity anyway because enforce_positive was "
+                "requested -- the model will be non-negative, but the prior "
+                "may have little effect on it.", reason,
+            )
+        elif reason is not None:
             logger.warning(
                 "the non-negative solver is unreliable on this data: %s. "
                 "Disabling positivity for this fit; the model may contain "
-                "small negative values.", reason,
+                "small negative values. Pass enforce_positive=True "
+                "(--enforce-positive) to keep it regardless.", reason,
             )
             positive_only = False
 
@@ -1483,7 +1801,7 @@ def fit_dataset(
             if len(finite) >= 3:
                 spread = max(c for _, c in finite) / min(c for _, c in finite)
                 decades = np.ptp(np.log10([co for co, _ in finite]))
-                if spread < 1.01 and decades > 3.0:
+                if spread < 1.01 and decades > 3.0 and not enforce_positive:
                     logger.warning(
                         "the non-negative solver returned the same chi^2 "
                         "(%.4g) across %.0f decades of regularisation "

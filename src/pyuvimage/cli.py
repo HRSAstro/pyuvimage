@@ -23,11 +23,27 @@ def _all_sigma(uvd):
     return _np.concatenate([_np.asarray(s.noise).real.ravel() for s in uvd.spws])
 
 
-def _parse_centre(text):
-    """"centre" / "auto" pass through; "dRA,dDec" becomes a (float, float).
+def _parse_pair(text: str, flag: str) -> tuple[float, float]:
+    parts = [
+        q for q in text.replace("(", "").replace(")", "").split(",") if q.strip()
+    ]
+    if len(parts) != 2:
+        raise SystemExit(
+            f"{flag}: expected 'x,y' in arcsec from the phase centre, "
+            f"got {text!r}"
+        )
+    try:
+        return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        raise SystemExit(f"{flag}: {text!r} is not a pair of numbers in arcsec")
 
-    Same convention as `--point`: arcsec from the phase centre, +RA East and
-    +Dec North.
+
+def _parse_centre(text):
+    """"centre" / "auto" pass through; "x,y" becomes a (float, float).
+
+    Image axes, +x right and +y up, arcsec from the phase centre -- the same
+    convention as `--point` and as `api.run`, which converts to sky
+    coordinates via `pointsource.image_to_sky`.
     """
     if not isinstance(text, str):
         return text
@@ -36,18 +52,7 @@ def _parse_centre(text):
         return "centre"
     if t == "auto":
         return "auto"
-    parts = [p for p in t.replace("(", "").replace(")", "").split(",") if p.strip()]
-    if len(parts) != 2:
-        raise SystemExit(
-            f"--image-centre: expected 'centre', 'auto' or 'dRA,dDec' in "
-            f"arcsec, got {text!r}"
-        )
-    try:
-        return (float(parts[0]), float(parts[1]))
-    except ValueError:
-        raise SystemExit(
-            f"--image-centre: {text!r} is not a pair of numbers in arcsec"
-        )
+    return _parse_pair(t, "--image-centre")
 
 
 def _parse_spw(text: str):
@@ -79,13 +84,13 @@ def _hint_negative_centre(argv: list[str]) -> None:
     it before argparse does.
     """
     for i, a in enumerate(argv):
-        if a == "--image-centre" and i + 1 < len(argv):
+        if a in ("--image-centre", "--point") and i + 1 < len(argv):
             nxt = argv[i + 1]
             if nxt.startswith("-") and "," in nxt:
                 raise SystemExit(
-                    f'--image-centre: write --image-centre="{nxt}" (with the '
-                    f'"=") when the offset starts with a minus sign, or '
-                    f"argparse reads it as another flag."
+                    f'{a}: write {a}="{nxt}" (with the "=") when the '
+                    f"offset starts with a minus sign, or argparse reads it "
+                    f"as another flag."
                 )
 
 
@@ -223,6 +228,15 @@ def main(argv: list[str] | None = None) -> int:
         help="target chi^2/N for the discrepancy criterion (default 1.0)",
     )
     p_fit.add_argument(
+        "--enforce-positive", action="store_true",
+        help="keep positivity even if the non-negative solver looks "
+        "unreliable. By default pyuvimage probes the solver and falls back to "
+        "the unconstrained solve when it is ignoring the prior or fitting far "
+        "worse -- right for a good image, wrong when a strictly non-negative "
+        "model is the point. The fit logs which solver actually ran, and "
+        "fit_parameters.json records it.",
+    )
+    p_fit.add_argument(
         "--no-positive", action="store_true",
         help="allow negative flux in the model (faster, less robust)",
     )
@@ -233,15 +247,24 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument("--no-pb", action="store_true", help="skip primary-beam products")
     p_fit.add_argument(
         "--transformer", default="auto",
-        choices=["auto", "dft", "nufft", "pynufft"]
+        choices=["auto", "dft", "nufft", "pynufft"],
+        help=(
+            "Fourier transform backend. auto: the direct DFT while it is "
+            "affordable, then pynufft or the JAX NUFFT, whichever fits in "
+            "memory -- on large datasets that is pynufft, because the JAX "
+            "one transforms the whole mapping matrix in one batch (see "
+            "docs/parameters.md)"
+        ),
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
     p_fit.add_argument(
-        "--image-centre", default="centre", metavar="centre|auto|dRA,dDec",
+        "--image-centre", default="centre", metavar="centre|auto|x,y",
         help='where to centre the reconstruction: "centre" (the phase '
         'centre, default), "auto" (the brightest peak in a wide-field dirty '
-        'image), or an offset in arcsec from the phase centre as "dRA,dDec" '
-        "(+RA East, +Dec North, as for --point). A negative dRA needs the "
+        'image), or an offset in arcsec from the phase centre as "x,y" in '
+        "image axes -- +x right and +y up, as you would read it off "
+        "summary.png (RA increases leftward, so x = -dRA), the same "
+        "convention as --point. A negative x needs the "
         '"=" form -- --image-centre="-2.3,0.3" -- because argparse reads a '
         "leading minus as a flag. Cost goes as the square of --fov, so "
         "recentring on a source a few arcsec off the phase centre is much "
@@ -256,9 +279,13 @@ def main(argv: list[str] | None = None) -> int:
         help="fit analytic point components; auto-detect their positions",
     )
     p_fit.add_argument(
-        "--point", action="append", metavar="dRA,dDec", default=None,
-        help="fit a point at this offset [arcsec]; the position is refined. "
-             "Repeatable. Implies --point-sources and disables auto-detection",
+        "--point", action="append", metavar="x,y", default=None,
+        help="fit a point at this offset [arcsec] from the phase centre, in "
+             "image axes: +x right and +y up, as you would read it off "
+             "summary.png. (RA increases leftward, so x = -dRA; products are "
+             "written in dRA/dDec.) The position is refined. Repeatable. "
+             "Implies --point-sources and disables auto-detection. A negative "
+             'x needs the "=" form: --point="-1.2,0.4"',
     )
     p_fit.add_argument(
         "--point-significance", type=float, default=5.0,
@@ -335,9 +362,8 @@ def main(argv: list[str] | None = None) -> int:
             reg_scale = args.reg_scale
         # explicit positions win; otherwise --point-sources means auto-detect
         if args.point:
-            point_sources = [
-                tuple(float(v) for v in p.split(",")) for p in args.point
-            ]
+            # image x,y, straight through -- api.run converts
+            point_sources = [_parse_pair(p, "--point") for p in args.point]
         else:
             point_sources = bool(args.point_sources)
         run(
@@ -367,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
             criterion=args.criterion,
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
+            enforce_positive=args.enforce_positive,
             transformer=args.transformer,
             image_centre=_parse_centre(args.image_centre),
             pb_correction=not args.no_pb,

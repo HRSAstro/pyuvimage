@@ -75,6 +75,7 @@ def run(
     criterion: str = "discrepancy",
     chi2_target: float = 1.0,
     positive_only: bool = True,
+    enforce_positive: bool = False,
     transformer: str = "auto",
     mask_shape: str = "square",
     oversample: int = 2,
@@ -121,14 +122,22 @@ def run(
         chi2_target: target chi^2/N for the discrepancy criterion.
         image_centre: where to centre the reconstruction. "centre" (default)
             uses the phase centre; "auto" finds the brightest peak in a
-            wide-field dirty image and centres there; or a (dRA, dDec) offset
-            in arcsec from the phase centre, +RA East and +Dec North, the same
-            convention as the point-source positions. The visibilities are
+            wide-field dirty image and centres there; or an **(x, y)** offset
+            in arcsec from the phase centre in image axes -- +x right and +y
+            up, as read off summary.png. RA increases leftward, so dRA = -x;
+            products are still written in dRA/dDec, matching the WCS. Same
+            convention as ``point_sources``. The visibilities are
             rotated by an exact phase ramp and
             the output WCS follows, so a source several arcsec off the phase
             centre no longer forces a field big enough to reach it from the
             centre -- and cost goes as the square of the field.
         positive_only: constrain the source to non-negative flux.
+        enforce_positive: keep positivity even when the non-negative solver
+            looks unreliable. By default pyuvimage tests the solver and
+            silently falls back to the unconstrained solve if it is ignoring
+            the prior or fitting far worse -- which is right when the goal is
+            a good image, and wrong when a strictly non-negative model is the
+            point. Set this to keep positivity and take the warning instead.
         dish_diameter: antenna diameter [m] for the primary beam; defaults to
             the value stored at import.
     """
@@ -199,6 +208,19 @@ def run(
             advice,
         )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
+    # Resolve the transformer *before* reporting memory: which backend runs
+    # changes the answer by two orders of magnitude, because the JAX one
+    # transforms the whole mapping matrix in a single batched nufft2d2 whose
+    # gather buffer is n_mesh x n_vis x nspread^2.
+    transformer_cls = fitting.resolve_transformer(
+        n_vis=uvd.n_samples,
+        transformer=transformer,
+        n_image_pixels=int(np.prod(geometry.shape_native)),
+        n_mesh_pixels=n_pix,
+    )
+    # before anything large is allocated: an OOM kill prints nothing useful,
+    # so the moment to speak is while --mesh and --fov are still adjustable
+    fitting.check_memory(uvd.n_samples, n_pix, transformer_cls)
     # the real sample count: flags remove samples, and for ragged multi-spw
     # data n_vis * n_chan is not even a meaningful product
     n_data_all = 2 * uvd.n_samples
@@ -223,7 +245,7 @@ def run(
     # ----------------------------------------------------------------- MFS
     uv, d, n = uvd.flattened()
     mfs_dataset = fitting.make_dataset(
-        uv, d, n, geometry, transformer, mask_shape=mask_shape
+        uv, d, n, geometry, transformer_cls, mask_shape=mask_shape
     )
     logger.info("fitting MFS image (%d visibility samples)...", len(d))
     # The natural correlation length of a Gaussian-process source prior is
@@ -288,7 +310,8 @@ def run(
     fixed_prior = _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale)
     mfs_fit = fitting.fit_dataset(
         mfs_dataset, geometry, reg_kind=reg, prior=fixed_prior,
-        positive_only=positive_only, criterion=criterion,
+        positive_only=positive_only, enforce_positive=enforce_positive,
+                criterion=criterion,
         nu=nu, fixed_scale=beam_scale, envelope=envelope,
         optimise_envelope=locals().get("optimise_env", False),
         chi2_target=chi2_target,
@@ -320,6 +343,13 @@ def run(
             "user positions" if positions else
             f"auto-detect above {point_significance:.1f} sigma",
         )
+        # positions arrive as image (x, y); pointsource speaks sky
+        from .pointsource import image_to_sky as _img2sky
+
+        positions = (
+            [_img2sky(*q) for q in positions] if positions else positions
+        )
+
         def _fit_points(fit_obj):
             return fit_point_sources(
                 fit_obj.fit.inversion, mfs_dataset, geometry,
@@ -414,11 +444,13 @@ def run(
             ch = uvd.select(channel=c)
             uv_c, d_c, n_c = ch.flattened()
             ds_c = fitting.make_dataset(
-                uv_c, d_c, n_c, geometry, transformer, mask_shape=mask_shape
+                uv_c, d_c, n_c, geometry, transformer_cls,
+                mask_shape=mask_shape
             )
             sf = fitting.fit_dataset(
                 ds_c, geometry, reg_kind=reg, prior=frozen,
-                positive_only=positive_only, criterion=criterion, nu=nu,
+                positive_only=positive_only, enforce_positive=enforce_positive,
+                criterion=criterion, nu=nu,
                 envelope=envelope,
             )
             logger.info(
@@ -551,14 +583,15 @@ AUTO_CENTRE_PIXELS = 96
 def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
     """Apply --image-centre, resolving "auto" from a wide-field dirty image.
 
-    An explicit centre is given as ``(dRA, dDec)`` in arcsec from the phase
-    centre, +RA East and +Dec North -- the same convention as ``--point``, and
-    the one an astronomer reads off a CLEAN image. Internally the grid uses
-    ``(y, x)`` with x running opposite to RA, so the two are not the same pair
-    of numbers and `pointsource.sky_to_grid` does the conversion.
+    An explicit centre is given as image ``(x, y)`` in arcsec from the phase
+    centre -- +x right and +y up, as read off `summary.png`, the same
+    convention as the point positions. Two conversions follow: to sky
+    (``dRA = -x``) and then to the internal grid. All three pairs differ, so
+    they go through `pointsource.image_to_sky` and `sky_to_grid` rather than
+    being written out by hand.
     """
     from . import beam as beam_mod
-    from .pointsource import grid_to_sky, sky_to_grid
+    from .pointsource import grid_to_sky, image_to_sky, sky_to_grid
     from .uvdata import shift_image_centre
 
     if image_centre is None or (
@@ -568,7 +601,7 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
     if isinstance(image_centre, str):
         if image_centre != "auto":
             raise ValueError(
-                "image_centre must be 'centre', 'auto', or a (dRA, dDec) "
+                "image_centre must be 'centre', 'auto', or an (x, y) "
                 "offset in arcsec"
             )
         dish = dish_diameter or uvd.meta.get("dish_diameter_m")
@@ -590,10 +623,12 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
         )
         centre = envelope.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
         peak = float(np.nanmax(img))
+        d_ra, d_dec = grid_to_sky(*centre)
         logger.info(
-            "  brightest peak %.3g Jy/beam (%.0f sigma) at dRA %+.3f\", "
-            "dDec %+.3f\"", peak, peak / rms if rms > 0 else np.nan,
-            *grid_to_sky(*centre),
+            "  brightest peak %.3g Jy/beam (%.0f sigma) at x %+.3f\", "
+            "y %+.3f\" (dRA %+.3f\", dDec %+.3f\")",
+            peak, peak / rms if rms > 0 else np.nan,
+            -d_ra, d_dec, d_ra, d_dec,
         )
         if max(abs(centre[0]), abs(centre[1])) < 0.5 * (
             wide / AUTO_CENTRE_PIXELS
@@ -601,11 +636,18 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
             logger.info("  already at the phase centre; not recentring")
             return uvd
     else:
-        centre = sky_to_grid(float(image_centre[0]), float(image_centre[1]))
+        # given as image (x, y); the grid and everything below is sky
+        centre = sky_to_grid(
+            *image_to_sky(float(image_centre[0]), float(image_centre[1]))
+        )
 
+    d_ra, d_dec = grid_to_sky(*centre)
+    # both conventions, every time: the CLI takes image x,y and everything
+    # written speaks dRA/dDec, so printing one alone invites a sign error
     logger.info(
-        "recentring the reconstruction on dRA %+.3f\", dDec %+.3f\" from the "
-        "phase centre; the output WCS follows.", *grid_to_sky(*centre),
+        "recentring the reconstruction on x %+.3f\", y %+.3f\" "
+        "(dRA %+.3f\", dDec %+.3f\") from the phase centre; the output WCS "
+        "follows.", -d_ra, d_dec, d_ra, d_dec,
     )
     return shift_image_centre(uvd, centre)
 

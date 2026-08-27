@@ -77,6 +77,26 @@ class PointSource:
         }
 
 
+def image_to_sky(x: float, y: float) -> tuple[float, float]:
+    """Image (x, y) offsets in arcsec -> (dRA, dDec).
+
+    The user-facing convention, for both `image_centre` and point positions:
+    +x is right on `summary.png` and +y is up, which is how an offset is read
+    off a picture. RA increases to the *left*, so ``dRA = -x``; Dec is up
+    either way, so ``dDec = y``.
+
+    Everything below this line -- the grid, the phase ramp, the FITS headers,
+    every position written to a product -- stays in (dRA, dDec), because that
+    is what has to agree with the WCS. The conversion happens once, where a
+    human's number enters.
+    """
+    return (-float(x), float(y))
+
+
+def sky_to_image(d_ra: float, d_dec: float) -> tuple[float, float]:
+    return (-float(d_ra), float(d_dec))
+
+
 def sky_to_grid(d_ra: float, d_dec: float) -> tuple[float, float]:
     """(dRA, dDec) offsets -> the (y, x) grid coordinates the transformer uses.
 

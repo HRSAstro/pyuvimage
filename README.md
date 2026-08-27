@@ -17,13 +17,13 @@ the noise level rather than through it, with nothing to tune by hand.
 ```bash
 pip install -e .            # core (numpy backend)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
-pip install -e ".[jax]"     # + JAX/nufftax: strongly recommended above ~10^4 vis
-                            #   (if JAX misbehaves, see Troubleshooting below —
-                            #    the NumPy path is fully supported)
+pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
 
-Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
-`version: python_version_check: False` in a local `config/general.yaml`).
+Python ≥ 3.12. JAX is optional and the NumPy path is fully supported — see
+[docs/install.md](docs/install.md), which also covers building an **arm64**
+conda environment on Apple silicon, the one setup detail whose symptoms
+otherwise appear much later.
 
 ## Use
 
@@ -36,8 +36,8 @@ pyuvimage import obs.ms mydata/ --spw all  # or every spectral window
 pyuvimage fit mydata/ --fov 3.0
 ```
 
-No python-casacore? Export the target data from CASA with the bundled script,
-then fit the `.npz` directly:
+No python-casacore? Export from CASA with the bundled script and fit the `.npz`
+directly:
 
 ```bash
 # field 0, spw 0; spw may also be a list (0,2), a range (0-3), or "all"
@@ -71,30 +71,27 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
 | `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D) |
 
-Plus `summary.png` (dirty / model / reconvolved / residual / uncertainty, each
-with a colour bar), `fit_parameters.json` (every parameter of the run),
+Plus `summary.png`, `fit_parameters.json` (every parameter of the run),
 `prior_scan.json` (every hyperparameter trial), and `point_sources.json` when
 point components are fitted.
 
 ![summary.png for PJ0116 at 245 GHz](figures/pj0116_summary.png)
 
-A real one: PJ0116 at 245 GHz, an ALMA Band 6 continuum observation of a
-lensed source (2 spectral windows x 1 channel, 5158 visibility samples,
-`--fov 8`). The arc and its counter-image are reconstructed at χ²/N = 1.007,
-the residual peaks at 3.7σ — 5% of the source peak, a dynamic range of 20:1 —
-and the residual map is featureless, which is what you want to see. The model
-panel is in Jy/pixel and the reconvolved panel in Jy/beam, which is why they
-look so different: the model is the sky at the mesh scale, not smoothed by the
-beam.
+PJ0116 at 245 GHz, an ALMA Band 6 observation of a lensed source (5158
+visibility samples, `--fov 8`): the arc and its counter-image at χ²/N = 1.007,
+a residual peaking at 3.7σ — 5% of the source peak — and a featureless residual
+map, which is what you want to see. The model panel is in Jy/pixel and the
+reconvolved panel in Jy/beam, which is why they look so different: the model is
+the sky at the mesh scale, not smoothed by the beam.
 
 ## The settings worth knowing about
 
-`--fov` is the only required input; everything else has a default that is
-meant to be left alone. These are the ones worth reaching for:
+`--fov` is the only required input; everything else has a default that is meant
+to be left alone. These are the ones worth reaching for:
 
 | flag | when |
 |---|---|
-| `--reg gibbs` | a single bright compact feature you want as sharp as possible (see [docs/priors.md](docs/priors.md)) |
+| `--reg gibbs` | a single bright compact feature you want as sharp as possible |
 | `--reg gaussian` | very sparse visibilities, where a stationary prior lets sidelobes leak into the model |
 | `--point-sources` | there is a genuine point source in the field — no pixel grid can represent one |
 | `--image-centre auto` | the source is not at the phase centre. Recentring on it is exact and cost falls as the *square* of the field you then need |
@@ -104,6 +101,27 @@ meant to be left alone. These are the ones worth reaching for:
 | `--mode cube` | per-channel images instead of one MFS image |
 
 Full reference: [docs/parameters.md](docs/parameters.md).
+
+## Choosing the prior (`--reg`)
+
+The source prior is what stops the inversion fitting noise. All of these are
+Gaussian-process priors on the mesh, `H = coefficient × C^-1`; they differ in
+whether `C` varies across the image, and how.
+
+| `--reg` | what it is | when to use it |
+|---|---|---|
+| `adaptive` **(default)** | two-stage: a first-pass model becomes a brightness map, and the prior's *amplitude* follows it as `b^power` | general use — the best extended model, and no central artefact |
+| `gibbs` | non-stationary Matérn: the correlation *length* shortens where the source is bright | sharpest on a single compact feature; leaves a central residual on extended sources |
+| `matern` | stationary Matérn covariance, correlation length = the synthesised beam | smooth sources, and the fastest — one pass instead of two |
+| `gaussian` | `matern` modulated by a Gaussian envelope on the prior width | sparse visibilities, where a stationary prior lets sidelobes leak in |
+| `exponential` | `matern` with ν = 0.5 — rougher | when the source has genuine sharp edges |
+| `constant` | nearest-neighbour gradient penalty, no covariance | rarely: rank-deficient, and its evidence is ill-behaved |
+
+The strength (`--lambda`) and correlation length (`--scale`) are optimised for
+you; `--adapt-power` sets the exponent for `adaptive` and `gibbs`, `--nu` the
+Matérn smoothness. Comparisons across three mocks are in
+[docs/priors.md](docs/priors.md); how the strength is chosen is
+`--criterion`, in [docs/parameters.md](docs/parameters.md).
 
 ## The uncertainty map
 
@@ -117,29 +135,21 @@ the median of each in the FITS header:
 | prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed |
 
 The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
-with `C = (F+H)^-1`; its noise-only part was verified against Monte Carlo at
-0.996. That term alone is optimistic — a regularised model is smoothed, hence
-biased — so the systematic term measures how far each pixel moves when the
-regularisation strength is varied over ±0.5 dex. The statistical term tends to
-dominate in smooth extended emission and the systematic on compact features,
-which is exactly where a purely statistical error bar would mislead you.
+with `C = (F+H)^-1`, verified against Monte Carlo at 0.996. That term alone is
+optimistic — a regularised model is smoothed, hence biased — so the systematic
+term measures how far each pixel moves when the regularisation strength is
+varied over ±0.5 dex. Neither covers the prior *family* being wrong, nor
+calibration or deconvolution error.
 
-Neither covers the prior *family* being wrong, nor calibration or
-deconvolution error.
-
-Two things to know before quoting numbers from it:
-
-- **Do not add per-pixel errors in quadrature.** They are correlated over the
-  prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`,
-  which evaluates `w^T (M C M^T) w` properly; quadrature overstated a compact
-  aperture's error by ~1.4x on our mocks.
-- The mesh/image **checkerboard is removed** — replaced by its upper envelope,
-  conservatively, since an over-stated error never manufactures a detection.
-  `ERRDEBL` records that it was done.
+**Do not add per-pixel errors in quadrature**: they are correlated over the
+prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
+evaluates `w^T (M C M^T) w` properly — quadrature overstated a compact
+aperture's error by ~1.4× on our mocks.
 
 ![uncertainty](figures/uncertainty_total.png)
 
-Details and validation: [docs/uncertainty.md](docs/uncertainty.md).
+Details, and the mesh/image checkerboard removal recorded as `ERRDEBL`:
+[docs/uncertainty.md](docs/uncertainty.md).
 
 ## True point sources
 
@@ -153,13 +163,11 @@ pyuvimage fit mydata/ --fov 3.0 --point-sources     # auto-detect
 pyuvimage fit mydata/ --fov 3.0 --point 0.70,0.80   # you supply the position
 ```
 
-This is opt-in and deliberately conservative. Detection is a matched filter
-over the whole field, not a residual peak-finder, and a candidate must clear a
+Opt-in and deliberately conservative: detection is a matched filter over the
+whole field, not a residual peak-finder, and a candidate must clear a
 significance cut *and* be positive, at least 0.75 beams from any other
-candidate, and genuinely unresolved (it is refitted as a Gaussian with free
-width and rejected if that fits materially better). Across the generalisation
-suite this gave **zero false positives**. Fluxes and 1σ errors land in
-`point_sources.json`.
+candidate, and genuinely unresolved. Across the generalisation suite this gave
+**zero false positives**. Fluxes and 1σ errors land in `point_sources.json`.
 
 Fitting is refused outright if the pixelized model has not converged to its
 chi^2 target, because the residual is then model error rather than sky.
@@ -170,86 +178,46 @@ Details: [docs/point-sources.md](docs/point-sources.md).
 
 ## Several spectral windows
 
-`--spw` takes one window (`0`), a list or range (`0,2`, `0-3`), or `all`.
-Multiple windows are imported into one dataset and imaged together by
-multifrequency synthesis as a single image:
+`--spw` on import takes one window (`0`), a list or range (`0,2`, `0-3`), or
+`all`; they are imported into one dataset and imaged together. `--mode mfs`
+(the default) fits them as one frequency-independent image, `--mode cube` fits
+each channel separately.
 
 ```bash
 pyuvimage import obs.ms mydata/ --spw all
-pyuvimage fit mydata/ --fov 3.0
+pyuvimage fit mydata/ --fov 3.0 --mode mfs
 ```
 
-Nothing is averaged or resampled to make them fit together. Every visibility
-already carries its own (u, v) computed at its own channel frequency, so
-combining windows is the same operation the single-window path has always
-performed across channels — splitting a dataset into spectral windows and
-imaging it gives a bit-identical image, which is a regression test.
-
-Windows keep their own channels, their own rows and their own noise estimate,
-because in a measurement set all three differ between them. On disk the
-dataset becomes `spw000/`, `spw001/`, ...; single-window datasets written
-before this keep working unchanged.
-
-**MFS fits one frequency-independent image.** That is mild within one window
-and can be strong across several: at fractional bandwidth *B*, a source with
-spectral index α is mis-modelled by roughly |α|·*B* across the band — about
-40% for α = −0.7 over a 2:1 frequency range. pyuvimage has no Taylor-term
-expansion (CLEAN's `mtmfs`), so it warns above 20% fractional bandwidth and
-leaves the judgement to you. The fit will still reach its chi^2 target by
-absorbing the spectral structure into the image; read the result as a
-band-averaged sky, and image the windows separately if you need spectra.
-
-`--mode cube` also works across windows: channels are ordered by frequency and
-fitted independently. Their spacing is then irregular, which a linear FITS
-frequency axis cannot express, so the true per-plane frequencies are written to
-the header as `FRQ0000...` and to `frequencies.json`, and `FREQIRR` marks that
-`CDELT3` is only indicative.
+MFS across a wide band mis-models a source with a spectral index, so the import
+warns above 20% fractional bandwidth. Details, and how irregular cube
+frequencies are written:
+[docs/spectral-windows.md](docs/spectral-windows.md).
 
 ## Troubleshooting
 
-**`ModuleNotFoundError: No module named 'pyuvimage'`, from the `pyuvimage`
-script itself.** The command exists but the package it imports does not — so
-the console script and the package have ended up in different places. Almost
-always one of: an editable install that failed *after* writing the script, or
-one made into a different environment from the one on your `PATH`.
+**Install problems** — `ModuleNotFoundError: No module named 'pyuvimage'` from
+the `pyuvimage` script itself, an editable install pointing at a moved
+directory, or the console script and the package living in different
+environments: [docs/install.md](docs/install.md).
+
+**An x86 Python on Apple silicon cannot run JAX at all.** Every x86 `jaxlib`
+wheel is built with AVX, which Rosetta does not provide. Check with
+`python -c "import platform; print(platform.machine())"` — you want `arm64`,
+not `x86_64` — and if it is wrong, build a native environment:
 
 ```bash
-python -m pip show pyuvimage | grep -i "location"   # start here
-head -1 $(which pyuvimage)                          # which python the script uses
-python -c 'import sys; print(sys.executable)'       # which python you are in
-```
-
-**Check `Editable project location` first.** An editable install records an
-absolute path, and if that directory has since been moved, renamed or emptied,
-`pip show` still reports the package as installed while the import fails — the
-path is where the package *was*. Reinstall from where it actually lives:
-
-```bash
-python -m pip uninstall -y pyuvimage
-cd /path/to/pyuvimage
-python -m pip install -e .        # python -m pip, not pip: same interpreter
-python -c 'import pyuvimage; print(pyuvimage.__file__)'
-```
-
-If instead the two `python` paths disagree, activate the environment the script
-belongs to. If `pip show` finds nothing at all, the install did not complete —
-rerun it **and read the output**, since a failure still leaves
-`src/pyuvimage.egg-info` behind and looks like it worked.
-
-Until that is sorted, this always works and needs no install at all:
-
-```bash
-PYTHONPATH=/path/to/pyuvimage/src python -m pyuvimage.cli fit mydata/ --fov 8
+CONDA_SUBDIR=osx-arm64 conda create -n native_env python=3.12
+conda activate native_env
+conda config --env --set subdir osx-arm64   # keeps later installs arm64 too
+pip install -e ".[jax]"
 ```
 
 **`AttributeError: partially initialized module 'jax' has no attribute
-'version'`** (or any other crash mentioning jax). Your JAX install is broken,
-not pyuvimage. The PyAuto libraries decide whether JAX exists by looking for it
+'version'`**, or any other crash mentioning jax. Your JAX install is broken,
+not pyuvimage: the PyAuto libraries decide whether JAX exists by looking for it
 on disk rather than importing it, so a broken install passes that check and
-then fails deep inside a fit.
-
-pyuvimage now detects this at startup, falls back to the NumPy path, and tells
-you. To fix JAX itself, in the environment you run pyuvimage from:
+then fails deep inside a fit. pyuvimage detects this at startup, falls back to
+the NumPy path, and tells you. To fix JAX itself:
 
 ```bash
 python -c 'import jax; print(jax.__version__)'   # see the real error
@@ -257,11 +225,9 @@ pip uninstall -y jax jaxlib jax-metal
 pip install -U 'jax[cpu]'                        # a matched jax/jaxlib pair
 ```
 
-A jax/jaxlib version mismatch is the usual cause; on Apple silicon the
-`jax-metal` plugin is another; mixing conda-forge and pip installs of jax in one
-environment does it too. If you would rather not use JAX, `pip uninstall jax
-jaxlib` is a clean answer — the NumPy path is fully supported and everything in
-these docs was measured on it.
+A jax/jaxlib mismatch is the usual cause; the `jax-metal` plugin and mixing
+conda-forge with pip installs each do it too. If you would rather not use JAX,
+`pip uninstall jax jaxlib` is a clean answer.
 
 ## When not to trust a fit
 
@@ -272,16 +238,15 @@ these docs was measured on it.
   at chi2/N = 1.008: structure ratio 4.28
   ```
 
-  If the residual visibilities were noise, the residual dirty image would have
-  rms `sqrt(chi^2/N)` in sigma, because incoherent residuals average down as
-  `1/sqrt(N)`. Coherent residuals — sky the model failed to reproduce — add in
-  phase instead and land `sqrt(N)` higher. So the ratio says whether what is
-  left over is *noise or signal*, which `chi^2` cannot: **`chi^2` constrains
-  the residual's total power, not its structure**, and a fit can sit exactly on
-  `chi^2/N = 1` with the whole source still in `residual.fits`.
+  Incoherent residuals average down as `1/sqrt(N)`; coherent ones — sky the
+  model failed to reproduce — add in phase and land `sqrt(N)` higher. So the
+  ratio says whether what is left over is *noise or signal*, which `chi^2`
+  cannot: **`chi^2` constrains the residual's total power, not its
+  structure**, and a fit can sit exactly on `chi^2/N = 1` with the whole
+  source still in `residual.fits`.
 
-  This is the single most useful number the tool prints. It caught a noise map
-  inflated 1.4x by a bug in the export, on a fit whose `chi^2/N` read 1.0076.
+  This is the single most useful number the tool prints — it caught a noise
+  map inflated 1.4× by an export bug, on a fit whose `chi^2/N` read 1.0076.
   The usual cause is a noise map that **over**estimates the noise, which stops
   the fit early; also check `--fov` and whether the source has structure finer
   than the model pixel scale.
@@ -293,86 +258,97 @@ these docs was measured on it.
   flat in the coefficient — see
   [docs/design-notes.md](docs/design-notes.md#when-chi2--n-cannot-be-reached).
 
-- **`chi^2/N` well above 1.** The model cannot represent the data. The run
-  says so loudly and refuses to fit point sources.
-- **Sparsely sampled uv plane.** In cases where the uv plane is very sparsely
-  sampled, faint structure is then set by the prior rather than the data.
-  pyuvimage gives a warning in this case.
+- **`chi^2/N` well above 1.** The model cannot represent the data. The run says
+  so loudly and refuses to fit point sources.
+- **Sparsely sampled uv plane.** Faint structure is then set by the prior
+  rather than the data; the run warns.
 - **The mask edge.** On mocks the largest residual is often at the mask
   boundary rather than the source: edge mesh pixels are poorly constrained and
   absorb flux. Judge a fit from the interior.
 - **A "the non-negative solver is unreliable" warning.** Positivity has been
   disabled for that fit and the model may contain small negative values.
 
-## Run time
+## Run time and memory
 
-Rough CPU figures (2 cores, NumPy backend, no JAX) for a single-channel fit:
+Both scale with **`n_vis × n_mesh_pixels`** — the transformed mapping matrix,
+which is built once per hyperparameter trial and dominates everything else.
+Note what is *not* in that product: the size of the output image. Making the
+products finer is nearly free; more visibilities or a larger field are not.
 
-| model pixels | time |
-|---|---|
-| 1024 (32x32) | ~10-20 s |
-| 2304 (48x48) | ~70 s |
-| 4096 (64x64) | ~5 min |
+Small fits, on 2 CPU cores with the NumPy backend, matern prior, no
+uncertainty map:
 
-Point detection adds ~1 s per candidate, and the retune iteration 10-60 s.
-Cost is set by the mesh, which `--pixel-scale auto` sizes from the baseline
-95% of samples fall within. `--pixel-scale nyquist` sizes it from the *longest*
-baseline instead: on an array with a sparse long-baseline tail that can be
-several times finer and tens of times slower. For real work install
-`pyuvimage[jax]`, which is where this stack is designed to run.
+| model pixels | mesh | time | peak RSS |
+|---|---|---|---|
+| 1024 | 32×32 | 17 s | 0.3 GB |
+| 2304 | 48×48 | 53 s | 0.4 GB |
+| 4096 | 64×64 | 88 s | 0.6 GB |
 
-**Averaging the data down first is usually the bigger win.** The fit cost
-scales with the number of visibilities, and a modern dataset carries far more
-channels and time samples than a small field needs. Averaging in frequency and
-in time before `pyuvimage import` costs nothing scientifically *up to the point
-where smearing sets in* — and that point depends on how far your emission sits
-from the phase centre, so it is worth working out rather than guessing:
+(3000 visibility samples; the default `adaptive` prior runs two passes, so
+roughly doubles these, and the uncertainty map adds more again.)
 
-- channel averaging is limited by **bandwidth smearing** (chromatic
-  aberration), which radially blurs sources in proportion to their distance
-  from the phase centre:
-  [NRAO note with the formulae](https://safe.nrao.edu/wiki/pub/Main/RadioTutorial/BandwidthSmearing.pdf)
-- time averaging is limited by **time-average smearing**, which blurs
-  tangentially: [Hitchhiker's Guide to the VLA, on choosing an averaging
-  time](https://www.cv.nrao.edu/vla/hhg2vla/node12.html) — it also gives the
-  useful rule that time smearing should be kept a little *below* the
-  chromatic-aberration loss you have already accepted
+Real data, same machine. **PJ0116 at 245 GHz** (5,158 samples, 50×50 mesh,
+`--fov 8`): 20 min for `matern` with the default criterion, 26 min with
+`--criterion structure`, and ~43 min for the default `adaptive` — two passes —
+with the uncertainty map. How many hyperparameter trials the search needs
+varies, so treat these as the scale rather than a specification.
 
-Both effects are worst at the field edge, so size them for the most distant
-emission you care about, not for the phase centre. Averaging past those limits
-resolves out real flux, and neither pyuvimage nor CLEAN can put it back.
+**Ruby at 200 GHz** (148,477 samples, `--fov 8`) is 29× more visibilities, and
+shows what the mesh then costs, per hyperparameter trial:
+
+| mesh | pixel scale | per trial | peak RSS |
+|---|---|---|---|
+| 16×16 | 0.50″ | 12 s | 1.9 GB |
+| 24×24 | 0.33″ | 25 s | 3.8 GB |
+| 32×32 | 0.25″ | ~44 s | ~6.7 GB |
+| 70×70 | 0.11″ (Nyquist) | ~210 s | ~32 GB |
+
+A full fit is roughly 30–40 trials, doubled for `adaptive`.
+
+**Recentring is the biggest single lever**, because `n_mesh` goes as `fov²`:
+Ruby at `--fov 8` from the phase centre needs ~32 GB at Nyquist, and the same
+data recentred on the ring at `--fov 3` needs ~4.4 GB *at the same resolution*.
+See [docs/large-datasets.md](docs/large-datasets.md).
+
+**JAX is not the answer to this.** It accelerates the rest of the fit, but the
+dominant step — transforming the mapping matrix — is the one step the JAX NUFFT
+cannot do at these sizes: it batches every mesh pixel into a single `nufft2d2`
+whose gather buffer runs to hundreds of GB. `--transformer auto` therefore
+picks `pynufft` for large fits, and every figure above is on that path. `pip
+install pynufft` is the install that matters for speed here; the arithmetic is
+in [docs/parameters.md](docs/parameters.md#why-auto-usually-picks-pynufft-over-jax).
+
+**Averaging the data down first is usually the bigger win**, up to the point
+where bandwidth and time-average smearing set in — see
+[docs/large-datasets.md](docs/large-datasets.md#averaging-the-data-down).
 
 ## Noise
 
 **pyuvimage estimates the noise from the visibilities themselves and does not
 use the MS weights for it.** `SIGMA` and `WEIGHT` are nominally absolute but in
-practice only relative — a pipeline sets them proportional to the true inverse
-variance, and `split`, `mstransform` and averaging rescale them again. Since
-everything downstream scales with σ (χ², the smoothing criterion,
-`uncertainty.fits`), a weight column off by 40% quietly changes the answer.
+practice only relative, and `split`, `mstransform` and averaging rescale them
+again — so a weight column off by 40% quietly changes χ², the smoothing
+criterion and `uncertainty.fits` alike.
 
-The estimate differences visibilities adjacent in time on the same baseline, so
-the sky cancels and what is left is noise. It is made **once**, when the data
-leaves the measurement set, and stored — fits never recompute it.
-
-`--noise difference` (the default) needs nothing but the visibilities and is
-the right answer for almost everyone. Three alternatives use the weight column
-to varying degrees, and every import prints diagnostics saying whether your
-data would benefit: see **[docs/noise.md](docs/noise.md)**.
-
-To change the estimate on an existing dataset without re-exporting:
+Instead the estimate differences visibilities adjacent in time on the same
+baseline, so the sky cancels and what is left is noise. It is made **once**,
+when the data leaves the measurement set, and stored — fits never recompute it.
+`--noise difference` (the default) needs nothing but the visibilities; three
+alternatives use the weight column to varying degrees, and every import prints
+diagnostics saying whether your data would benefit. To change the estimate on
+an existing dataset without re-exporting:
 
 ```bash
 pyuvimage convert export.npz mydata/ --noise difference
 ```
 
+Full discussion: [docs/noise.md](docs/noise.md).
+
 ## How it works
 
 1. **Import** forms Stokes I from the parallel hands (respecting flags) and
-   **recomputes the per-visibility noise from the data**, by differencing
-   visibilities adjacent in time on the same baseline (σ = std(diff)/√2). The
-   MS weight column is never trusted for scale — see
-   [docs/noise.md](docs/noise.md).
+   **recomputes the per-visibility noise from the data** (σ = std(diff)/√2).
+   The MS weight column is never trusted for scale.
 2. **MFS** fits all channels jointly, each with its exact uv coordinates in
    wavelengths (no channel-averaging approximation). **Cube** mode fits each
    channel with the regularisation frozen from an MFS fit.
@@ -388,7 +364,8 @@ pyuvimage convert export.npz mydata/ --noise difference
 ## Caveats
 
 - Only Stokes I is currently supported.
-- Only a single field is currently supported; several spectral windows can be imaged together (see below).
+- Only a single field is currently supported; several spectral windows can be
+  imaged together ([docs/spectral-windows.md](docs/spectral-windows.md)).
 - The w-term is neglected (small-field approximation), so very large fields are
   not supported.
 - Total flux cannot be resolved beyond the maximum recovery scale of the data
@@ -399,15 +376,19 @@ pyuvimage convert export.npz mydata/ --noise difference
 
 | doc | what is in it |
 |---|---|
+| [docs/install.md](docs/install.md) | installing, arm64 conda environments, and the install failures that look like bugs |
+| [docs/parameters.md](docs/parameters.md) | every flag, with defaults |
 | [docs/noise.md](docs/noise.md) | why the MS weights are not trusted, the four estimators, and the diagnostics that pick between them |
 | [docs/priors.md](docs/priors.md) | what each prior is, and how they compare across three mocks |
 | [docs/uncertainty.md](docs/uncertainty.md) | the uncertainty map in full, with the Monte Carlo validation |
 | [docs/point-sources.md](docs/point-sources.md) | how delta components are solved, and the detection guards |
+| [docs/spectral-windows.md](docs/spectral-windows.md) | multiple spw, MFS bandwidth limits, irregular cube frequencies |
+| [docs/large-datasets.md](docs/large-datasets.md) | 10^5 visibilities: which NUFFT, where the memory goes, and finding the source before choosing `--fov` |
 | [docs/generalisation.md](docs/generalisation.md) | the generalisation suite: a crowded field, four arrays, three noise levels |
 | [docs/design-notes.md](docs/design-notes.md) | the grid trap, reading the residual map, under-constrained fits, and other things that bite |
 
 ## Development
 
-`python -m pytest tests/` — 159 tests, including end-to-end regressions on
+`python -m pytest tests/` — 265 tests, including end-to-end regressions on
 simulated data (adjoint consistency, flux conservation, WCS, restore centring,
 the noise estimator, and one test per bug listed in the docs above).

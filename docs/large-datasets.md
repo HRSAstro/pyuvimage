@@ -7,11 +7,36 @@ stretched to reach an off-centre source.
 
 ## 1. Get a NUFFT working
 
-Two backends, and which one you can have depends on the environment.
+Two backends. **At these dataset sizes you want `pynufft`, not the JAX one** —
+which is the opposite of what the speed comparison suggests, so it is worth
+saying why before the installation notes.
 
-**`nufftax` (JAX-native)** is the default and the faster of the two —
-`--transformer nufft`. It needs two separate things, and they fail
-independently.
+The JAX transform itself is faster. But `TransformerNUFFT.transform_mapping_matrix`
+pushes every mesh pixel through one batched `nufft2d2`, and nufftax
+materialises that call's gather buffer in full: `n_mesh × n_vis × nspread²`
+complex128, with `nspread = 14` at autoarray's default `eps=1e-12`. For Ruby
+at a 20×20 mesh that is **186 GB** — to transform a mapping matrix that is
+itself 0.5 GB. The process is killed with no traceback (`Killed: 9`), which is
+what it looks like from the outside. pynufft's mapping-matrix transform is a
+loop over mesh pixels and never holds more than one column.
+
+`--transformer auto` now checks this before choosing and takes pynufft when
+the JAX buffer will not fit, saying so in the log; `--transformer nufft`
+forces JAX and splits the transform into blocks instead of dying. The full
+arithmetic is in [parameters.md](parameters.md#why-auto-usually-picks-pynufft-over-jax).
+
+So: install pynufft, and treat JAX as the thing that accelerates the rest of
+the fit.
+
+**`pynufft`** — `pip install pynufft`. Pure NumPy/SciPy, no JAX involved,
+works under Rosetta. `--transformer pynufft` forces it.
+
+This works on every autoarray version: PyAutoArray PR #475 (2026.8.23.1)
+deleted the upstream `TransformerNUFFTPyNUFFT` class, so pyuvimage vendors its
+own copy (corrected — see below) that talks to `pynufft` directly.
+
+**`nufftax` (JAX-native)** — `--transformer nufft`. It needs two separate
+things, and they fail independently.
 
 **`nufftax` itself is not part of a default install.** Since PyAutoLens#702
 JAX moved into autonerves' base dependencies while nufftax stayed behind in
@@ -42,14 +67,6 @@ half is missing when it falls back.
   `pyuvimage` survives all of these — `_jax_guard.py` catches the broken
   import and falls back to NumPy — but you lose the fast path.
 
-**`pynufft`** is the pure NumPy/SciPy alternative: `pip install pynufft`, no
-JAX involved, works under Rosetta. `--transformer auto` picks it up once the
-DFT stops being affordable; `--transformer pynufft` forces it.
-
-This works on every autoarray version: PyAutoArray PR #475 (2026.8.23.1)
-deleted the upstream `TransformerNUFFTPyNUFFT` class, so pyuvimage vendors its
-own copy (corrected — see below) that talks to `pynufft` directly.
-
 **Does `nufftax` have the half-pixel bug too?** The pynufft transformer builds
 a half-pixel phase ramp and then never applies it, so it sits half a pixel
 from the DFT in both axes; pyuvimage corrects that. Whether `nufftax` shares
@@ -71,19 +88,20 @@ That is worth knowing before trusting a position.
 Both of these sit several arcsec off the phase centre, which is easy to miss
 and expensive to get wrong:
 
-Measured from a 16″ dirty image, in arcsec from the phase centre
-(+RA East, +Dec North):
+Measured from a 16″ dirty image at 0.1″/pixel. **These are image `x, y` —
++x right and +y up, as `--image-centre` and `--point` take them**, with the sky
+pair alongside; RA increases leftward, so `x = −dRA`.
 
 | | brightest peak | where the emission is |
 |---|---|---|
-| 9io9 135 GHz | 0.96 mJy/beam (96σ) | an arc running from (dRA −2.7, dDec +0.1) through (−1.7, +2.3) to (−2.5, −1.5) — ~4″ long, centred near **(−2.3, +0.3)** — plus a compact 58σ companion at **(+1.96, −0.62)**. A handful of 12–14σ features sit 6–8″ out; at that level, on a field this dominated by the arc, treat them as possible sidelobes until a proper fit says otherwise. |
-| Ruby 200 GHz | 6.46 mJy/beam (285σ) | a ring ~1.5″ across centred at **(+2.06, +2.81)** |
+| 9io9 135 GHz | 0.840 mJy/beam (84σ) at **x +1.75, y +2.25** (dRA −1.75, dDec +2.25) | an arc through (x +1.75, y +2.25), (+2.75, +0.15) and (+2.55, +1.15), centred near **(x +2.3, y +0.4)** — plus the counter-image, 51σ at **(x −1.95, y −0.65)** (dRA +1.95, dDec −0.65). Together they span x −2.25 to +3.05 and y −1.85 to +2.85 above 20σ, so a field holding *both* is centred near **(x +0.4, y +0.5)**. Below ~15σ there are features 6–8″ out; on a field this dominated by the arc, treat those as possible sidelobes until a fit says otherwise. |
+| Ruby 200 GHz | 4.89 mJy/beam (216σ) at **x −2.05, y +2.85** (dRA +2.05, dDec +2.85) | a ring ~1.5″ across centred on that peak |
 
 `--image-centre auto` does this for you: it makes a wide-field dirty image
-(4× the requested field, capped at the primary beam), reports the brightest
-peak in dRA/dDec, and recentres there. `--image-centre "dRA,dDec"` sets it by
-hand — which is the better choice for 9io9, because `auto` finds the arc's
-brightest *knot* at (−1.71, +2.29) rather than the arc's centre.
+(4× the requested field, capped at the primary beam) and recentres on the
+brightest peak. That is the right answer for Ruby and the wrong one for 9io9,
+where the peak is the arc's brightest *knot* and the counter-image is 4″ away
+on the other side of the phase centre — so 9io9 wants the centre set by hand.
 
 ## 3. Pick a field, knowing what it costs
 
@@ -93,6 +111,11 @@ Memory is the binding constraint, not speed. The inversion builds an
 ```
 peak RSS  ~  n_vis  ×  n_mesh_pixels  ×  44 bytes
 ```
+
+That figure is for the DFT and pynufft paths. On the JAX path it is not the
+binding term at all — see section 1 — and `pyuvimage fit` now reports the
+estimate for whichever transformer it has actually chosen, before allocating
+anything.
 
 Measured on Ruby (148k visibilities) at 8″:
 
@@ -115,7 +138,24 @@ Because `n_mesh` goes as `fov²`, recentring is the single biggest lever:
 
 Same data, same resolution, seven times less memory.
 
+### Averaging the data down
+
+**Averaging the data down first is usually the bigger win.** A modern dataset
+carries far more channels and time samples than a small field needs, and
+averaging before `pyuvimage import` costs nothing scientifically *up to the
+point where smearing sets in*: channel averaging is limited by [bandwidth
+smearing](https://safe.nrao.edu/wiki/pub/Main/RadioTutorial/BandwidthSmearing.pdf)
+(radial), time averaging by [time-average
+smearing](https://www.cv.nrao.edu/vla/hhg2vla/node12.html) (tangential). Both
+are worst at the field edge, so size them for the most distant emission you
+care about. Past those limits, averaging resolves out real flux and neither
+pyuvimage nor CLEAN can put it back.
+
 ## 4. The commands
+
+`--image-centre` and `--point` take **image x, y** — +x right, +y up, as you
+read them off `summary.png`. A leading minus needs the `=` form, or argparse
+reads it as a flag.
 
 Ruby — the ring is compact, so recentred it fits comfortably:
 
@@ -125,25 +165,28 @@ pyuvimage fit Ruby_200GHz_cont.npz \
     --out ruby_out
 ```
 
-9io9 — the arc is ~4″ long and the companion sits 4.7″ away on the other side
-of the phase centre, so `auto` is not the right call here: it would centre on
-the arc's brightest knot. Two reasonable choices:
+`auto` lands on (x −2.05, y +2.85); `--image-centre="-2.05,2.85"` is the same
+thing written out.
+
+9io9 — the arc is ~4″ long and the counter-image sits 4.7″ away on the other
+side of the phase centre, so `auto` is not the right call here: it would
+centre on the arc's brightest knot. Two reasonable choices:
 
 ```
 # the arc alone, centred on it, at full resolution (~9 GB at Nyquist,
 # ~5 GB at --mesh 26)
 pyuvimage fit 9io9_135GHz_cont.npz \
-    --fov 5 --image-centre "-2.3,0.3" --transformer pynufft --out 9io9_arc
+    --fov 5 --image-centre "2.3,0.4" --transformer pynufft --out 9io9_arc
 
-# arc and companion together, centred between them, coarser
+# arc and counter-image together, centred between them, coarser
 pyuvimage fit 9io9_135GHz_cont.npz \
-    --fov 7 --image-centre "-0.4,0.0" --mesh 32 \
+    --fov 7 --image-centre "0.4,0.5" --mesh 32 \
     --transformer pynufft --out 9io9_wide
 ```
 
-Fitting the arc alone is the better science: the companion is 4″ away and
-nothing in the model couples them, so including it only costs resolution
-everywhere.
+Which is better science depends on the question. The counter-image is part of
+the same lensed source, so a lens model wants both; if you only want the arc's
+own structure, fitting it alone buys resolution everywhere.
 
 ## 5. What to look at first
 

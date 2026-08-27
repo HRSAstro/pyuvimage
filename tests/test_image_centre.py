@@ -42,6 +42,7 @@ def _peak(uvd, geom):
 
 @pytest.mark.parametrize("text,expected", [
     ("centre", "centre"), ("center", "centre"), ("auto", "auto"),
+    # image x,y, passed through unconverted -- api.run does the conversion
     ("1.5,-2", (1.5, -2.0)), (" (0.5, 0.25) ", (0.5, 0.25)),
 ])
 def test_parse_image_centre(text, expected):
@@ -53,15 +54,20 @@ def test_a_malformed_centre_is_refused():
         _parse_centre("over there")
 
 
-def test_the_user_facing_offset_is_dra_ddec_not_grid_yx():
-    """`--image-centre` takes (dRA, dDec) like `--point`, not the internal
-    (y, x). They are different numbers -- x runs opposite to RA -- so getting
-    this wrong puts the field on the wrong side of the phase centre, and the
-    fit would still converge on whatever empty sky it landed on."""
-    from pyuvimage.pointsource import sky_to_grid
+def test_the_three_conventions_stay_straight():
+    """Three coordinate pairs live in this codebase and two of them differ by
+    a sign on the first number. Getting it wrong puts the field on the wrong
+    side of the phase centre, and the fit still converges -- on empty sky.
 
-    assert sky_to_grid(2.0, -1.0) == (-1.0, -2.0)
-    assert _parse_centre("2,-1") == (2.0, -1.0)
+        CLI and API  image (x, y)   +x right on summary.png, +y up
+        sky          (dRA, dDec)    +RA East, +Dec North;  dRA = -x
+        internal     grid (y, x)    y = dDec, x = -dRA
+    """
+    from pyuvimage.pointsource import image_to_sky, sky_to_grid
+
+    assert _parse_centre("2,-1") == (2.0, -1.0)           # CLI: image x,y
+    assert image_to_sky(2.0, -1.0) == (-2.0, -1.0)        # api.run -> sky
+    assert sky_to_grid(-2.0, -1.0) == (-1.0, 2.0)         # sky -> grid
 
 
 def test_an_explicit_centre_moves_the_source_to_the_middle(offset_source):
@@ -71,7 +77,8 @@ def test_an_explicit_centre_moves_the_source_to_the_middle(offset_source):
 
     uvd, geom = offset_source
     d_ra, d_dec = grid_to_sky(*_peak(uvd, geom))
-    moved = _recentre(uvd, (d_ra, d_dec), fov=1.0, dish_diameter=None)
+    x, y = -d_ra, d_dec                      # the API takes image (x, y)
+    moved = _recentre(uvd, (x, y), fov=1.0, dish_diameter=None)
     y, x = _peak(moved, geom)
     assert max(abs(y), abs(x)) <= geom.pixel_scale
 
@@ -79,7 +86,7 @@ def test_an_explicit_centre_moves_the_source_to_the_middle(offset_source):
 def test_a_bad_image_centre_string_is_refused_by_the_api():
     from pyuvimage.api import _recentre
 
-    with pytest.raises(ValueError, match="dRA"):
+    with pytest.raises(ValueError, match=r"\(x, y\)"):
         _recentre(None, "middle", fov=1.0, dish_diameter=None)
 
 
@@ -240,4 +247,33 @@ def test_a_negative_offset_gets_a_usable_error():
 
 
 def test_the_equals_form_parses_fine():
-    assert _parse_centre("-2.3,0.3") == (-2.3, 0.3)
+    assert _parse_centre("-2.3,0.3") == (-2.3, 0.3)   # image x,y, verbatim
+
+
+# --- the CLI takes image x,y; everything else speaks dRA/dDec --------------
+
+def test_the_cli_takes_image_x_not_dra():
+    """+x is right on summary.png and RA increases leftward, so x = -dRA.
+    Typing the wrong one puts the field on the wrong side of the phase
+    centre -- and the fit still converges, on empty sky."""
+    from pyuvimage.pointsource import image_to_sky
+
+    assert image_to_sky(2.0, 0.0) == (-2.0, 0.0)   # 2" right  = 2" West
+    assert image_to_sky(-2.0, 0.0) == (2.0, 0.0)   # 2" left   = 2" East
+    assert image_to_sky(0.0, 1.5) == (0.0, 1.5)    # y is Dec, unchanged
+    assert _parse_centre("2.0,0.0") == (2.0, 0.0)  # CLI keeps image axes
+
+
+def test_point_positions_use_the_same_convention_as_image_centre():
+    """The two positional flags in one command must not disagree."""
+    from pyuvimage.cli import _parse_pair
+
+    assert _parse_pair("1.5,-0.5", "--point") == _parse_centre("1.5,-0.5")
+    assert _parse_pair("1.5,-0.5", "--point") == (1.5, -0.5)
+
+
+def test_a_negative_x_is_caught_for_point_too():
+    from pyuvimage.cli import main
+
+    with pytest.raises(SystemExit, match='--point="-1.2,0.4"'):
+        main(["fit", "x.npz", "--fov", "5", "--point", "-1.2,0.4"])
