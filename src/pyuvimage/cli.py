@@ -23,6 +23,33 @@ def _all_sigma(uvd):
     return _np.concatenate([_np.asarray(s.noise).real.ravel() for s in uvd.spws])
 
 
+def _parse_centre(text):
+    """"centre" / "auto" pass through; "dRA,dDec" becomes a (float, float).
+
+    Same convention as `--point`: arcsec from the phase centre, +RA East and
+    +Dec North.
+    """
+    if not isinstance(text, str):
+        return text
+    t = text.strip().lower()
+    if t in ("centre", "center", "none", ""):
+        return "centre"
+    if t == "auto":
+        return "auto"
+    parts = [p for p in t.replace("(", "").replace(")", "").split(",") if p.strip()]
+    if len(parts) != 2:
+        raise SystemExit(
+            f"--image-centre: expected 'centre', 'auto' or 'dRA,dDec' in "
+            f"arcsec, got {text!r}"
+        )
+    try:
+        return (float(parts[0]), float(parts[1]))
+    except ValueError:
+        raise SystemExit(
+            f"--image-centre: {text!r} is not a pair of numbers in arcsec"
+        )
+
+
 def _parse_spw(text: str):
     """"0" -> 0;  "all" -> "all";  "0,2" / "0-3" / "0-1,4" -> [0, 2] / ... ."""
     text = str(text).strip()
@@ -41,6 +68,25 @@ def _parse_spw(text: str):
     if not ids:
         raise ValueError(f"could not parse --spw {text!r}")
     return ids[0] if len(ids) == 1 else sorted(set(ids))
+
+
+def _hint_negative_centre(argv: list[str]) -> None:
+    """argparse reads `--image-centre -2.3,0.3` as a missing argument.
+
+    A leading minus makes argparse treat the value as another option flag, and
+    the resulting "expected one argument" says nothing about the fix. Negative
+    offsets are entirely normal -- half the sky is at negative dRA -- so catch
+    it before argparse does.
+    """
+    for i, a in enumerate(argv):
+        if a == "--image-centre" and i + 1 < len(argv):
+            nxt = argv[i + 1]
+            if nxt.startswith("-") and "," in nxt:
+                raise SystemExit(
+                    f'--image-centre: write --image-centre="{nxt}" (with the '
+                    f'"=") when the offset starts with a minus sign, or '
+                    f"argparse reads it as another flag."
+                )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,9 +213,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument(
         "--criterion", default="discrepancy",
-        choices=["evidence", "discrepancy"],
+        choices=["discrepancy", "structure", "evidence"],
         help="how the source-prior hyperparameters are optimised: "
-        "fit-to-the-noise-level (default) or maximum Bayesian evidence",
+        "fit to the noise level (chi^2 = N, default), make the residual map "
+        "look like noise (structure ratio = 1), or maximum Bayesian evidence",
     )
     p_fit.add_argument(
         "--chi2-target", type=float, default=1.0,
@@ -185,9 +232,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--no-pb", action="store_true", help="skip primary-beam products")
     p_fit.add_argument(
-        "--transformer", default="auto", choices=["auto", "dft", "nufft"]
+        "--transformer", default="auto",
+        choices=["auto", "dft", "nufft", "pynufft"]
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
+    p_fit.add_argument(
+        "--image-centre", default="centre", metavar="centre|auto|dRA,dDec",
+        help='where to centre the reconstruction: "centre" (the phase '
+        'centre, default), "auto" (the brightest peak in a wide-field dirty '
+        'image), or an offset in arcsec from the phase centre as "dRA,dDec" '
+        "(+RA East, +Dec North, as for --point). A negative dRA needs the "
+        '"=" form -- --image-centre="-2.3,0.3" -- because argparse reads a '
+        "leading minus as a flag. Cost goes as the square of --fov, so "
+        "recentring on a source a few arcsec off the phase centre is much "
+        "cheaper than growing the field to reach it. The output WCS follows.",
+    )
     p_fit.add_argument(
         "--no-uncertainty", action="store_true",
         help="skip the per-pixel 1 sigma posterior map",
@@ -219,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
     p_demo = sub.add_parser("demo", help="run a self-contained mock demo")
     p_demo.add_argument("out", nargs="?", default="pyuvimage_demo")
 
+    _hint_negative_centre(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -308,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
             transformer=args.transformer,
+            image_centre=_parse_centre(args.image_centre),
             pb_correction=not args.no_pb,
             dish_diameter=args.dish_diameter,
             uncertainty_map=not args.no_uncertainty,

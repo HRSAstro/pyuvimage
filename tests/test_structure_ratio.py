@@ -17,7 +17,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from pyuvimage.api import STRUCTURE_RATIO_WARN, _report_dynamic_range
+from pyuvimage.api import (
+    STRUCTURE_RATIO_OVERFIT,
+    STRUCTURE_RATIO_WARN,
+    _report_dynamic_range,
+)
 
 
 def _products(residual_sigma, chi_squared, peak=1.0, rms=0.01):
@@ -96,3 +100,57 @@ def test_no_n_data_means_no_ratio(caplog):
 
 def test_threshold_leaves_room_for_scatter():
     assert 1.0 < STRUCTURE_RATIO_WARN < 2.5
+
+
+# ------------------------------------------------------------- the other side
+
+def test_a_residual_quieter_than_the_noise_is_flagged_as_overfitting(caplog):
+    """The failure this missed on PJ0116: chi^2 fine, model speckled.
+
+    A good fit read 0.94 and an overfit one 0.73, while chi^2/N moved only
+    1.007 -> 1.036. Warning only above 1.5 left the overfit case silent.
+    """
+    rng = np.random.default_rng(4)
+    n_data = 10_000
+    # residual visibilities at chi2/N = 1, but the map has been driven quiet
+    resid = 0.73 * rng.normal(0.0, 1.0, (64, 64))
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(_products(resid, chi_squared=n_data), n_data)
+
+    warnings = _lines(caplog, logging.WARNING)
+    assert warnings, "an over-quiet residual must warn"
+    assert "absorbed" in warnings[0]
+    assert "speckled" in warnings[0] or "fragmented" in warnings[0]
+
+
+def test_the_two_bounds_bracket_white_noise(caplog):
+    """A white residual must sit comfortably inside, not near either edge."""
+    assert STRUCTURE_RATIO_OVERFIT < 1.0 < STRUCTURE_RATIO_WARN
+    rng = np.random.default_rng(5)
+    n_data = 10_000
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(
+            _products(rng.normal(0.0, 1.0, (64, 64)), chi_squared=n_data), n_data
+        )
+    assert not _lines(caplog, logging.WARNING)
+
+
+def test_both_failure_modes_are_distinguished(caplog):
+    """Same chi^2, opposite defects, different warnings."""
+    rng = np.random.default_rng(6)
+    n_data = 10_000
+    y, x = np.mgrid[0:64, 0:64]
+    r = np.hypot(y - 32, x - 32)
+    ring = np.exp(-((r - 20.0) ** 2) / (2 * 2.0**2))
+    ring *= 4.28 / ring.std()
+
+    seen = {}
+    for tag, resid in (("underfit", ring), ("overfit", 0.7 * rng.normal(0, 1, (64, 64)))):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="pyuvimage"):
+            _report_dynamic_range(_products(resid, chi_squared=n_data), n_data)
+        w = _lines(caplog, logging.WARNING)
+        assert w, tag
+        seen[tag] = "discarded" if "unmodelled" in w[0] else "absorbed"
+
+    assert seen == {"underfit": "discarded", "overfit": "absorbed"}

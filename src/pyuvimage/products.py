@@ -29,6 +29,27 @@ def to_fits_orientation(native: np.ndarray) -> np.ndarray:
     return np.flipud(np.asarray(native))
 
 
+def _to_fits_order(data) -> np.ndarray:
+    """Flip North-up arrays into FITS row order.
+
+    Our arrays follow autoarray's native convention -- row 0 is North, which
+    is what `envelope.peak_offset_arcsec` and the summary figure both assume
+    (the figure draws them with ``origin="upper"``, putting row 0 at the top).
+
+    FITS is the other way up. With ``CDELT2`` positive, Dec *increases* with
+    row index, so row 0 is the southernmost. Writing a North-up array under
+    that header put every image upside down in Dec while leaving RA correct --
+    invisible in our own summary PNG, obvious the moment anyone opened
+    `model.fits` in CASA or DS9, and quietly wrong for any Dec read off the
+    WCS.
+
+    Flip the row axis (second from last, so cubes work too) rather than
+    negating CDELT2: positive CDELT2 is the convention every other tool
+    expects.
+    """
+    return np.flip(np.asarray(data, dtype=np.float32), axis=-2)
+
+
 def build_header(
     n_pix: int,
     pixel_scale_arcsec: float,
@@ -47,10 +68,27 @@ def build_header(
             "no phase centre in dataset metadata; writing WCS centred on (0,0)"
         )
     cd = pixel_scale_arcsec / 3600.0
+    # The reconstruction may be centred off the phase centre (--image-centre).
+    # The image grid moved, so CRVAL has to move with it or every product is
+    # astrometrically wrong by exactly the shift -- the one way this feature
+    # could do real damage.
+    offset = meta.get("image_centre_offset_arcsec")
+    if offset:
+        y0, x0 = float(offset[0]), float(offset[1])
+        dec = float(dec) + y0 / 3600.0
+        # column index increases with +x and CDELT1 is negative, so +x is
+        # decreasing RA
+        cosd = max(np.cos(np.radians(float(dec))), 1e-6)
+        ra = float(ra) - (x0 / 3600.0) / cosd
     h["CTYPE1"] = "RA---SIN"
     h["CTYPE2"] = "DEC--SIN"
     h["CUNIT1"] = h["CUNIT2"] = "deg"
     h["CRVAL1"], h["CRVAL2"] = float(ra), float(dec)
+    if offset:
+        h["IMCENOFF"] = (
+            f"{offset[0]:.4f},{offset[1]:.4f}",
+            "image centre offset (y,x) arcsec from phase centre",
+        )
     h["CRPIX1"] = h["CRPIX2"] = (n_pix + 1) / 2.0
     h["CDELT1"], h["CDELT2"] = -cd, cd
     h["RADESYS"] = "ICRS"
@@ -185,8 +223,7 @@ def write_products(
 
     def w(name, data, header):
         path = out / name
-        fits.writeto(path, np.asarray(data, dtype=np.float32), header,
-                     overwrite=overwrite)
+        fits.writeto(path, _to_fits_order(data), header, overwrite=overwrite)
         written[name] = path
 
     n_img = geometry.shape_native[0]

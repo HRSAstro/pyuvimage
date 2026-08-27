@@ -19,6 +19,7 @@ import numpy as np
 
 import autogalaxy as ag
 
+from .beam import DirtyImager
 from .grids import ImageGeometry
 
 logger = logging.getLogger("pyuvimage")
@@ -27,11 +28,23 @@ logger = logging.getLogger("pyuvimage")
 # NUFFT (JAX-based) is required for sane runtimes.
 DFT_MAX_VIS = 20_000
 # The direct DFT builds n_image_pixels x n_vis float64 temporaries, so its cost
-# is the *product*, not either factor. 2e8 elements is ~1.6 GB per temporary.
+# is the *product*, not either factor.
 # Found the hard way on the first well-formed real dataset: 5158 visibilities
 # (well under DFT_MAX_VIS) on a 30" field at 0.19" resolution is 384400 image
 # pixels, and autoarray asked the OS for 14.8 GB.
-DFT_MAX_PRODUCT = 2e8
+#
+# The first threshold was 2e8, reasoned from a single array being ~1.6 GB.
+# That reasoning was wrong: autoarray holds several such temporaries at once,
+# so the peak is a few times one array. Two measured points bracket it, both
+# on J0116 (5158 visibilities) in a 7 GB container:
+#
+#   --pixel-scale auto     100x100 grid   5.2e7 elements (0.41 GB)  ran fine
+#   --pixel-scale nyquist  168x168 grid   1.46e8 elements (1.17 GB) OOM-killed
+#
+# So the limit is somewhere between, and 1e8 (~0.8 GB per array) splits them.
+# Below it nothing changes; above it `auto` reaches for a NUFFT, and if none
+# is installed it warns and uses the DFT anyway -- so erring low costs little.
+DFT_MAX_PRODUCT = 1e8
 
 REGULARIZATIONS = ("gibbs", "adaptive", "matern", "gaussian", "exponential", "constant")
 
@@ -59,6 +72,27 @@ LOG_COEFFICIENT_BOUNDS = (-6.0, 6.0)
 # the bracket is extended up to here when the shipped range is too narrow.
 MAX_LOG_COEFFICIENT = 18.0
 
+# chi^2 = N is not always reachable. Positivity raises chi^2, and a mesh has
+# only so much freedom, so the *constrained* fit can floor above the target
+# while the unconstrained solve reaches it (PJ0116 at 245 GHz: constrained
+# floor chi^2/N = 1.024 against a target of 1.0). Bisecting towards a target
+# that cannot be met is not a near miss -- every trial reads "still too high",
+# so the search walks the coefficient down to its lower bound, switches the
+# prior off and overfits. Instead, when the floor is within
+# CHI2_UNREACHABLE_FACTOR of the target, aim just above the floor: the
+# strongest prior that still fits essentially as well as this model can.
+CHI2_FLOOR_TOLERANCE = 0.05
+CHI2_UNREACHABLE_FACTOR = 1.3
+# How far the constrained fit's chi^2 may sit from the target before the
+# coefficient is re-bisected with the constrained solver.
+CHI2_REBISECT_TOLERANCE = 0.03
+
+# The residual-structure criterion drives the residual map's rms to exactly
+# what white noise of the same total power would give.
+STRUCTURE_TARGET = 1.0
+
+CRITERIA = ("discrepancy", "structure", "evidence")
+
 # Brightness-adaptive regularisation: ratio of the smoothing strength in
 # bright (inner) vs faint (outer) regions, and the brightness contrast scale.
 ADAPT_FLOOR = 1e-2   # prior width in the faintest regions, relative to the peak
@@ -70,14 +104,180 @@ ADAPT_POWER = 2.0
 GIBBS_ELL_FLOOR = 0.25  # shortest correlation length, as a fraction of the beam
 
 
-def jax_available() -> bool:
+def pynufft_available() -> bool:
     try:  # pragma: no cover - environment dependent
-        import jax  # noqa: F401
-        import nufftax  # noqa: F401
+        import pynufft  # noqa: F401
 
         return True
     except Exception:
         return False
+
+
+_PYNUFFT_CLASS = None
+
+
+def pynufft_transformer_class():
+    """A pynufft-backed transformer that agrees with `TransformerDFT`.
+
+    Standalone rather than a subclass of autoarray's
+    ``TransformerNUFFTPyNUFFT``, for two reasons:
+
+    1. **That class no longer exists upstream.** PyAutoArray PR #475
+       (2026.8.23.1) deleted it outright in favour of the JAX-native nufftax
+       backend. Subclassing it made autoarray's optional legacy class a hard
+       import-time dependency of this whole package, which is how one
+       `pip install -U autoarray` produced an AttributeError before pyuvimage
+       could even import. Vendoring the ~60 lines (it is MIT-licensed) keeps
+       the no-JAX NUFFT path alive on every autoarray version.
+
+    2. **It had a half-pixel bug.** It built ``self.shift`` -- the phase ramp
+       aligning the NUFFT grid convention with the DFT's -- and never applied
+       it, so it sat half a pixel from `TransformerDFT` in both axes. Measured:
+       the discrepancy grows linearly with baseline length exactly as a phase
+       error must (9% of the visibility rms at the shortest baselines, 38% at
+       the longest), and applying ``shift`` once recovers the DFT to 1e-5. A
+       fit built entirely on it still converges -- the offset is shared by the
+       mapping matrix and the model -- but the sky lands half a pixel from
+       where every DFT-computed product puts it. The vendored copy applies the
+       shift in `visibilities_from` and its conjugate in `image_from`, so the
+       adjoint identity <Rx, y> == <x, R^T y> is preserved.
+
+    Built lazily so that importing pyuvimage never requires pynufft.
+    `tests/test_pynufft_transformer.py` pins the agreement with the DFT, and
+    `test_the_jax_nufft_agrees_with_the_dft` (skipped without JAX) asks the
+    same question of nufftax.
+    """
+    global _PYNUFFT_CLASS
+    if _PYNUFFT_CLASS is not None:
+        return _PYNUFFT_CLASS
+    try:  # pragma: no cover - environment dependent
+        from pynufft.linalg.nufft_cpu import NUFFT_cpu
+    except Exception:
+        return None
+
+    from astropy import units
+
+    import autoarray as aa
+
+    class TransformerPyNUFFT(NUFFT_cpu):
+        # After autoarray's removed TransformerNUFFTPyNUFFT (MIT licence),
+        # with the half-pixel shift applied; see pynufft_transformer_class.
+
+        def __init__(self, uv_wavelengths, real_space_mask, xp=np, **kwargs):
+            super().__init__()
+            self.uv_wavelengths = np.asarray(uv_wavelengths, dtype=float)
+            self.real_space_mask = real_space_mask
+            self.grid = aa.Grid2D.from_mask(mask=real_space_mask).in_radians
+
+            # pynufft wants uv in radians per pixel, scaled to [-pi, pi) at
+            # the image grid's Nyquist frequency, in (v, u) order
+            pixel_rad = self.grid.pixel_scales[0] * units.arcsec.to(units.rad)
+            nyquist = 1.0 / (2.0 * pixel_rad)
+            om = np.array(
+                [
+                    self.uv_wavelengths[:, 1] / nyquist * np.pi,
+                    self.uv_wavelengths[:, 0] / nyquist * np.pi,
+                ]
+            ).T
+            shape = self.grid.shape_native
+            self.plan(om=om, Nd=shape, Kd=(2 * shape[0], 2 * shape[1]), Jd=(6, 6))
+
+            # the half-pixel phase ramp aligning pynufft's grid convention
+            # with TransformerDFT's
+            half_pix = self.grid.pixel_scales[0] / 2.0 * units.arcsec.to(units.rad)
+            self.shift = np.exp(
+                -2.0j * np.pi * half_pix
+                * (self.uv_wavelengths[:, 1] + self.uv_wavelengths[:, 0])
+            )
+
+        def visibilities_from(self, image, xp=np):
+            vis = self.forward(np.asarray(image.native.array)[::-1, :])
+            return ag.Visibilities(visibilities=vis * self.shift)
+
+        def image_from(self, visibilities, xp=np, **kwargs):
+            shifted = np.asarray(visibilities) * np.conj(self.shift)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                image = np.real(self.adjoint(shifted))[::-1, :]
+            return aa.Array2D(values=image, mask=self.real_space_mask)
+
+        def transform_mapping_matrix(self, mapping_matrix, xp=np):
+            out = np.zeros(
+                (self.uv_wavelengths.shape[0], mapping_matrix.shape[1]),
+                dtype=complex,
+            )
+            native_index = (
+                self.real_space_mask.derive_indexes.native_for_slim.astype(int)
+            )
+            shape = self.grid.shape_native
+            for j in range(mapping_matrix.shape[1]):
+                image_2d = np.zeros(shape, dtype=mapping_matrix.dtype)
+                image_2d[native_index[:, 0], native_index[:, 1]] = (
+                    mapping_matrix[:, j]
+                )
+                out[:, j] = self.forward(image_2d[::-1, :]) * self.shift
+            return out
+
+    _PYNUFFT_CLASS = TransformerPyNUFFT
+    return _PYNUFFT_CLASS
+
+
+def _require_pynufft():
+    cls = pynufft_transformer_class()
+    if cls is None:
+        raise RuntimeError(
+            "--transformer pynufft needs the pynufft package: "
+            "`pip install pynufft`."
+        )
+    return cls
+
+
+def jax_available() -> bool:
+    """Whether the JAX-native NUFFT (`TransformerNUFFT`) can actually run.
+
+    Both halves are required and they fail independently -- see
+    `jax_path_diagnosis` for why that distinction is worth reporting.
+    """
+    return not jax_path_diagnosis()
+
+
+def jax_path_diagnosis() -> str | None:
+    """Why the JAX NUFFT is unavailable, or None if it is available.
+
+    ``nufftax`` is what `TransformerNUFFT` is actually built on, and since
+    PyAutoLens#702 it is **not** part of a default install: JAX itself moved
+    into autonerves' base dependencies, while nufftax stayed behind in
+    autoarray's ``optional`` extra. So the common case on a freshly built
+    environment is a perfectly good JAX and no nufftax -- and the symptom is
+    silence, because `_jax_guard` only speaks up when JAX is *broken*.
+    Distinguish the two, or the fast path is missing for a reason nothing
+    reports.
+
+    The version floor is ours to care about too: nufftax <0.6.1 cannot
+    differentiate a batched ``nufft2d2``, and ``transform_mapping_matrix`` --
+    the call the inversion makes for every mesh pixel -- relies on it.
+    """
+    try:  # pragma: no cover - environment dependent
+        import jax  # noqa: F401
+    except Exception as e:
+        return (
+            f"JAX cannot be imported ({type(e).__name__}: {e}). See the "
+            "startup warning from pyuvimage._jax_guard for how to repair it."
+        )
+    try:  # pragma: no cover - environment dependent
+        import nufftax  # noqa: F401
+    except Exception:
+        return (
+            "JAX works but `nufftax` is not installed, and that is what the "
+            "JAX NUFFT is built on. It is deliberately not part of a default "
+            "install (it lives in autoarray's `optional` extra), so a fresh "
+            "environment usually lacks it. Fix with:\n"
+            "      pip install 'nufftax>=0.6.1,<0.7.0'\n"
+            "  The 0.6.1 floor matters here: earlier versions cannot "
+            "differentiate a batched nufft2d2, which is the call the "
+            "inversion makes for every mesh pixel."
+        )
+    return None
 
 
 def resolve_transformer(
@@ -94,6 +294,8 @@ def resolve_transformer(
         return ag.TransformerDFT
     if transformer == "nufft":
         return ag.TransformerNUFFT
+    if transformer == "pynufft":
+        return _require_pynufft()
     if transformer != "auto":
         raise ValueError(f"unknown transformer {transformer!r}")
 
@@ -103,6 +305,16 @@ def resolve_transformer(
         return ag.TransformerDFT
     if jax_available():
         return ag.TransformerNUFFT
+    if pynufft_available():
+        # No JAX, but pynufft is a pure NumPy/SciPy NUFFT and is the
+        # difference between "impossible" and "an hour": on 164k visibilities
+        # over a 116x116 image the DFT cannot even allocate its 16.5 GB
+        # temporary, while a pynufft transform takes 20 ms.
+        logger.info(
+            "%d visibilities on a %s-pixel image: using the pynufft "
+            "transformer (no JAX installed).", n_vis, n_image_pixels,
+        )
+        return pynufft_transformer_class()
     if n_vis > DFT_MAX_VIS:
         why = f"{n_vis} visibilities"
     else:
@@ -111,10 +323,14 @@ def resolve_transformer(
             f"({product / 1e6:.0f}e6 DFT elements, ~{product * 8 / 1e9:.1f} GB "
             "per temporary)"
         )
+    diagnosis = jax_path_diagnosis()
+    if diagnosis:
+        logger.info("the JAX NUFFT is unavailable: %s", diagnosis)
     warnings.warn(
-        f"{why} with no JAX/nufftax installed: falling back to the direct "
-        "DFT, which will be slow and may run out of memory. Install "
-        "pyuvimage[jax] for the fast NUFFT, or reduce --fov.",
+        f"{why} with no NUFFT installed: falling back to the direct DFT, "
+        "which will be slow and may run out of memory. `pip install pynufft` "
+        "is the quickest fix and needs no JAX; pyuvimage[jax] is the fast "
+        "path where JAX wheels exist. Reducing --fov also helps.",
         stacklevel=2,
     )
     return ag.TransformerDFT
@@ -297,18 +513,32 @@ class PriorScan:
     free_parameters: list = field(default_factory=list)
     trials: list = field(default_factory=list)
     best: dict = field(default_factory=dict)
+    #: chi^2 of the weakest prior tried, under the solver the delivered fit
+    #: uses. With positivity on this is a floor the fit cannot go below, so
+    #: the discrepancy target has to respect it (see `effective_chi2_target`).
+    chi2_floor: float = float("nan")
 
-    def record(self, params: dict, log_evidence: float, chi_squared: float) -> None:
-        self.trials.append(
-            {
-                **{k: float(v) for k, v in params.items()},
-                "log_evidence": float(log_evidence),
-                "chi_squared": float(chi_squared),
-                "chi_squared_per_datum": (
-                    float(chi_squared) / self.n_data if self.n_data else float("nan")
-                ),
-            }
-        )
+    def record(
+        self,
+        params: dict,
+        log_evidence: float,
+        chi_squared: float,
+        structure_ratio: float = float("nan"),
+        positive: bool = False,
+    ) -> None:
+        trial = {
+            **{k: float(v) for k, v in params.items()},
+            "log_evidence": float(log_evidence),
+            "chi_squared": float(chi_squared),
+            "chi_squared_per_datum": (
+                float(chi_squared) / self.n_data if self.n_data else float("nan")
+            ),
+        }
+        if np.isfinite(structure_ratio):
+            trial["structure_ratio"] = float(structure_ratio)
+        if positive:
+            trial["positive"] = True
+        self.trials.append(trial)
 
     def as_dict(self) -> dict:
         return {
@@ -319,7 +549,69 @@ class PriorScan:
             "best": {k: float(v) for k, v in self.best.items()},
             "n_evaluations": len(self.trials),
             "trials": self.trials,
+            **(
+                {"chi_squared_floor": float(self.chi2_floor)}
+                if np.isfinite(self.chi2_floor) else {}
+            ),
         }
+
+
+def effective_chi2_target(target: float, floor: float) -> float:
+    """Raise an unreachable chi^2 target to just above the achievable floor.
+
+    ``target`` and ``floor`` are both absolute chi^2 (not per datum). If the
+    best chi^2 this model and solver can reach already exceeds the target,
+    aiming at the target is worse than useless -- see CHI2_FLOOR_TOLERANCE.
+    Aim a hair above the floor instead, which selects the strongest prior
+    whose fit is indistinguishable from the best available.
+    """
+    if np.isfinite(floor) and np.isfinite(target) and floor > target:
+        return float(floor) * (1.0 + CHI2_FLOOR_TOLERANCE)
+    return float(target)
+
+
+def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
+    """How much the residual *map* looks like noise, rather than like sky.
+
+    ``chi^2`` constrains the residual's total power and nothing else. Two fits
+    with the same chi^2 can leave a featureless residual or the whole source,
+    and only the image plane can tell them apart: incoherent residuals average
+    down as ``1/sqrt(N)``, coherent ones add in phase and land ``sqrt(N)``
+    higher.
+
+    So compare the residual map's measured rms against ``sqrt(chi^2/N)``, the
+    rms it would have if the residual visibilities were white:
+
+    - **~1** the leftover is noise
+    - **>1** coherent structure the fit discarded
+    - **<1** the residual is quieter than the noise it should contain, i.e. the
+      model has absorbed noise
+
+    On PJ0116 this separates a good fit (0.94) from an overfit one (0.73) while
+    chi^2/N moves only 1.007 -> 1.036.
+    """
+    chi2 = _chi_squared(fit)
+    if not np.isfinite(chi2) or chi2 <= 0 or not n_data:
+        return float("nan")
+    try:
+        resid = np.asarray(fit.dataset.data) - np.asarray(fit.model_data)
+        rms = imager.rms
+        if not np.isfinite(rms) or rms <= 0:
+            return float("nan")
+        resid_map = np.asarray(imager.dirty_image(resid), dtype=float) / rms
+        # the transformer returns zeros outside the real-space mask, which
+        # would drag the rms down; measure only where the image is defined
+        inside = imager.inside
+        if getattr(inside, "shape", None) == resid_map.shape:
+            resid_map = resid_map[inside]
+        measured = float(np.nanstd(resid_map))
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.debug("structure ratio failed: %s", e)
+        return float("nan")
+    expected = np.sqrt(chi2 / n_data)
+    if not (np.isfinite(expected) and expected > 0 and np.isfinite(measured)):
+        return float("nan")
+    return measured / expected
 
 
 def _chi_squared(fit: ag.FitInterferometer) -> float:
@@ -341,6 +633,7 @@ def optimise_prior(
     adapt_image=None,
     chi2_target: float = 1.0,
     max_evaluations: int = 60,
+    positive_only: bool = False,
 ) -> tuple[dict, PriorScan]:
     """Optimise the source-prior hyperparameters.
 
@@ -358,6 +651,20 @@ def optimise_prior(
     ``criterion="discrepancy"`` instead drives chi^2 to ``chi2_target * N``,
     which is more robust when the noise map is trustworthy but the evidence
     is poorly behaved (e.g. far fewer visibilities than model pixels).
+
+    ``criterion="structure"`` drives the residual *map's* structure ratio to
+    1 instead (see `structure_ratio`). chi^2 constrains only the residual's
+    total power, and on real data it can be nearly flat in the coefficient --
+    on PJ0116 chi^2/N moved by 0.0008 across two decades of smoothing while
+    the residual went from white to visibly over-smoothed -- so the image
+    plane is the more discriminating test of when to stop.
+
+    ``positive_only`` says whether the delivered fit imposes positivity. The
+    structure search then runs on that solver throughout, since positivity
+    changes the residual map; the discrepancy search stays unconstrained (it
+    is much faster and `fit_dataset` re-bisects afterwards) but its
+    reachability probe uses it, because the constrained chi^2 floor is what
+    the delivered fit actually has to live with.
     """
     mesh_shape = geometry.mesh_shape
     n_data = 2 * len(np.asarray(dataset.data))
@@ -390,7 +697,21 @@ def optimise_prior(
             np.log10(beam_like), np.log10(geometry.fov_arcsec / 2.0)
         )
 
-    def evaluate(log_params: np.ndarray) -> tuple[float, float]:
+    if criterion not in CRITERIA:
+        raise ValueError(f"criterion must be one of {CRITERIA}")
+
+    # The structure criterion is measured in the image plane, so it needs a
+    # dirty imager; build it once and reuse it across every evaluation.
+    imager = DirtyImager(dataset) if criterion == "structure" else None
+    # positivity changes the residual map, so the structure search has to run
+    # on the solver the delivered fit uses; the other criteria stay on the
+    # fast unconstrained solve (the evidence is defined for it).
+    search_positive = bool(positive_only) and criterion == "structure"
+
+    def evaluate(
+        log_params: np.ndarray, positive: bool | None = None
+    ) -> tuple[float, float, float]:
+        positive = search_positive if positive is None else bool(positive)
         coefficient = 10.0 ** float(log_params[0])
         scale = 10.0 ** float(log_params[1]) if kernel else fixed_scale
         env = envelope
@@ -399,74 +720,101 @@ def optimise_prior(
         try:
             fit = fit_at(
                 dataset, mesh_shape, reg_kind, coefficient,
-                positive_only=False, reg_scale=scale, nu=nu,
+                positive_only=positive, reg_scale=scale, nu=nu,
                 envelope=env, adapt_image=adapt_image,
             )
             ev = _safe_evidence(fit)
             chi2 = _chi_squared(fit)
+            ratio = (
+                structure_ratio(fit, imager, n_data)
+                if imager is not None else float("nan")
+            )
         except Exception as e:
             logger.debug("prior evaluation failed: %s", e)
-            return -np.inf, float("nan")
+            return -np.inf, float("nan"), float("nan")
         params = {"coefficient": coefficient}
         if scale is not None:
             params["scale"] = scale
         if second == "envelope_fwhm":
             params["envelope_fwhm"] = env["fwhm"]
-        scan.record(params, ev, chi2)
+        scan.record(params, ev, chi2, ratio, positive=positive)
         logger.info(
-            "  coefficient=%.4g%s  log_evidence=%.6g  chi2/N=%.4g",
+            "  coefficient=%.4g%s  log_evidence=%.6g  chi2/N=%.4g%s",
             coefficient,
             f"  scale={scale:.4g}\"" if kernel else "",
             ev, chi2 / n_data if n_data else np.nan,
+            f"  structure={ratio:.3g}" if np.isfinite(ratio) else "",
         )
-        return ev, chi2
+        return ev, chi2, ratio
 
     def score(log_params: np.ndarray) -> float:
         """Higher is better."""
         for i, (lo, hi) in enumerate(bounds):
             if not (lo <= log_params[i] <= hi):
                 return -np.inf
-        ev, chi2 = evaluate(log_params)
+        ev, chi2, ratio = evaluate(log_params)
         if criterion == "evidence":
             return ev
-        if criterion == "discrepancy":
-            if not np.isfinite(chi2) or chi2 <= 0:
+        # break ties (kernel schemes) by evidence
+        tie = ev / (1.0 + abs(ev)) if np.isfinite(ev) else 0.0
+        if criterion == "structure":
+            if not np.isfinite(ratio) or ratio <= 0:
                 return -np.inf
-            # drive chi^2 to the target; break ties (kernel schemes) by evidence
-            miss = np.log10(chi2 / (chi2_target * n_data)) ** 2
-            tie = ev / (1.0 + abs(ev)) if np.isfinite(ev) else 0.0
-            return -miss + 1e-3 * tie
-        raise ValueError("criterion must be 'evidence' or 'discrepancy'")
+            return -np.log10(ratio / STRUCTURE_TARGET) ** 2 + 1e-3 * tie
+        if not np.isfinite(chi2) or chi2 <= 0:
+            return -np.inf
+        # drive chi^2 to the target
+        miss = np.log10(chi2 / (chi2_target * n_data)) ** 2
+        return -miss + 1e-3 * tie
 
     bounds = [LOG_COEFFICIENT_BOUNDS] + ([log_scale_bounds] if two_d else [])
 
-    if criterion == "discrepancy":
-        # chi^2 rises monotonically with the prior strength, so the
-        # coefficient that fits exactly to the noise level can be bisected.
+    if criterion in ("discrepancy", "structure"):
+        # Both criteria drive a single measure up to a target as the prior
+        # strengthens -- chi^2 to chi2_target * N, or the residual structure
+        # ratio to 1 -- so in both cases the coefficient can be bisected.
         # For kernel priors the correlation scale is the remaining freedom:
-        # among the priors that all fit to the noise level, take the one the
-        # evidence prefers.
-        target = chi2_target * n_data
+        # among the priors that all hit the target, take the one the evidence
+        # prefers.
+        structure = criterion == "structure"
+        target = STRUCTURE_TARGET if structure else chi2_target * n_data
+        unit = "structure ratio" if structure else "chi^2/N"
+        per = 1.0 if structure else n_data
 
-        # If even the weakest prior cannot reach the noise level, the
-        # discrepancy criterion has no solution and bisection would drive the
-        # coefficient to its floor -- silently switching regularisation off
-        # and returning a noisy, unregularised model.  Detect that first.
+        def measure(log_params: np.ndarray) -> tuple[float, float]:
+            """(the quantity being driven to `target`, the log evidence)."""
+            ev, chi2, ratio = evaluate(log_params)
+            return (ratio if structure else chi2), ev
+
+        # If even the weakest prior overshoots the target, bisection has no
+        # solution: every trial reads "still too high", so the search drives
+        # the coefficient to its floor -- silently switching regularisation
+        # off and returning a noisy, overfitted model. Detect that first,
+        # with the solver the delivered fit uses: positivity raises chi^2, so
+        # probing unconstrained hides a constrained floor above the target,
+        # which is exactly how PJ0116 ended up with no effective prior.
         # the probe vector must match the number of free hyperparameters
         probe = [LOG_COEFFICIENT_BOUNDS[0]]
         if kernel:
             probe.append(float(np.mean(log_scale_bounds)))
-        _, chi2_weakest = evaluate(np.array(probe))
-        if np.isfinite(chi2_weakest) and chi2_weakest > target:
+        _, chi2_weakest, ratio_weakest = evaluate(
+            np.array(probe), positive=positive_only
+        )
+        if not structure:
+            scan.chi2_floor = chi2_weakest
+        floor = ratio_weakest if structure else chi2_weakest
+        hopeless = target * (1.0 if structure else CHI2_UNREACHABLE_FACTOR)
+
+        if np.isfinite(floor) and floor > hopeless:
             logger.warning(
-                "chi^2/N = %.3g with essentially no regularisation, above the "
+                "%s = %.3g with essentially no regularisation, above the "
                 "target of %.3g: the model cannot reproduce this data however "
-                "little it is smoothed, so fitting to the noise level is not "
-                "possible. Common causes: the source has real structure finer "
-                "than the model pixel scale, the noise map underestimates the "
-                "noise, or the field of view is too small. Falling back to "
-                "maximum-evidence selection so the prior is not switched off.",
-                chi2_weakest / n_data, chi2_target,
+                "little it is smoothed. Common causes: the source has real "
+                "structure finer than the model pixel scale, the noise map "
+                "underestimates the noise, or the field of view is too small. "
+                "Falling back to maximum-evidence selection so the prior is "
+                "not switched off.",
+                unit, floor / per, target / per,
             )
             best, ev_scan = optimise_prior(
                 dataset, geometry, reg_kind=reg_kind, criterion="evidence",
@@ -474,9 +822,21 @@ def optimise_prior(
                 adapt_image=adapt_image, max_evaluations=max_evaluations,
             )
             scan.trials.extend(ev_scan.trials)
-            scan.criterion = "discrepancy->evidence (unreachable target)"
+            scan.criterion = f"{criterion}->evidence (unreachable target)"
             scan.best = best
             return best, scan
+
+        if np.isfinite(floor) and floor > target:
+            # A near miss: the target is out of reach but only just, so aim
+            # at the knee instead of chasing something impossible.
+            target = effective_chi2_target(target, floor)
+            logger.info(
+                "chi^2/N cannot go below %.4g with this model%s, short of the "
+                "%.4g asked for; aiming for %.4g instead -- the strongest "
+                "prior that still fits essentially as well.",
+                floor / per, " under positivity" if positive_only else "",
+                chi2_target, target / per,
+            )
 
         def coefficient_for_target(log_scale: float | None) -> tuple[float, float]:
             lo, hi = LOG_COEFFICIENT_BOUNDS
@@ -485,35 +845,36 @@ def optimise_prior(
             )
             # The coefficient's natural scale depends on the data's units and
             # signal-to-noise, so the shipped LogUniform(1e-6, 1e6) range is
-            # not always wide enough: extend the bracket until chi^2 brackets
-            # the target.
-            _, chi2_hi = evaluate(p(hi))
+            # not always wide enough: extend the bracket until the measure
+            # brackets the target.
+            value_hi, ev_hi = measure(p(hi))
             while (
-                np.isfinite(chi2_hi) and chi2_hi < target
+                np.isfinite(value_hi) and value_hi < target
                 and hi < MAX_LOG_COEFFICIENT
             ):
                 hi = min(hi + 3.0, MAX_LOG_COEFFICIENT)
-                _, chi2_hi = evaluate(p(hi))
-            if np.isfinite(chi2_hi) and chi2_hi < target:
+                value_hi, ev_hi = measure(p(hi))
+            if np.isfinite(value_hi) and value_hi < target:
                 logger.warning(
-                    "even the strongest prior tried (coefficient 1e%g) fits "
-                    "the data better than the noise level (chi2/N = %.3g): "
-                    "the model has far more freedom than the data constrain, "
-                    "so its faint structure is set by the prior.",
-                    hi, chi2_hi / n_data,
+                    "even the strongest prior tried (coefficient 1e%g) leaves "
+                    "%s at %.3g, below the target of %.3g: the model has far "
+                    "more freedom than the data constrain, so its faint "
+                    "structure is set by the prior.",
+                    hi, unit, value_hi / per, target / per,
                 )
-                return hi, chi2_hi
+                # rank scales by evidence, like every other return here
+                return hi, ev_hi
             for _ in range(14):
                 mid = 0.5 * (lo + hi)
-                _, chi2 = evaluate(p(mid))
-                if not np.isfinite(chi2) or chi2 < target:
+                value, _ = measure(p(mid))
+                if not np.isfinite(value) or value < target:
                     lo = mid
                 else:
                     hi = mid
                 if hi - lo < 0.02:
                     break
             best_c = 0.5 * (lo + hi)
-            ev, chi2 = evaluate(p(best_c))
+            _, ev = measure(p(best_c))
             return best_c, ev
 
         if not two_d:
@@ -637,6 +998,11 @@ class SingleFit:
     geometry: ImageGeometry
     prior: dict
     scan: PriorScan | None = None
+    #: whether the *delivered* fit imposed positivity. Not the same as what
+    #: the caller asked for: the non-negative solver is disabled mid-fit when
+    #: it is caught ignoring the prior, and `fit_parameters.json` was
+    #: reporting the request rather than what actually ran.
+    positive_only: bool = True
 
     @property
     def coefficient(self) -> float:
@@ -1002,7 +1368,7 @@ def fit_dataset(
             dataset, geometry, reg_kind=reg_kind, criterion=criterion,
             nu=nu, fixed_scale=fixed_scale, envelope=envelope,
             optimise_envelope=optimise_envelope, adapt_image=adapt_image,
-            chi2_target=chi2_target,
+            chi2_target=chi2_target, positive_only=positive_only,
         )
     if "envelope_fwhm" in prior:
         envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
@@ -1023,13 +1389,32 @@ def fit_dataset(
     # final fit may impose positivity, which raises chi^2. When that shifts
     # the fit off the noise level, re-bisect the coefficient with the solver
     # actually in use so the delivered model really does fit to the noise.
-    if scan is not None and criterion == "discrepancy" and positive_only:
+    if (
+        scan is not None and criterion == "discrepancy" and positive_only
+        # a search that gave up on chi^2 and fell back to the evidence must
+        # not then have its answer re-bisected against the target it gave up on
+        and "->evidence" not in scan.criterion
+    ):
         n_data = 2 * len(np.asarray(dataset.data))
-        target = chi2_target * n_data
+        # The search probed the weakest prior on this same solver, so we know
+        # what chi^2 the constrained fit can actually reach. If that floor is
+        # above the target, bisecting towards the target walks the
+        # coefficient to its lower bound and switches the prior off; aim just
+        # above the floor instead.
+        target = effective_chi2_target(chi2_target * n_data, scan.chi2_floor)
+        if target > chi2_target * n_data:
+            logger.info(
+                "the constrained fit cannot go below chi2/N = %.4g, so the "
+                "coefficient is chosen against %.4g rather than %.4g.",
+                scan.chi2_floor / n_data, target / n_data, chi2_target,
+            )
         chi2 = _chi_squared(fit)
+        # A few per cent, not the 50%% this used to allow: chi^2 is nearly
+        # flat in the coefficient near the floor, so a loose gate lets a
+        # badly over- or under-smoothed model through as "close enough".
         if not np.isfinite(chi2) or abs(
             np.log10(max(chi2, 1e-30) / target)
-        ) > np.log10(1.5):
+        ) > np.log10(1.0 + CHI2_REBISECT_TOLERANCE):
             logger.info(
                 "positivity moved chi2/N to %.4g; re-optimising the "
                 "coefficient with the constrained solver...",
@@ -1122,7 +1507,7 @@ def fit_dataset(
     n_data_final = 2 * len(np.asarray(dataset.data))
     if np.isfinite(chi2_final):
         ratio = chi2_final / (chi2_target * n_data_final)
-        if ratio > 1.3:
+        if ratio > CHI2_UNREACHABLE_FACTOR:
             logger.warning(
                 "chi^2/N = %.3g against a target of %.3g: the model does not "
                 "reproduce the data and its products should not be trusted. "
@@ -1131,4 +1516,7 @@ def fit_dataset(
                 chi2_final / n_data_final, chi2_target,
             )
 
-    return SingleFit(fit=fit, geometry=geometry, prior=prior, scan=scan)
+    return SingleFit(
+        fit=fit, geometry=geometry, prior=prior, scan=scan,
+        positive_only=bool(positive_only),
+    )

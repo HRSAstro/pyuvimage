@@ -1,0 +1,275 @@
+"""The pynufft transformer must agree with the DFT.
+
+`autoarray.TransformerNUFFTPyNUFFT` computes the half-pixel phase ramp that
+aligns its grid convention with the DFT's -- `self.shift` -- in `__init__`, and
+then never applies it. The two transformers in the same library therefore place
+the image grid half a pixel apart in both axes. Measured on the demo mock, the
+disagreement grows linearly with baseline length exactly as a phase error must:
+9% of the visibility rms at the shortest baselines, 38% at the longest.
+
+`TransformerPyNUFFT` applies it. These tests pin that down, because the failure
+is silent: a fit built entirely on the uncorrected transformer still converges,
+it just reconstructs the sky half a pixel from where every DFT-computed product
+puts it.
+"""
+
+import numpy as np
+import pytest
+
+import autogalaxy as ag
+
+from pyuvimage import fitting, mock
+from pyuvimage.fitting import (
+    pynufft_available,
+    pynufft_transformer_class,
+    resolve_transformer,
+)
+
+pynufft_only = pytest.mark.skipif(
+    not pynufft_available(),
+    reason="pynufft, or autoarray's TransformerNUFFTPyNUFFT, is unavailable",
+)
+TransformerPyNUFFT = pynufft_transformer_class()
+
+
+@pytest.fixture(scope="module")
+def problem():
+    uvd, _, geom, _ = mock.make_demo_dataset(n_vis=400, mesh_n=16, seed=3)
+    uv, data, noise = uvd.flattened()
+    mask = ag.Mask2D.all_false(
+        shape_native=geom.shape_native, pixel_scales=geom.pixel_scale
+    )
+    rng = np.random.default_rng(0)
+    image = ag.Array2D(values=rng.normal(size=int(np.sum(~mask))), mask=mask)
+    return uv, data, noise, geom, mask, image
+
+
+# --- transformer selection (no pynufft needed) -----------------------------
+
+@pynufft_only
+def test_pynufft_can_be_asked_for_by_name():
+    assert resolve_transformer(10, transformer="pynufft") is TransformerPyNUFFT
+
+
+def test_asking_for_a_missing_pynufft_says_why(monkeypatch):
+    """PyAutoArray PR #475 (2026.8.23.1) deleted TransformerNUFFTPyNUFFT
+    outright, and an earlier pyuvimage subclassed it at import time -- so one
+    `pip install -U autoarray` produced an AttributeError before pyuvimage
+    could even import. The transformer is vendored now, so the only missing
+    piece can be the pynufft package itself, and that is a clear message at
+    the point of use, never an import failure."""
+    monkeypatch.setattr(fitting, "pynufft_transformer_class", lambda: None)
+    with pytest.raises(RuntimeError, match="pip install pynufft"):
+        resolve_transformer(10, transformer="pynufft")
+
+
+def test_auto_survives_pynufft_being_missing(monkeypatch):
+    monkeypatch.setattr(fitting, "pynufft_available", lambda: False)
+    monkeypatch.setattr(fitting, "jax_available", lambda: False)
+    with pytest.warns(UserWarning):
+        got = resolve_transformer(164_262, n_image_pixels=116 * 116)
+    assert got is ag.TransformerDFT
+
+
+def test_the_vendored_class_does_not_depend_on_the_deleted_upstream_one():
+    """The regression that motivated vendoring: the transformer must build
+    from pynufft directly, whether or not this autoarray still ships
+    TransformerNUFFTPyNUFFT."""
+    if not fitting.pynufft_available():
+        pytest.skip("pynufft is not installed")
+    cls = fitting.pynufft_transformer_class()
+    upstream = getattr(ag, "TransformerNUFFTPyNUFFT", None)
+    assert cls is not None
+    assert upstream is None or not issubclass(cls, upstream)
+
+
+def test_an_unknown_transformer_is_still_rejected():
+    with pytest.raises(ValueError, match="unknown transformer"):
+        resolve_transformer(10, transformer="nufftt")
+
+
+def test_auto_keeps_the_dft_for_small_problems():
+    assert resolve_transformer(100, n_image_pixels=100) is ag.TransformerDFT
+
+
+@pynufft_only
+def test_auto_reaches_for_pynufft_when_the_dft_cannot_cope(monkeypatch):
+    """164k visibilities on a 116x116 image is 16.5 GB of DFT temporary --
+    numpy raises MemoryError before it computes anything."""
+    monkeypatch.setattr(fitting, "jax_available", lambda: False)
+    got = resolve_transformer(164_262, n_image_pixels=116 * 116)
+    assert got is TransformerPyNUFFT
+
+
+# --- the correction itself -------------------------------------------------
+
+@pynufft_only
+def test_visibilities_match_the_dft(problem):
+    uv, _, _, _, mask, image = problem
+    ref = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    got = np.asarray(
+        TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    # gridding accuracy, not machine precision: pynufft's default plan is a
+    # (6,6) kernel at 2x oversampling
+    assert np.max(np.abs(got - ref)) / np.std(np.abs(ref)) < 1e-3
+
+
+@pynufft_only
+def _skip_without_upstream_legacy_class():
+    """Two tests demonstrate the *upstream* class's half-pixel bug by running
+    it uncorrected. PyAutoArray PR #475 (2026.8.23.1) deleted that class, so
+    on newer installs the demonstration has nothing to run against -- the
+    vendored transformer's own correctness tests still run everywhere."""
+    if getattr(ag, "TransformerNUFFTPyNUFFT", None) is None:
+        pytest.skip("autoarray no longer ships TransformerNUFFTPyNUFFT")
+
+
+def test_the_uncorrected_transformer_really_is_off(problem):
+    _skip_without_upstream_legacy_class()
+    """Guard against the correction being quietly removed as a no-op -- and
+    against upstream fixing it, which would make the wrapper double-shift."""
+    uv, _, _, _, mask, image = problem
+    ref = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    raw = np.asarray(
+        ag.TransformerNUFFTPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    assert np.max(np.abs(raw - ref)) / np.std(np.abs(ref)) > 0.1
+
+
+@pynufft_only
+def test_the_correction_is_a_pure_phase(problem):
+    _skip_without_upstream_legacy_class()
+    """A half-pixel shift moves no power, so amplitudes were never wrong --
+    which is why this survived: every amplitude-based check passes."""
+    uv, _, _, _, mask, image = problem
+    tr = TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+    raw = np.asarray(
+        ag.TransformerNUFFTPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    got = np.asarray(tr.visibilities_from(image=image))
+    assert np.allclose(np.abs(raw), np.abs(got))
+
+
+@pynufft_only
+def test_forward_and_adjoint_stay_adjoint(problem):
+    """<Rx, y> == <x, R^T y>, the load-bearing assumption of the inversion.
+    The adjoint carries conj(shift), so a one-sided fix would break this."""
+    uv, data, _, _, mask, image = problem
+    tr = TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+    rng = np.random.default_rng(1)
+    y = rng.normal(size=len(data)) + 1j * rng.normal(size=len(data))
+    Rx = np.asarray(tr.visibilities_from(image=image))
+    Rty = np.asarray(tr.image_from(visibilities=ag.Visibilities(y)))
+    lhs = float(np.real(np.vdot(Rx, y)))
+    rhs = float(np.dot(np.asarray(image), Rty))
+    # upstream returns the adjoint unscaled by `adjoint_scaling`; the constant
+    # cancels everywhere it is used, so only its constancy is asserted here
+    assert lhs / rhs == pytest.approx(4.0 * np.prod(mask.shape), rel=1e-4)
+
+
+@pynufft_only
+def test_a_fit_agrees_with_the_dft_end_to_end(problem):
+    """The claim that actually matters: same data, same prior, two
+    transformers, same reconstruction."""
+    uv, data, noise, geom, _, _ = problem
+    prior = {"coefficient": 1e5, "scale": 0.3, "nu": 1.5}
+    out = {}
+    for name in ("dft", "pynufft"):
+        ds = fitting.make_dataset(uv, data, noise, geom, transformer=name)
+        out[name] = fitting.fit_dataset(
+            ds, geom, reg_kind="matern", prior=prior, positive_only=False
+        )
+    a, b = out["dft"], out["pynufft"]
+    assert b.chi_squared == pytest.approx(a.chi_squared, rel=1e-3)
+    am, bm = np.asarray(a.model_mesh_image), np.asarray(b.model_mesh_image)
+    assert np.max(np.abs(bm - am)) / np.max(np.abs(am)) < 5e-3
+
+
+# --- the same question, asked of the JAX backend ---------------------------
+
+@pytest.mark.skipif(
+    not fitting.jax_available(), reason="JAX/nufftax is not installed"
+)
+def test_the_jax_nufft_agrees_with_the_dft(problem):
+    """Does `nufftax` share the pynufft backend's half-pixel convention?
+
+    Unanswered when this was written: no container available here can run JAX,
+    and the question matters -- if it does, every JAX-path fit reconstructs
+    the sky half a pixel from where the DFT puts it, silently, because a
+    self-consistent fit still converges and the amplitudes are untouched.
+
+    This test answers it on any machine that has JAX. If it fails with an
+    error growing linearly in baseline length, nufftax needs the same
+    correction `pynufft_transformer_class` applies.
+    """
+    uv, _, _, _, mask, image = problem
+    ref = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    got = np.asarray(
+        ag.TransformerNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    err = np.abs(got - ref) / np.std(np.abs(ref))
+    b = np.hypot(uv[:, 0], uv[:, 1])
+    long_half = err[b > np.median(b)].mean()
+    short_half = err[b <= np.median(b)].mean()
+    assert np.max(err) < 1e-3, (
+        f"nufftax disagrees with the DFT: mean relative error "
+        f"{short_half:.3g} on short baselines and {long_half:.3g} on long "
+        f"ones. Growing with baseline length means a phase offset -- almost "
+        f"certainly the same half-pixel shift the pynufft backend has."
+    )
+
+
+# --- why the JAX path is missing, when it is -------------------------------
+
+def test_a_missing_nufftax_is_diagnosed_separately(monkeypatch):
+    """The quiet failure this exists to catch: nufftax is not part of a
+    default install (it sits in autoarray's `optional` extra), so a freshly
+    built environment routinely has a perfect JAX and no fast path -- and
+    `_jax_guard` says nothing, because JAX is not broken."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_nufftax(name, *args, **kwargs):
+        if name == "nufftax":
+            raise ImportError("no nufftax")
+        if name == "jax":
+            return object()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_nufftax)
+    diagnosis = fitting.jax_path_diagnosis()
+    assert diagnosis is not None
+    assert "nufftax" in diagnosis
+    assert "0.6.1" in diagnosis, "the version floor is the part that bites"
+    assert fitting.jax_available() is False
+
+
+def test_a_broken_jax_is_diagnosed_as_a_different_thing(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def broken_jax(name, *args, **kwargs):
+        if name == "jax":
+            raise AttributeError("partially initialized module 'jax'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_jax)
+    diagnosis = fitting.jax_path_diagnosis()
+    assert diagnosis is not None and "cannot be imported" in diagnosis
+    assert "nufftax" not in diagnosis

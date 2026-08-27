@@ -97,7 +97,9 @@ meant to be left alone. These are the ones worth reaching for:
 | `--reg gibbs` | a single bright compact feature you want as sharp as possible (see [docs/priors.md](docs/priors.md)) |
 | `--reg gaussian` | very sparse visibilities, where a stationary prior lets sidelobes leak into the model |
 | `--point-sources` | there is a genuine point source in the field — no pixel grid can represent one |
+| `--image-centre auto` | the source is not at the phase centre. Recentring on it is exact and cost falls as the *square* of the field you then need |
 | `--pixel-scale nyquist` | you want the longest baselines sampled — finer mesh, several times slower, and only worth it if the long baselines are well populated |
+| `--criterion structure` | the structure ratio the run prints is far from 1 while `chi^2/N` looks fine — pick the smoothing from the residual *map* instead |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
 | `--mode cube` | per-channel images instead of one MFS image |
 
@@ -205,6 +207,41 @@ the header as `FRQ0000...` and to `frequencies.json`, and `FREQIRR` marks that
 
 ## Troubleshooting
 
+**`ModuleNotFoundError: No module named 'pyuvimage'`, from the `pyuvimage`
+script itself.** The command exists but the package it imports does not — so
+the console script and the package have ended up in different places. Almost
+always one of: an editable install that failed *after* writing the script, or
+one made into a different environment from the one on your `PATH`.
+
+```bash
+python -m pip show pyuvimage | grep -i "location"   # start here
+head -1 $(which pyuvimage)                          # which python the script uses
+python -c 'import sys; print(sys.executable)'       # which python you are in
+```
+
+**Check `Editable project location` first.** An editable install records an
+absolute path, and if that directory has since been moved, renamed or emptied,
+`pip show` still reports the package as installed while the import fails — the
+path is where the package *was*. Reinstall from where it actually lives:
+
+```bash
+python -m pip uninstall -y pyuvimage
+cd /path/to/pyuvimage
+python -m pip install -e .        # python -m pip, not pip: same interpreter
+python -c 'import pyuvimage; print(pyuvimage.__file__)'
+```
+
+If instead the two `python` paths disagree, activate the environment the script
+belongs to. If `pip show` finds nothing at all, the install did not complete —
+rerun it **and read the output**, since a failure still leaves
+`src/pyuvimage.egg-info` behind and looks like it worked.
+
+Until that is sorted, this always works and needs no install at all:
+
+```bash
+PYTHONPATH=/path/to/pyuvimage/src python -m pyuvimage.cli fit mydata/ --fov 8
+```
+
 **`AttributeError: partially initialized module 'jax' has no attribute
 'version'`** (or any other crash mentioning jax). Your JAX install is broken,
 not pyuvimage. The PyAuto libraries decide whether JAX exists by looking for it
@@ -248,6 +285,13 @@ these docs was measured on it.
   The usual cause is a noise map that **over**estimates the noise, which stops
   the fit early; also check `--fov` and whether the source has structure finer
   than the model pixel scale.
+
+- **A structure ratio well below ~0.85.** The residual is *quieter* than the
+  noise it should contain, so the model has absorbed noise and its faint
+  structure is not all real. `--criterion structure` picks the smoothing from
+  the residual map rather than from `chi^2`, which on real data can be nearly
+  flat in the coefficient — see
+  [docs/design-notes.md](docs/design-notes.md#when-chi2--n-cannot-be-reached).
 
 - **`chi^2/N` well above 1.** The model cannot represent the data. The run
   says so loudly and refuses to fit point sources.

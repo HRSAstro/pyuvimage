@@ -114,3 +114,32 @@ def test_multi_spw_pools_every_spw():
     pooled = m.baseline_percentile_wavelengths(95.0)
     assert a.baseline_percentile_wavelengths(95.0) < pooled
     assert pooled < m.max_baseline_wavelengths
+
+
+def test_the_long_tail_note_does_not_advise_a_flag_already_in_use(caplog):
+    """The hint says "use --pixel-scale nyquist" -- which is confusing when
+    that is exactly what the user did. `auto` is the only setting the advice
+    applies to; anything else was a deliberate choice."""
+    import logging
+
+    import numpy as np
+
+    from pyuvimage import api, mock
+
+    uvd, _, _, _ = mock.make_demo_dataset(n_vis=200, mesh_n=12, seed=2)
+    # a long tail: one very long baseline against a compact core
+    for spw in uvd.spws:
+        spw.uvw[0] = spw.uvw[0] * 40.0
+
+    for scale, expect_advice in (("auto", True), ("nyquist", False)):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="pyuvimage"):
+            try:
+                api.run(uvd, fov=3.0, pixel_scale=scale, write=False,
+                        uncertainty_map=False, coefficient=1e3)
+            except Exception:
+                pass  # only the geometry logging matters here
+        said = " ".join(r.getMessage() for r in caplog.records)
+        if "sparse long tail" not in said:
+            continue
+        assert ("Use --pixel-scale nyquist" in said) is expect_advice

@@ -8,6 +8,7 @@ natural weighting: sigma_im = sqrt(sum w^2 sigma^2) / sum w.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,6 +16,8 @@ from scipy.optimize import least_squares
 from scipy.signal import fftconvolve
 
 import autogalaxy as ag
+
+logger = logging.getLogger("pyuvimage")
 
 SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
 
@@ -81,6 +84,11 @@ class DirtyImager:
         Verified against `rms_empirical`.
         """
         return float(1.0 / np.sqrt(np.sum(self.weights)))
+
+    @property
+    def inside(self) -> np.ndarray:
+        """Public alias of `_inside`: where the image plane is defined."""
+        return self._inside
 
     @property
     def _inside(self) -> np.ndarray:
@@ -191,3 +199,109 @@ def restore(
         np.nan_to_num(model_image_jy_pix), kernel, mode="same"
     )
     return restored + np.nan_to_num(residual_dirty_jy_beam)
+
+
+def wide_field_dirty_image(
+    uv_wavelengths: np.ndarray,
+    data: np.ndarray,
+    noise: np.ndarray,
+    fov_arcsec: float,
+    n_pixels: int = 96,
+    chunk: int = 4096,
+) -> tuple[np.ndarray, float]:
+    """A naturally weighted dirty image by direct summation, in chunks.
+
+    Deliberately does not go through a transformer. The point is to look at a
+    field far larger than the one being reconstructed -- to find where the
+    emission actually is -- and building an autoarray dataset for that would
+    allocate the ``n_pixels^2 x n_vis`` temporary the whole exercise is meant
+    to avoid. Here memory is bounded by ``chunk``.
+
+    On a real ALMA dataset (164k visibilities, 96x96 pixels) this takes about
+    a minute and a few hundred MB.
+
+    The returned array follows the same convention as every other native image
+    here: row 0 is North (+y), column index increases with +x, so
+    `envelope.peak_offset_arcsec` reads it directly.
+
+    Returns (image [Jy/beam], analytic rms [Jy/beam]).
+    """
+    uv = np.asarray(uv_wavelengths, dtype=float)
+    vis = np.asarray(data)
+    sig = np.asarray(noise)
+    w = 1.0 / (0.5 * (sig.real**2 + sig.imag**2))
+    total = float(np.sum(w))
+    if not np.isfinite(total) or total <= 0:
+        raise RuntimeError("no usable weights for the wide-field dirty image")
+    arcsec = np.pi / 180.0 / 3600.0
+    step = fov_arcsec / n_pixels
+    coord = (np.arange(n_pixels) - (n_pixels - 1) / 2.0) * step * arcsec
+    x_of_col = coord                 # +x with increasing column
+    y_of_row = coord[::-1]           # +y (North) at row 0
+    img = np.zeros((n_pixels, n_pixels))
+    for s in range(0, len(vis), chunk):
+        u = uv[s:s + chunk, 0]
+        v = uv[s:s + chunk, 1]
+        d = vis[s:s + chunk]
+        wc = w[s:s + chunk]
+        for r, yy in enumerate(y_of_row):
+            ph = 2.0 * np.pi * (u[None, :] * x_of_col[:, None] + v[None, :] * yy)
+            # Re[V e^{+i phi}] -- the sign that matches `DirtyImager`; the
+            # other one returns the image flipped in both axes, which is easy
+            # to miss on a centrally peaked source and wrong on every other
+            img[r] += (wc * (d.real * np.cos(ph) - d.imag * np.sin(ph))).sum(1)
+    return img / total, float(1.0 / np.sqrt(total))
+
+
+def wide_field_image(
+    uv_wavelengths: np.ndarray,
+    data: np.ndarray,
+    noise: np.ndarray,
+    fov_arcsec: float,
+    n_pixels: int = 96,
+    transformer: str = "auto",
+) -> tuple[np.ndarray, float]:
+    """Dirty image of a field much wider than the one being reconstructed.
+
+    Used to find where the emission actually is before committing to an
+    ``--fov``. Takes the NUFFT when one is available -- a few seconds -- and
+    falls back to direct summation otherwise.
+
+    The fallback is exact but costs ``n_pixels^2 x n_vis``: about 1.4 billion
+    operations for a 96x96 field over 148k visibilities, which is ~90 s on a
+    fast machine and several minutes on a slow one. That is long enough to
+    look like a hang, so this reports what it is doing before starting.
+
+    Returns (image [Jy/beam], rms [Jy/beam]) on the native grid convention.
+    """
+    from . import fitting
+    from .grids import resolve_geometry
+
+    uv = np.asarray(uv_wavelengths, dtype=float)
+    n_vis = len(uv)
+    cls = fitting.resolve_transformer(
+        n_vis, transformer=transformer, n_image_pixels=n_pixels * n_pixels
+    )
+    if cls is not ag.TransformerDFT or n_vis * n_pixels**2 <= fitting.DFT_MAX_PRODUCT:
+        b_max = float(np.max(np.hypot(uv[:, 0], uv[:, 1])))
+        half = max(1, n_pixels // 2)
+        geometry = resolve_geometry(
+            fov_arcsec=fov_arcsec,
+            max_baseline_wavelengths=b_max,
+            mesh_shape=(half, half),
+            oversample=2,
+        )
+        dataset = fitting.make_dataset(
+            uv, data, noise, geometry, transformer=transformer
+        )
+        imager = DirtyImager(dataset)
+        return np.asarray(imager.dirty_image(np.asarray(data))), imager.rms
+
+    logger.info(
+        "  no NUFFT available, so the wide-field image is a direct sum over "
+        "%d visibilities: this takes a couple of minutes. `pip install "
+        "pynufft` makes it seconds.", n_vis,
+    )
+    return wide_field_dirty_image(
+        uv, data, noise, fov_arcsec, n_pixels=n_pixels
+    )

@@ -16,11 +16,14 @@ each channel use its exact uv coordinates: u_lambda = u_m * nu / c.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+
+logger = logging.getLogger("pyuvimage")
 
 C_M_S = 299792458.0
 
@@ -765,3 +768,86 @@ def recompute_noise(
         time=dataset.time,
         weight_sigma=dataset.weight_sigma,
     )
+
+
+ARCSEC_RAD = np.pi / 180.0 / 3600.0
+
+
+def shift_image_centre(
+    dataset: "UVData | MultiSpwUVData", centre_arcsec: tuple[float, float]
+) -> "UVData | MultiSpwUVData":
+    """Move the reconstruction's centre to ``(y, x)`` arcsec off the phase centre.
+
+    The visibilities are rotated by an exact phase ramp,
+
+        V' = V exp(+2 pi i (u x0 + v y0)),
+
+    with ``(y0, x0)`` in radians, which puts emission that was at that offset
+    at the new grid centre. This is not an approximation: it is the same
+    operation CASA's ``phaseshift`` performs, minus the w-term correction,
+    which is negligible for the few-arcsecond offsets it is meant for.
+
+    Why it matters: the reconstruction cost goes as the *square* of the field
+    of view, and both ALMA datasets that motivated this sit 3-4 arcsec off the
+    phase centre. Covering an off-centre source from the phase centre needed
+    an 8 arcsec field -- 32 GB and hours. Recentred, the same source needs 3
+    arcsec, 4.4 GB, and a coarser field is no longer forced on it.
+
+    The offset is recorded in ``meta["image_centre_offset_arcsec"]`` so the
+    output WCS can shift ``CRVAL`` to match; without that the FITS astrometry
+    would silently be wrong by exactly the amount shifted.
+    """
+    y0, x0 = float(centre_arcsec[0]), float(centre_arcsec[1])
+    if isinstance(dataset, MultiSpwUVData):
+        return MultiSpwUVData(
+            spws=[shift_image_centre(s, centre_arcsec) for s in dataset.spws],
+            meta=_with_centre(dataset.meta, y0, x0),
+        )
+    if y0 == 0.0 and x0 == 0.0:
+        return dataset
+
+    data = np.array(dataset.data, dtype=complex)
+    noise = np.array(dataset.noise, dtype=complex)
+    for c in range(dataset.n_chan):
+        uv = dataset.uv_wavelengths(c)
+        phase = np.exp(
+            2j * np.pi * (uv[:, 0] * x0 + uv[:, 1] * y0) * ARCSEC_RAD
+        )
+        data[c] = data[c] * phase
+        # A phase rotation mixes the real and imaginary parts, so separate
+        # sigma_re and sigma_im no longer describe the rotated visibility.
+        # They agree to well within a per cent on real data (both are the same
+        # receiver noise), so the rotated noise is the quadrature mean.
+        s_re, s_im = noise[c].real, noise[c].imag
+        s = np.sqrt(0.5 * (s_re**2 + s_im**2))
+        noise[c] = s + 1j * s
+    worst = _reim_asymmetry(dataset.noise)
+    if worst > 0.02:
+        logger.warning(
+            "the real and imaginary noise differ by up to %.0f%% before "
+            "recentring; the rotated noise map is their quadrature mean, so "
+            "individual sigmas are accurate to about that much.",
+            100.0 * worst,
+        )
+    return replace(
+        dataset, data=data, noise=noise,
+        meta=_with_centre(dataset.meta, y0, x0),
+    )
+
+
+def _reim_asymmetry(noise: np.ndarray) -> float:
+    a = np.asarray(noise)
+    re, im = np.abs(a.real), np.abs(a.imag)
+    ok = np.isfinite(re) & np.isfinite(im) & (re > 0) & (im > 0)
+    if not np.any(ok):
+        return 0.0
+    return float(np.nanmax(np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))))
+
+
+def _with_centre(meta: dict, y0: float, x0: float) -> dict:
+    out = dict(meta or {})
+    prev = out.get("image_centre_offset_arcsec") or (0.0, 0.0)
+    out["image_centre_offset_arcsec"] = [
+        float(prev[0]) + y0, float(prev[1]) + x0
+    ]
+    return out

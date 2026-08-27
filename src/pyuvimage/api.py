@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from . import beam as beam_mod
-from . import fitting, primary_beam
+from . import envelope, fitting, primary_beam
 from .grids import (
     ImageGeometry,
     nyquist_pixel_scale_arcsec,
@@ -69,6 +69,7 @@ def run(
     nu: float = fitting.DEFAULT_NU,
     envelope_fwhm: float | str = "auto",
     envelope_centre: tuple[float, float] | str = "auto",
+    image_centre: tuple[float, float] | str = "centre",
     envelope_floor: float = 1e-2,
     adapt_power: float = fitting.ADAPT_POWER,
     criterion: str = "discrepancy",
@@ -112,10 +113,21 @@ def run(
             "centre" forces the phase centre.
         envelope_floor: prior width far from the centre, relative to the
             centre (smaller suppresses distant structure more strongly).
-        criterion: how the prior hyperparameters are optimised: "evidence"
-            (maximise the Bayesian evidence, as PyAutoLabs does) or
-            "discrepancy" (drive chi^2 to chi2_target * N).
+        criterion: how the prior hyperparameters are optimised:
+            "discrepancy" (drive chi^2 to chi2_target * N), "structure"
+            (drive the residual map's structure ratio to 1, which is more
+            discriminating when chi^2 is flat in the coefficient), or
+            "evidence" (maximise the Bayesian evidence, as PyAutoLabs does).
         chi2_target: target chi^2/N for the discrepancy criterion.
+        image_centre: where to centre the reconstruction. "centre" (default)
+            uses the phase centre; "auto" finds the brightest peak in a
+            wide-field dirty image and centres there; or a (dRA, dDec) offset
+            in arcsec from the phase centre, +RA East and +Dec North, the same
+            convention as the point-source positions. The visibilities are
+            rotated by an exact phase ramp and
+            the output WCS follows, so a source several arcsec off the phase
+            centre no longer forces a field big enough to reach it from the
+            centre -- and cost goes as the square of the field.
         positive_only: constrain the source to non-negative flux.
         dish_diameter: antenna diameter [m] for the primary beam; defaults to
             the value stored at import.
@@ -147,6 +159,8 @@ def run(
     # a single very wide spw deserves the same warning as several combined
     _warn_wide_band(uvd, mode)
 
+    uvd = _recentre(uvd, image_centre, fov, dish_diameter, transformer)
+
     b_max = uvd.max_baseline_wavelengths
     b_eff = uvd.baseline_percentile_wavelengths(BASELINE_PERCENTILE)
     geometry = resolve_geometry(
@@ -163,13 +177,26 @@ def run(
         geometry.nyquist_pixel_scale, *geometry.shape_native,
     )
     if b_max > 1.5 * b_eff:
+        # ...but do not advise a flag the user is already using: `auto` sizes
+        # from b_95, every other setting is a deliberate choice.
+        advice = (
+            " Use --pixel-scale nyquist to sample the longest baselines "
+            "instead." if pixel_scale == "auto" else ""
+        )
         logger.info(
             "  baselines have a sparse long tail: %.0f%% of samples are within "
-            "%.0f klambda but the longest is %.0f klambda, so the mesh is sized "
-            "at %.3g\" rather than %.3g\". Use --pixel-scale nyquist to sample "
-            "the longest baselines instead.",
+            "%.0f klambda but the longest is %.0f klambda, so %s.%s",
             BASELINE_PERCENTILE, b_eff / 1e3, b_max / 1e3,
-            nyquist_pixel_scale_arcsec(b_eff), nyquist_pixel_scale_arcsec(b_max),
+            (
+                f"the mesh is sized at "
+                f"{nyquist_pixel_scale_arcsec(b_eff):.3g}\" rather than "
+                f"{nyquist_pixel_scale_arcsec(b_max):.3g}\""
+                if pixel_scale == "auto" else
+                f"a mesh at {geometry.mesh_pixel_scale:.3g}\" is finer than "
+                f"the bulk of the data constrains "
+                f"({nyquist_pixel_scale_arcsec(b_eff):.3g}\")"
+            ),
+            advice,
         )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
     # the real sample count: flags remove samples, and for ragged multi-spw
@@ -486,7 +513,12 @@ def _parameter_record(
             "n_evaluations": (scan or {}).get("n_evaluations", 0),
         },
         "solver": {
-            "positive_only": bool(positive_only),
+            # what actually ran, not what was asked for -- the guard can
+            # disable positivity mid-fit
+            "positive_only": bool(
+                getattr(fit, "positive_only", positive_only)
+                if fit is not None else positive_only
+            ),
             "transformer": transformer,
             "jax": fitting.jax_available(),
         },
@@ -507,6 +539,75 @@ def _parameter_record(
     }
 
 
+
+
+# How much wider than the reconstruction to look when hunting for the source.
+# The primary beam is the real limit, but a first look does not need to be
+# fine: this is a peak-finder, not a product.
+AUTO_CENTRE_FIELD_FACTOR = 4.0
+AUTO_CENTRE_PIXELS = 96
+
+
+def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
+    """Apply --image-centre, resolving "auto" from a wide-field dirty image.
+
+    An explicit centre is given as ``(dRA, dDec)`` in arcsec from the phase
+    centre, +RA East and +Dec North -- the same convention as ``--point``, and
+    the one an astronomer reads off a CLEAN image. Internally the grid uses
+    ``(y, x)`` with x running opposite to RA, so the two are not the same pair
+    of numbers and `pointsource.sky_to_grid` does the conversion.
+    """
+    from . import beam as beam_mod
+    from .pointsource import grid_to_sky, sky_to_grid
+    from .uvdata import shift_image_centre
+
+    if image_centre is None or (
+        isinstance(image_centre, str) and image_centre == "centre"
+    ):
+        return uvd
+    if isinstance(image_centre, str):
+        if image_centre != "auto":
+            raise ValueError(
+                "image_centre must be 'centre', 'auto', or a (dRA, dDec) "
+                "offset in arcsec"
+            )
+        dish = dish_diameter or uvd.meta.get("dish_diameter_m")
+        wide = fov * AUTO_CENTRE_FIELD_FACTOR
+        if dish:
+            wide = min(
+                wide,
+                primary_beam.pb_fwhm_arcsec(uvd.central_frequency, dish),
+            )
+        wide = max(wide, fov)
+        uv, d, n = uvd.flattened()
+        logger.info(
+            "looking for the source in a %.3g\" dirty image before choosing "
+            "the reconstruction centre...", wide,
+        )
+        img, rms = beam_mod.wide_field_image(
+            uv, d, n, wide, n_pixels=AUTO_CENTRE_PIXELS,
+            transformer=transformer,
+        )
+        centre = envelope.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
+        peak = float(np.nanmax(img))
+        logger.info(
+            "  brightest peak %.3g Jy/beam (%.0f sigma) at dRA %+.3f\", "
+            "dDec %+.3f\"", peak, peak / rms if rms > 0 else np.nan,
+            *grid_to_sky(*centre),
+        )
+        if max(abs(centre[0]), abs(centre[1])) < 0.5 * (
+            wide / AUTO_CENTRE_PIXELS
+        ):
+            logger.info("  already at the phase centre; not recentring")
+            return uvd
+    else:
+        centre = sky_to_grid(float(image_centre[0]), float(image_centre[1]))
+
+    logger.info(
+        "recentring the reconstruction on dRA %+.3f\", dDec %+.3f\" from the "
+        "phase centre; the output WCS follows.", *grid_to_sky(*centre),
+    )
+    return shift_image_centre(uvd, centre)
 
 
 def _warn_wide_band(uvd, mode: str) -> None:
@@ -537,10 +638,19 @@ def _warn_wide_band(uvd, mode: str) -> None:
     )
 
 
-# Residual-structure ratio above which the leftover is not credibly noise.
-# 1.0 is white; the ratio scatters a little with the number of independent
-# beams in the field, so leave room before complaining.
+# The residual-structure ratio is two-sided, and both sides are failures.
+#
+# 1.0 is white. **Above** STRUCTURE_RATIO_WARN the leftover is coherent -- real
+# emission the fit discarded (PJ0116 with an inflated noise map: 4.3).
+# **Below** STRUCTURE_RATIO_OVERFIT the residual is quieter than the noise it
+# is supposed to contain, which means the model has absorbed noise: the fit is
+# overfitting even though chi^2 looks respectable. On PJ0116 a good fit read
+# 0.94 and an overfit one 0.73, while chi^2/N moved only 1.007 -> 1.036.
+#
+# Both bounds leave room for the scatter that comes with a finite number of
+# independent beams in the field.
 STRUCTURE_RATIO_WARN = 1.5
+STRUCTURE_RATIO_OVERFIT = 0.85
 
 
 def _report_dynamic_range(p, n_data: int | None = None) -> None:
@@ -603,6 +713,19 @@ def _report_dynamic_range(p, n_data: int | None = None) -> None:
             "noise, which stops the fit early; also check --fov and whether "
             "the source has structure finer than the model pixel scale.",
             ratio, ratio,
+        )
+    elif ratio < STRUCTURE_RATIO_OVERFIT:
+        logger.warning(
+            "the residual map is quieter than the noise it should contain "
+            "(structure ratio %.2f, %.0f%% of white): the model has absorbed "
+            "noise, so its faint structure is not all real -- expect a "
+            "speckled or fragmented model image. chi^2 cannot see this, "
+            "because a model that fits the noise still lands near "
+            "chi^2/N = 1. The usual cause is a noise map that "
+            "*under*estimates the noise; a stronger prior (--coefficient, "
+            "--criterion structure, or --criterion evidence) is the other "
+            "lever.",
+            ratio, 100.0 * ratio,
         )
 
 
