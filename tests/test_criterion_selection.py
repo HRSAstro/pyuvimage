@@ -24,6 +24,8 @@ import pytest
 from pyuvimage import fitting, mock
 from pyuvimage.fitting import (
     CHI2_FLOOR_TOLERANCE,
+    CHI2_FLOOR_SIGMAS,
+    chi2_floor_tolerance,
     CHI2_REBISECT_TOLERANCE,
     LOG_COEFFICIENT_BOUNDS,
     PriorScan,
@@ -125,9 +127,10 @@ def test_an_unreachable_target_does_not_switch_the_prior_off(
     sf, n_data = _run(monkeypatch, dataset, geometry, floor_positive=1.02)
 
     assert np.log10(sf.prior["coefficient"]) > LOG_COEFFICIENT_BOUNDS[0] + 1.0
-    # it lands at the knee: just above the floor the solver can reach
+    # it lands at the knee: just above the floor the solver can reach, by
+    # however much chi^2/N is uncertain at *this* dataset size
     assert sf.chi_squared / n_data == pytest.approx(
-        1.02 * (1.0 + CHI2_FLOOR_TOLERANCE), rel=0.02
+        1.02 * (1.0 + chi2_floor_tolerance(n_data)), rel=0.02
     )
     assert np.isfinite(sf.scan.chi2_floor)
     assert sf.scan.chi2_floor / n_data == pytest.approx(1.02, rel=1e-3)
@@ -321,3 +324,121 @@ def test_enforce_positive_does_nothing_when_the_solver_is_fine(demo_geometry):
         prior={"coefficient": 1e3}, enforce_positive=True,
     )
     assert sf.positive_only is True
+
+
+# --- how far above the floor still counts as "as good" ----------------------
+#
+# This was a flat 5% and it was the reason a Ruby fit at chi^2/N = 1.069 left
+# the whole ring in the residual map at 60 sigma: 5% is 3.6 sigma at N = 10^4
+# and 19 sigma at N = 3x10^5, so the same number means "the knee" on a small
+# dataset and "smooth away the source" on a large one.
+
+
+def test_the_tolerance_shrinks_as_the_dataset_grows():
+    small, large = chi2_floor_tolerance(10_000), chi2_floor_tolerance(300_000)
+    assert small > large
+    # it is sqrt(2/N), so 30x the data is sqrt(30) times tighter
+    assert small / large == pytest.approx(np.sqrt(30.0), rel=0.01)
+
+
+def test_the_tolerance_is_a_fixed_number_of_sigma():
+    for n in (10_316, 296_954, 328_524):
+        sigma = np.sqrt(2.0 / n)
+        assert chi2_floor_tolerance(n) == pytest.approx(CHI2_FLOOR_SIGMAS * sigma)
+
+
+def test_the_ruby_case_lands_where_the_structure_criterion_independently_did():
+    """The corroboration: on both large real datasets, aiming k=2 sigma above
+    the floor puts the coefficient within 0.1% of where `structure` -- which
+    knows nothing about chi^2 -- puts it. Ruby floors at 1.018 and `structure`
+    chose 1.0225; 9io9 floors at 1.0298 by the same route."""
+    got = 1.018 * (1.0 + chi2_floor_tolerance(296_954))
+    assert got == pytest.approx(1.0233, abs=5e-4)
+    assert abs(got - 1.0225) / 1.0225 < 0.002
+
+
+def test_an_unknown_sample_count_falls_back_to_the_old_fixed_fraction():
+    assert chi2_floor_tolerance(None) == CHI2_FLOOR_TOLERANCE
+    assert chi2_floor_tolerance(0) == CHI2_FLOOR_TOLERANCE
+
+
+def test_a_tiny_dataset_is_not_handed_unlimited_slack():
+    """sqrt(2/N) grows without bound as N shrinks; the cap stops a 50-point
+    dataset from being told that any prior fits essentially as well."""
+    assert chi2_floor_tolerance(50) == fitting.CHI2_FLOOR_TOLERANCE_MAX
+
+
+def test_the_target_uses_the_sample_count_when_it_is_given():
+    """Same floor, same target, two dataset sizes -- and the large one gets a
+    much tighter effective target."""
+    small = effective_chi2_target(100.0, 110.0, 10_000)
+    large = effective_chi2_target(100.0, 110.0, 300_000)
+    assert 110.0 < large < small
+
+
+def test_the_rebisection_gate_is_statistical_too():
+    """Same flat-fraction mistake, one function along: 3% is 11 sigma at
+    N = 3x10^5, which lets a badly-smoothed constrained fit through as
+    "close enough" and skips the re-bisection entirely."""
+    assert fitting.chi2_rebisect_tolerance(None) == fitting.CHI2_REBISECT_TOLERANCE
+    assert fitting.chi2_rebisect_tolerance(296_954) < 0.01
+    # never tighter than the absolute floor, however large the dataset
+    assert fitting.chi2_rebisect_tolerance(10**9) == fitting.CHI2_REBISECT_FLOOR
+    # ...and never *looser* than it was: this gate decides whether to
+    # re-bisect at all, so a small dataset must not be let off the hook
+    for n in (200, 1_400, 10_316):
+        assert fitting.chi2_rebisect_tolerance(n) <= fitting.CHI2_REBISECT_TOLERANCE
+
+
+# --- picking the criterion automatically -----------------------------------
+#
+# The last knob this needed. `structure` is the better criterion wherever it
+# is calibrated -- at ratio 1.0 all three real datasets land at 3.9-5.0 sigma
+# -- but it mis-selects on a weakly constrained fit, where the residual map is
+# not white at chi^2 = N to begin with. Data per model pixel separates the two
+# regimes cleanly, so `auto` decides on that and says which it took.
+
+
+def test_auto_takes_structure_when_the_data_comfortably_outnumber_the_model():
+    """Ruby: 296,954 data points over a 26x26 mesh is 439 per pixel."""
+    assert fitting.resolve_criterion("auto", 296_954, 676) == "structure"
+    assert fitting.resolve_criterion("auto", 328_524, 676) == "structure"
+
+
+def test_auto_takes_discrepancy_on_a_weakly_constrained_fit():
+    """The demo mock: 400 data points over 144 mesh pixels, 2.8 per pixel.
+    Its structure ratio reads 0.49 at chi^2/N = 0.999, so driving the ratio
+    to 1 over-smooths to chi^2/N = 1.59."""
+    assert fitting.resolve_criterion("auto", 400, 144) == "discrepancy"
+    # PJ0116 at 4.1 per pixel is the marginal case, and lands on discrepancy
+    # -- which costs nothing there: 3.9 sigma either way, and it is faster.
+    assert fitting.resolve_criterion("auto", 10_316, 2500) == "discrepancy"
+
+
+def test_the_threshold_is_where_the_constant_says_it_is():
+    n_mesh = 100
+    k = fitting.CRITERION_AUTO_DATA_PER_PARAMETER
+    assert fitting.resolve_criterion("auto", int(k * n_mesh), n_mesh) == "structure"
+    assert fitting.resolve_criterion(
+        "auto", int(k * n_mesh) - n_mesh, n_mesh
+    ) == "discrepancy"
+
+
+def test_an_explicit_criterion_is_never_overridden():
+    for c in fitting.CRITERIA:
+        assert fitting.resolve_criterion(c, 10**6, 100) == c
+
+
+def test_auto_falls_back_safely_when_the_sizes_are_unknown():
+    assert fitting.resolve_criterion("auto", None, None) == "discrepancy"
+    assert fitting.resolve_criterion("auto", 0, 0) == "discrepancy"
+
+
+def test_auto_says_which_it_took_and_why(caplog):
+    """The point of an automatic choice is that it is not silent."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        fitting.resolve_criterion("auto", 296_954, 676)
+    assert "auto -> structure" in caplog.text
+    assert "--criterion discrepancy to override" in caplog.text

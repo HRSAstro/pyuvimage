@@ -11,6 +11,7 @@ maximisation is available as an alternative criterion.
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import warnings
@@ -82,17 +83,99 @@ MAX_LOG_COEFFICIENT = 18.0
 # prior off and overfits. Instead, when the floor is within
 # CHI2_UNREACHABLE_FACTOR of the target, aim just above the floor: the
 # strongest prior that still fits essentially as well as this model can.
+#
+# "Essentially as well" has to be measured in units of how well chi^2 is
+# determined, not as a fixed percentage. The standard error of chi^2/N is
+# sqrt(2/N), so a flat 5% -- which is what this used to be -- means very
+# different things at different dataset sizes:
+#
+#     PJ0116   N =  10,316   5% = 3.6 sigma   (a defensible knee)
+#     Ruby     N = 296,954   5% =  19 sigma   (a thousand-fold over-smoothing)
+#     9io9     N = 328,524   5% =  20 sigma
+#
+# On Ruby that let the discrepancy criterion pick a coefficient ~1000x too
+# strong while chi^2/N still read 1.069, leaving the whole ring in the
+# residual map at 60 sigma. CHI2_FLOOR_SIGMAS multiples of sqrt(2/N) instead:
+# on both large datasets k=2 lands within 0.1% of where the independent
+# `structure` criterion puts the coefficient (Ruby 1.0233 vs 1.0225,
+# 9io9 1.0321 vs 1.0298), which is a strong sign it is the right scale.
+CHI2_FLOOR_SIGMAS = 2.0
+# Fallback when the sample count is unknown, and a cap so that a very small
+# dataset -- where sqrt(2/N) is large -- cannot be given unlimited slack.
 CHI2_FLOOR_TOLERANCE = 0.05
+CHI2_FLOOR_TOLERANCE_MAX = 0.10
 CHI2_UNREACHABLE_FACTOR = 1.3
 # How far the constrained fit's chi^2 may sit from the target before the
-# coefficient is re-bisected with the constrained solver.
+# coefficient is re-bisected with the constrained solver. Same argument as
+# above -- a flat 3% is 11 sigma at N = 3x10^5 -- so it follows sqrt(2/N) too,
+# with a small absolute floor so the gate does not chase numerical noise on a
+# very large dataset.
 CHI2_REBISECT_TOLERANCE = 0.03
+CHI2_REBISECT_FLOOR = 0.005
 
 # The residual-structure criterion drives the residual map's rms to exactly
 # what white noise of the same total power would give.
 STRUCTURE_TARGET = 1.0
 
 CRITERIA = ("discrepancy", "structure", "evidence")
+
+# `--criterion auto` picks between the two chi^2-free-of-charge options on the
+# one thing that decides which of them works: how much data there is per model
+# parameter.
+#
+# `structure` is the better criterion wherever it is calibrated -- it drives
+# the residual *map* to white, which is what "the fit is done" actually means,
+# and on all three real datasets at ratio 1.0 the residual lands at 3.9-5.0
+# sigma. But it is only calibrated where the residual map really would be
+# white at chi^2 = N, and on a weakly constrained fit it is not: the demo mock
+# (400 data points, 144 mesh pixels) sits at ratio 0.49 with chi^2/N = 0.999,
+# and driving that to 1 over-smooths to chi^2/N = 1.59.
+#
+# The two regimes separate cleanly on data per parameter:
+#
+#     demo mock     2.8:1   discrepancy (structure over-smooths)
+#     PJ0116        4.1:1   either -- 3.9 sigma both ways
+#     Ruby        439:1     structure (discrepancy 6.3 sigma at ratio 1.43)
+#     9io9        486:1     structure
+#
+# so a threshold of 10 selects `structure` exactly where `discrepancy` fails
+# and leaves the small and marginal cases on the faster criterion, where it
+# costs nothing.
+CRITERION_AUTO_DATA_PER_PARAMETER = 10.0
+
+
+def resolve_criterion(
+    criterion: str, n_data: int | None = None, n_mesh_pixels: int | None = None
+) -> str:
+    """Turn ``"auto"`` into a concrete criterion; pass anything else through.
+
+    Resolved once, early, so that everything downstream -- including the
+    point-source retune, which only fires under `discrepancy` -- sees a
+    concrete choice rather than having to re-derive it.
+    """
+    if criterion != "auto":
+        return criterion
+    if not n_data or not n_mesh_pixels:
+        return "discrepancy"
+    per_parameter = float(n_data) / float(n_mesh_pixels)
+    if per_parameter >= CRITERION_AUTO_DATA_PER_PARAMETER:
+        logger.info(
+            "criterion auto -> structure: %.0f data points per model pixel "
+            "(%d / %d), comfortably enough for the residual map to be white "
+            "at chi^2 = N, and chi^2 is a weak discriminant at this size. "
+            "Pass --criterion discrepancy to override.",
+            per_parameter, n_data, n_mesh_pixels,
+        )
+        return "structure"
+    logger.info(
+        "criterion auto -> discrepancy: only %.1f data points per model pixel "
+        "(%d / %d). The structure ratio is not calibrated on a fit this "
+        "weakly constrained -- it reads well below 1 even at chi^2 = N -- so "
+        "chi^2 is the safer selector here. Pass --criterion structure to "
+        "override.",
+        per_parameter, n_data, n_mesh_pixels,
+    )
+    return "discrepancy"
 
 # Brightness-adaptive regularisation: ratio of the smoothing strength in
 # bright (inner) vs faint (outer) regions, and the brightness contrast scale.
@@ -864,7 +947,42 @@ class PriorScan:
         }
 
 
-def effective_chi2_target(target: float, floor: float) -> float:
+def chi2_floor_tolerance(n_data: int | None = None) -> float:
+    """How far above the chi^2 floor still counts as "fits essentially as well".
+
+    ``CHI2_FLOOR_SIGMAS`` standard errors of chi^2/N, which is sqrt(2/N) --
+    so the allowance shrinks as the dataset grows, as it must. Falls back to
+    ``CHI2_FLOOR_TOLERANCE`` when the sample count is unknown, and is capped
+    at ``CHI2_FLOOR_TOLERANCE_MAX`` so a tiny dataset is not handed unlimited
+    slack.
+    """
+    if not n_data or n_data <= 0:
+        return CHI2_FLOOR_TOLERANCE
+    return min(
+        CHI2_FLOOR_SIGMAS * math.sqrt(2.0 / float(n_data)),
+        CHI2_FLOOR_TOLERANCE_MAX,
+    )
+
+
+def chi2_rebisect_tolerance(n_data: int | None = None) -> float:
+    """How far off target the constrained fit may sit before re-bisecting.
+
+    Unlike `chi2_floor_tolerance`, this one is only ever allowed to get
+    *tighter*: a loose gate here means shipping a model that was never
+    re-bisected, so `CHI2_REBISECT_TOLERANCE` stays the ceiling and sqrt(2/N)
+    pulls it down on large datasets (0.5% on Ruby against the old 3%).
+    """
+    if not n_data or n_data <= 0:
+        return CHI2_REBISECT_TOLERANCE
+    return min(
+        CHI2_REBISECT_TOLERANCE,
+        max(chi2_floor_tolerance(n_data), CHI2_REBISECT_FLOOR),
+    )
+
+
+def effective_chi2_target(
+    target: float, floor: float, n_data: int | None = None
+) -> float:
     """Raise an unreachable chi^2 target to just above the achievable floor.
 
     ``target`` and ``floor`` are both absolute chi^2 (not per datum). If the
@@ -872,9 +990,12 @@ def effective_chi2_target(target: float, floor: float) -> float:
     aiming at the target is worse than useless -- see CHI2_FLOOR_TOLERANCE.
     Aim a hair above the floor instead, which selects the strongest prior
     whose fit is indistinguishable from the best available.
+
+    Pass ``n_data``: without it the allowance is a fixed 5%, which on a large
+    dataset is tens of sigma of over-smoothing rather than a knee.
     """
     if np.isfinite(floor) and np.isfinite(target) and floor > target:
-        return float(floor) * (1.0 + CHI2_FLOOR_TOLERANCE)
+        return float(floor) * (1.0 + chi2_floor_tolerance(n_data))
     return float(target)
 
 
@@ -1137,13 +1258,14 @@ def optimise_prior(
         if np.isfinite(floor) and floor > target:
             # A near miss: the target is out of reach but only just, so aim
             # at the knee instead of chasing something impossible.
-            target = effective_chi2_target(target, floor)
+            target = effective_chi2_target(target, floor, n_data)
             logger.info(
                 "chi^2/N cannot go below %.4g with this model%s, short of the "
-                "%.4g asked for; aiming for %.4g instead -- the strongest "
-                "prior that still fits essentially as well.",
+                "%.4g asked for; aiming for %.4g instead -- %.3g sigma above "
+                "the floor, where one sigma of chi^2/N is sqrt(2/N) = %.4g.",
                 floor / per, " under positivity" if positive_only else "",
-                chi2_target, target / per,
+                chi2_target, target / per, CHI2_FLOOR_SIGMAS,
+                np.sqrt(2.0 / n_data) if n_data else float("nan"),
             )
 
         def coefficient_for_target(log_scale: float | None) -> tuple[float, float]:
@@ -1610,6 +1732,15 @@ def fit_dataset(
             enforce_positive=enforce_positive,
         )
         envelope["brightness"] = np.clip(first.model_mesh_image.ravel(), 0.0, None)
+        # Drop the first-pass fit before the second one allocates. It holds an
+        # `ag.FitInterferometer`, and so the transformed mapping matrix --
+        # n_vis x n_mesh complex, several GB on a real dataset -- while all
+        # that is needed from it is the brightness array just copied out.
+        # Keeping it alive roughly doubles the peak, which is what OOM-killed
+        # 9io9 twice at the exact moment the second pass started, on a fit
+        # whose single-inversion estimate (5.3 GB) fitted comfortably.
+        del first
+        gc.collect()
         logger.info(
             "%s prior: second pass (tracks the first-pass model)", reg_kind,
         )
@@ -1719,7 +1850,9 @@ def fit_dataset(
         # above the target, bisecting towards the target walks the
         # coefficient to its lower bound and switches the prior off; aim just
         # above the floor instead.
-        target = effective_chi2_target(chi2_target * n_data, scan.chi2_floor)
+        target = effective_chi2_target(
+            chi2_target * n_data, scan.chi2_floor, n_data
+        )
         if target > chi2_target * n_data:
             logger.info(
                 "the constrained fit cannot go below chi2/N = %.4g, so the "
@@ -1732,7 +1865,7 @@ def fit_dataset(
         # badly over- or under-smoothed model through as "close enough".
         if not np.isfinite(chi2) or abs(
             np.log10(max(chi2, 1e-30) / target)
-        ) > np.log10(1.0 + CHI2_REBISECT_TOLERANCE):
+        ) > np.log10(1.0 + chi2_rebisect_tolerance(n_data)):
             logger.info(
                 "positivity moved chi2/N to %.4g; re-optimising the "
                 "coefficient with the constrained solver...",

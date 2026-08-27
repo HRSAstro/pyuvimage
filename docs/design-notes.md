@@ -94,10 +94,64 @@ Two things follow, both implemented:
 reachability probe used to run unconstrained, which hid the constrained
 floor entirely. When the floor turns out to be above the target but within
 `CHI2_UNREACHABLE_FACTOR` (1.3x) of it, the target is raised to
-`floor x (1 + CHI2_FLOOR_TOLERANCE)` — the strongest prior that still fits
-essentially as well as this model and solver can. A floor *far* above the
-target is a different failure (the model genuinely cannot reproduce the data)
-and still falls back to maximum evidence.
+`floor x (1 + tolerance)` — the strongest prior that still fits essentially as
+well as this model and solver can. A floor *far* above the target is a
+different failure (the model genuinely cannot reproduce the data) and still
+falls back to maximum evidence.
+
+**That tolerance has to be statistical, and it was not.** It was a flat 5%
+until 27 Aug, which is where the second real failure of this mechanism came
+from. The standard error of `chi^2/N` is `sqrt(2/N)`, so a fixed percentage
+means completely different things at different dataset sizes:
+
+| | N | 5% is | `2·sqrt(2/N)` is |
+|---|---|---|---|
+| PJ0116 245 GHz | 10,316 | 3.6 sigma | 2.8% |
+| Ruby 200 GHz | 296,954 | **19 sigma** | 0.52% |
+| 9io9 135 GHz | 328,524 | **20 sigma** | 0.49% |
+
+On Ruby the consequence was severe. Its `chi^2` is flat over *twelve* decades
+of coefficient:
+
+```
+coefficient=1e-06   chi2/N=1.018      <- the floor
+coefficient=1e+06   chi2/N=1.018
+coefficient=1e+09   chi2/N=1.027
+coefficient=1e+12   chi2/N=1.124
+```
+
+so "5% above the floor" is `chi^2/N = 1.069`, which the bisection reaches at a
+coefficient of ~1e11 — about a thousand times stronger than the fit needs. The
+delivered model was smoothed until the ring was gone, with `chi^2/N` still
+reading a perfectly respectable 1.069 and the whole source sitting in the
+residual map at 60 sigma.
+
+Measured on Ruby, `--fov 3 --reg adaptive`, 26x26 mesh:
+
+| | coefficient | chi^2/N | structure ratio | max residual |
+|---|---|---|---|---|
+| flat 5% tolerance | ~1e11 | 1.069 | — | **60 sigma** |
+| `2·sqrt(2/N)` | 9.68e6 | 1.023 | 1.43 | 6.3 sigma |
+| `--criterion structure` | 1.32e6 | 1.022 | **1.00** | 4.3 sigma |
+
+**But note the last two rows.** Fixing the tolerance removes the catastrophe;
+it does not make `chi^2` a good selector on this data. Across the adaptive
+pass the structure ratio runs 0.72 -> 1.50 while `chi^2/N` moves 1.021 ->
+1.023 — **0.8 sigma of `chi^2` covering the entire useful range of the
+coefficient**. No choice of tolerance can select well inside a window that
+narrow, which is why the run now *suggests* `--criterion structure` whenever
+the delivered fit's structure ratio exceeds `STRUCTURE_RATIO_SUGGEST` (1.25)
+under `discrepancy`, well below the 1.5 warning.
+
+The tolerance is now `CHI2_FLOOR_SIGMAS` (2) standard errors of `chi^2/N`,
+capped at 10% so a very small dataset is not handed unlimited slack. The
+corroboration is that on both large datasets this lands within 0.1% of where
+`--criterion structure` independently puts the coefficient — Ruby 1.0233
+against 1.0225, 9io9 1.0321 against 1.0298 — and `structure` knows nothing
+about `chi^2` at all. `CHI2_REBISECT_TOLERANCE`, the gate deciding whether the
+constrained fit needs re-bisecting, follows the same scale (it is only ever
+allowed to get tighter than its 3% ceiling, since a loose gate there means
+skipping the re-bisection altogether).
 
 **`--criterion structure` selects on the residual map instead.** It bisects
 the coefficient until the residual map's rms equals what white noise of the
@@ -116,10 +170,71 @@ then over-smooths to `chi^2/N = 1.59`, which the run flags as a model that does
 not reproduce the data. Use it where the data outnumber the model comfortably
 and `chi^2` has gone flat — which is the real-data case it was built for.
 
+## One setting for all three real datasets
+
+The question this was built to answer: is there a single choice that works
+everywhere, so there is nothing to turn? Measured on all three real datasets,
+`--reg adaptive --criterion structure`, structure ratio driven to 1.0:
+
+| dataset | N | mesh | peak | coefficient | chi^2/N | ratio | max residual | % of peak | DR |
+|---|---|---|---|---|---|---|---|---|---|
+| PJ0116 245 GHz | 10,316 | 50x50 | 76 sigma | 3.55e7 | 1.083 | 1.00 | **3.9 sigma** | 5.07% | 20:1 |
+| Ruby 200 GHz | 296,954 | 26x26 | 285 sigma | 1.32e6 | 1.022 | 1.00 | **4.3 sigma** | 1.52% | 66:1 |
+| 9io9 135 GHz | 328,524 | 26x26 | 118 sigma | 4.72e7 | 1.017 | 1.00 | **5.0 sigma** | 4.23% | 24:1 |
+
+30x in visibility count, 4x in peak brightness, coefficients differing by a
+factor of 40 — and the residuals land in a band of 3.9-5.0 sigma. **The ratio
+is the invariant, not the sigma.** Ruby's 4.3 sigma is 1.5% of its peak and
+PJ0116's 3.9 sigma is 5.1% of a peak four times fainter; on a brighter source
+"under 5 sigma" would be trivial and on a fainter one unreachable, with no
+bearing on whether the fit is right.
+
+**`adaptive` beats `matern` on every one of them**, at the same ratio: 6.2 ->
+3.9 sigma on PJ0116, 6.2 -> 4.3 on Ruby, 9.1 -> 5.0 on 9io9. A consistent
+35-45% reduction, three for three. It is already the default.
+
+**The criterion is now chosen for you.** `--criterion auto` (the default)
+takes `structure` above `CRITERION_AUTO_DATA_PER_PARAMETER` (10) data points
+per mesh pixel and `discrepancy` below, and logs which and why. The threshold
+is where the two regimes separate:
+
+| | n_data / n_mesh | `auto` takes | discrepancy | structure |
+|---|---|---|---|---|
+| demo mock | 2.8:1 | discrepancy | chi^2/N = 0.999 at ratio 0.49 | over-smooths to chi^2/N = 1.59 |
+| PJ0116 | 4.1:1 | discrepancy | **3.9 sigma**, ratio 0.88 | **3.9 sigma**, ratio 1.00 |
+| Ruby | 439:1 | structure | 6.3 sigma, ratio 1.43 | **4.3 sigma**, ratio 1.00 |
+| 9io9 | 486:1 | structure | 11.3 sigma, ratio 2.21 | **5.0 sigma**, ratio 1.00 |
+
+It selects `structure` exactly where `discrepancy` fails and leaves the small
+and marginal cases on the faster criterion, where it costs nothing.
+
+The two large-N `discrepancy` rows are *after* the sqrt(2/N) tolerance fix —
+before it they were 47.5 and 76.1 sigma. Fixing the tolerance moved 9io9's
+coefficient by three orders of magnitude (3.07e13 -> 7.93e9) and its residual
+from 76 to 11.3 sigma, and it is *still* twice what `structure` achieves. That
+is the case for choosing the criterion rather than tuning the tolerance: at
+these sizes chi^2 is not a strong enough discriminant to be fixed.
+
 ## Large datasets: what actually runs out
 
 PJ0116 has 5,158 visibility samples. Two later ALMA datasets have 164,262 and
 148,477 — about 30× — and they hit two separate walls.
+
+**And a third, specific to `--reg adaptive`: it used to peak at twice the
+estimate.** `fit_dataset` held the first pass's `SingleFit` for the whole of
+the second pass. That object carries an `ag.FitInterferometer`, and so the
+transformed mapping matrix — `n_vis × n_mesh` complex, several GB on a real
+dataset — while the only thing needed from it is the brightness array already
+copied out of it. Two mapping matrices alive at once. This OOM-killed 9io9
+twice at the exact moment the second pass began, on a fit whose
+single-inversion estimate of 5.3 GB fitted comfortably in 7.5 GB — and no
+estimate of one inversion could have predicted it. The reference is now
+dropped (and `gc.collect()` called) before the second pass allocates, which
+makes the reported estimate correct rather than needing an adaptive fudge
+factor. Pinned by
+`test_the_first_adaptive_pass_is_released_before_the_second_allocates`, which
+takes a weakref to the first-pass fit and asserts it is dead by the time the
+"second pass" line is logged.
 
 **The transform.** The direct DFT allocates an `n_pixels × n_vis` float64
 temporary, so its cost is the *product*. 164k visibilities over a 116×116

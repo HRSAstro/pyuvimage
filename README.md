@@ -96,7 +96,7 @@ to be left alone. These are the ones worth reaching for:
 | `--point-sources` | there is a genuine point source in the field — no pixel grid can represent one |
 | `--image-centre auto` | the source is not at the phase centre. Recentring on it is exact and cost falls as the *square* of the field you then need |
 | `--pixel-scale nyquist` | you want the longest baselines sampled — finer mesh, several times slower, and only worth it if the long baselines are well populated |
-| `--criterion structure` | the structure ratio the run prints is far from 1 while `chi^2/N` looks fine — pick the smoothing from the residual *map* instead |
+| `--criterion structure` | rarely — `auto` already picks this on any well-constrained fit. Force it if the structure ratio the run prints is far from 1 while `chi^2/N` looks fine |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
 | `--mode cube` | per-channel images instead of one MFS image |
 
@@ -120,8 +120,16 @@ whether `C` varies across the image, and how.
 The strength (`--lambda`) and correlation length (`--scale`) are optimised for
 you; `--adapt-power` sets the exponent for `adaptive` and `gibbs`, `--nu` the
 Matérn smoothness. Comparisons across three mocks are in
-[docs/priors.md](docs/priors.md); how the strength is chosen is
-`--criterion`, in [docs/parameters.md](docs/parameters.md).
+[docs/priors.md](docs/priors.md).
+
+**How the strength is chosen** is `--criterion`, and the default `auto`
+decides for you. `structure` drives the residual *map* to white, which is what
+"the fit is done" actually means, and it is what you want on any fit where the
+data comfortably outnumber the model — but it is not calibrated when they do
+not, so `auto` uses it above 10 data points per mesh pixel and `chi^2 = N`
+below, and says in the log which it took. On three real ALMA datasets spanning
+30× in visibility count, `--reg adaptive` at structure ratio 1.0 leaves a
+residual of 3.9–5.0σ; see [docs/design-notes.md](docs/design-notes.md).
 
 ## The uncertainty map
 
@@ -389,6 +397,6 @@ Full discussion: [docs/noise.md](docs/noise.md).
 
 ## Development
 
-`python -m pytest tests/` — 265 tests, including end-to-end regressions on
+`python -m pytest tests/` — 283 tests, including end-to-end regressions on
 simulated data (adjoint consistency, flux conservation, WCS, restore centring,
 the noise estimator, and one test per bug listed in the docs above).

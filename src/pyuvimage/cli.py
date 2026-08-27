@@ -217,11 +217,13 @@ def main(argv: list[str] | None = None) -> int:
         help='regularisation strength: "auto" or a value',
     )
     p_fit.add_argument(
-        "--criterion", default="discrepancy",
-        choices=["discrepancy", "structure", "evidence"],
-        help="how the source-prior hyperparameters are optimised: "
-        "fit to the noise level (chi^2 = N, default), make the residual map "
-        "look like noise (structure ratio = 1), or maximum Bayesian evidence",
+        "--criterion", default="auto",
+        choices=["auto", "discrepancy", "structure", "evidence"],
+        help="how the source-prior hyperparameters are optimised. auto "
+        "(default) chooses between the first two on data per model pixel and "
+        "says which it took; discrepancy fits to the noise level "
+        "(chi^2 = N); structure makes the residual map look like noise "
+        "(structure ratio = 1); evidence maximises the Bayesian evidence",
     )
     p_fit.add_argument(
         "--chi2-target", type=float, default=1.0,

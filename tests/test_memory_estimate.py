@@ -91,3 +91,63 @@ def test_an_unknown_memory_size_never_blocks_a_fit(caplog, monkeypatch):
 def test_available_memory_is_a_positive_number_or_none():
     got = available_memory_gb()
     assert got is None or got > 0
+
+
+# --- the adaptive two-pass peak -------------------------------------------
+#
+# `--reg adaptive` OOM-killed 9io9 twice at the exact moment its second pass
+# began, on a fit whose single-inversion estimate (5.3 GB) fitted comfortably
+# in 7.5 GB. The cause was not the estimate: `fit_dataset` held the first
+# pass's `SingleFit` -- and so an `ag.FitInterferometer`, and so the
+# transformed mapping matrix, n_vis x n_mesh complex -- for the whole of the
+# second pass, while the only thing needed from it was the brightness array
+# already copied out. Two mapping matrices alive at once is double the peak,
+# and no memory estimate of a single inversion can predict that.
+
+
+def test_the_first_adaptive_pass_is_released_before_the_second_allocates():
+    """A weakref to the first pass's fit must be dead by the time the second
+    pass starts, or the peak is twice what was reported."""
+    import gc
+    import weakref
+
+    import pyuvimage
+    from pyuvimage import fitting, mock
+
+    uvd, _, geometry, _ = mock.make_demo_dataset(n_vis=400, mesh_n=8, seed=5)
+    uv, d, n = uvd.flattened()
+    dataset = fitting.make_dataset(uv, d, n, geometry, transformer="dft")
+
+    real = fitting.fit_dataset
+    seen: list = []
+    alive_at_second_pass: list = []
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        if not seen:                      # the inner (first-pass) call
+            seen.append(weakref.ref(out.fit))
+        return out
+
+    class Watch(logging.Handler):
+        def emit(self, record):
+            if "second pass" in record.getMessage() and seen:
+                gc.collect()
+                alive_at_second_pass.append(seen[0]() is not None)
+
+    logger = logging.getLogger("pyuvimage")
+    watch = Watch()
+    logger.addHandler(watch)
+    old = fitting.fit_dataset
+    fitting.fit_dataset = spy
+    try:
+        spy(dataset, geometry, reg_kind="adaptive",
+            prior={"coefficient": 1e4, "scale": 0.5}, positive_only=False)
+    finally:
+        fitting.fit_dataset = old
+        logger.removeHandler(watch)
+
+    assert alive_at_second_pass, "the second pass never started"
+    assert alive_at_second_pass[0] is False, (
+        "the first-pass fit was still alive when the second pass began: its "
+        "transformed mapping matrix doubles the peak memory"
+    )

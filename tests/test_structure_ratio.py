@@ -154,3 +154,48 @@ def test_both_failure_modes_are_distinguished(caplog):
         seen[tag] = "discarded" if "unmodelled" in w[0] else "absorbed"
 
     assert seen == {"underfit": "discarded", "overfit": "absorbed"}
+
+
+# --- the middle band: usable, but chi^2 was not the right selector ---------
+#
+# Between "clean" and the 1.5 warning there is a band where the fit is fine
+# but chi^2 clearly did not choose the smoothing well. Ruby lands at 1.43
+# under `discrepancy` and 1.00 under `structure`, on a scan where chi^2/N
+# moves 1.022 -> 1.028 across the entire useful range of the coefficient --
+# about two sigma covering the whole decision. Worth saying out loud rather
+# than leaving to be noticed.
+
+
+def _at_ratio(ratio, n_data=100_000, chi2_per_datum=1.02):
+    """Products whose residual map has exactly this structure ratio."""
+    rng = np.random.default_rng(4)
+    resid = rng.standard_normal(4096)
+    resid *= ratio * np.sqrt(chi2_per_datum) / resid.std()
+    return _products(resid, chi2_per_datum * n_data)
+
+
+def test_a_mildly_structured_residual_suggests_the_structure_criterion(caplog):
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(_at_ratio(1.4), 100_000, criterion="discrepancy")
+    assert "--criterion structure" in caplog.text
+    assert not _lines(caplog, logging.WARNING)
+
+
+def test_it_does_not_suggest_the_criterion_already_in_use(caplog):
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(_at_ratio(1.4), 100_000, criterion="structure")
+    assert "--criterion structure" not in caplog.text
+
+
+def test_a_clean_residual_says_nothing_extra(caplog):
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(_at_ratio(1.0), 100_000, criterion="discrepancy")
+    assert "--criterion structure" not in caplog.text
+
+
+def test_the_loud_warning_still_wins_above_the_threshold(caplog):
+    """The suggestion must not shadow the real warning."""
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        _report_dynamic_range(_at_ratio(2.0), 100_000, criterion="discrepancy")
+    assert _lines(caplog, logging.WARNING)
+    assert "--criterion structure" not in caplog.text

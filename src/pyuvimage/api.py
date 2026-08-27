@@ -72,7 +72,7 @@ def run(
     image_centre: tuple[float, float] | str = "centre",
     envelope_floor: float = 1e-2,
     adapt_power: float = fitting.ADAPT_POWER,
-    criterion: str = "discrepancy",
+    criterion: str = "auto",
     chi2_target: float = 1.0,
     positive_only: bool = True,
     enforce_positive: bool = False,
@@ -114,11 +114,13 @@ def run(
             "centre" forces the phase centre.
         envelope_floor: prior width far from the centre, relative to the
             centre (smaller suppresses distant structure more strongly).
-        criterion: how the prior hyperparameters are optimised:
-            "discrepancy" (drive chi^2 to chi2_target * N), "structure"
-            (drive the residual map's structure ratio to 1, which is more
-            discriminating when chi^2 is flat in the coefficient), or
-            "evidence" (maximise the Bayesian evidence, as PyAutoLabs does).
+        criterion: how the prior hyperparameters are optimised. "auto"
+            (default) picks between the first two on data per model pixel --
+            see `fitting.resolve_criterion`. "discrepancy" drives chi^2 to
+            chi2_target * N; "structure" drives the residual map's structure
+            ratio to 1, which is the more discriminating of the two wherever
+            it is calibrated; "evidence" maximises the Bayesian evidence, as
+            PyAutoLabs does.
         chi2_target: target chi^2/N for the discrepancy criterion.
         image_centre: where to centre the reconstruction. "centre" (default)
             uses the phase centre; "auto" finds the brightest peak in a
@@ -221,6 +223,12 @@ def run(
     # before anything large is allocated: an OOM kill prints nothing useful,
     # so the moment to speak is while --mesh and --fov are still adjustable
     fitting.check_memory(uvd.n_samples, n_pix, transformer_cls)
+    # Resolve `auto` once, here, so that everything downstream -- the fits,
+    # the point-source retune, `fit_parameters.json` -- sees the concrete
+    # choice rather than re-deriving it or recording "auto".
+    criterion = fitting.resolve_criterion(
+        criterion, n_data=2 * uvd.n_samples, n_mesh_pixels=n_pix
+    )
     # the real sample count: flags remove samples, and for ragged multi-spw
     # data n_vis * n_chan is not even a meaningful product
     n_data_all = 2 * uvd.n_samples
@@ -433,7 +441,7 @@ def run(
                           oversample, uncertainty_map)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
-        _report_dynamic_range(products[0], n_data_all)
+        _report_dynamic_range(products[0], n_data_all, criterion)
     else:
         frozen = mfs_fit.prior
         logger.info(
@@ -693,9 +701,19 @@ def _warn_wide_band(uvd, mode: str) -> None:
 # independent beams in the field.
 STRUCTURE_RATIO_WARN = 1.5
 STRUCTURE_RATIO_OVERFIT = 0.85
+# Between "clean" and "warn" there is a band where the fit is usable but the
+# residual map is visibly not white, and on a large dataset that is nearly
+# always chi^2 failing to discriminate rather than anything wrong with the
+# data. Ruby at 200 GHz is the case in point: across the whole useful range of
+# the coefficient the structure ratio runs 0.95 -> 3.5 while chi^2/N moves
+# 1.022 -> 1.028 -- two sigma of chi^2 covering the entire decision. The
+# discrepancy criterion lands at ratio 1.43 there and `structure` at 1.00.
+STRUCTURE_RATIO_SUGGEST = 1.25
 
 
-def _report_dynamic_range(p, n_data: int | None = None) -> None:
+def _report_dynamic_range(
+    p, n_data: int | None = None, criterion: str | None = None
+) -> None:
     """Put the residual in proportion to how bright the source is.
 
     A residual quoted in sigma is meaningless on its own: the same 1% error on
@@ -755,6 +773,17 @@ def _report_dynamic_range(p, n_data: int | None = None) -> None:
             "noise, which stops the fit early; also check --fov and whether "
             "the source has structure finer than the model pixel scale.",
             ratio, ratio,
+        )
+    elif ratio > STRUCTURE_RATIO_SUGGEST and criterion == "discrepancy":
+        logger.info(
+            "the residual map is somewhat more structured than noise "
+            "(structure ratio %.2f, against 1 for white). Not alarming on its "
+            "own, but on a dataset this size chi^2 is usually the reason: it "
+            "constrains the residual's total power only, and its whole useful "
+            "range in the coefficient can be a couple of sigma wide. "
+            "--criterion structure selects on the residual map instead and "
+            "will land on a weaker prior; it is worth comparing.",
+            ratio,
         )
     elif ratio < STRUCTURE_RATIO_OVERFIT:
         logger.warning(
