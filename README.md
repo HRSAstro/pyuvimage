@@ -98,7 +98,7 @@ to be left alone. These are the ones worth reaching for:
 | `--pixel-scale nyquist` | you want the longest baselines sampled — finer mesh, several times slower, and only worth it if the long baselines are well populated |
 | `--criterion structure` | rarely — `auto` already picks this on any well-constrained fit. Force it if the structure ratio the run prints is far from 1 while `chi^2/N` looks fine |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
-| `--mode cube` | per-channel images instead of one MFS image |
+| `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on a 1-in-`n_chan` subset by default (`--cube-prior`), which is what makes a cube affordable — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
 
 Full reference: [docs/parameters.md](docs/parameters.md).
 
@@ -397,6 +397,6 @@ Full discussion: [docs/noise.md](docs/noise.md).
 
 ## Development
 
-`python -m pytest tests/` — 283 tests, including end-to-end regressions on
+`python -m pytest tests/` — 301 tests, including end-to-end regressions on
 simulated data (adjoint consistency, flux conservation, WCS, restore centring,
 the noise estimator, and one test per bug listed in the docs above).

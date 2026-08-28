@@ -25,29 +25,18 @@ logger = logging.getLogger("pyuvimage")
 
 def to_fits_orientation(native: np.ndarray) -> np.ndarray:
     """autoarray 'native' arrays put +y (North) in row 0; FITS wants row 0 at
-    the bottom (South).  Flip vertically."""
-    return np.flipud(np.asarray(native))
+    the bottom (South), to match the positive ``CDELT2`` `build_header`
+    writes. Flip vertically -- **once**.
 
-
-def _to_fits_order(data) -> np.ndarray:
-    """Flip North-up arrays into FITS row order.
-
-    Our arrays follow autoarray's native convention -- row 0 is North, which
-    is what `envelope.peak_offset_arcsec` and the summary figure both assume
-    (the figure draws them with ``origin="upper"``, putting row 0 at the top).
-
-    FITS is the other way up. With ``CDELT2`` positive, Dec *increases* with
-    row index, so row 0 is the southernmost. Writing a North-up array under
-    that header put every image upside down in Dec while leaving RA correct --
-    invisible in our own summary PNG, obvious the moment anyone opened
-    `model.fits` in CASA or DS9, and quietly wrong for any Dec read off the
-    WCS.
-
-    Flip the row axis (second from last, so cubes work too) rather than
-    negating CDELT2: positive CDELT2 is the convention every other tool
-    expects.
+    Once is the whole story. On 26 Aug a second flip was added at write time
+    to fix declinations that came out mirrored; two flips cancel, so the
+    written file was then *unflipped* -- and it looked correct only because it
+    cancelled a third mirror, in the imaging itself, where `v` had the wrong
+    sign (see `uvdata.V_SIGN`). Fixing that sign made the double flip visible
+    immediately. Pinned by `tests/test_sky_orientation.py`, which places a
+    source from a written-out forward model rather than a round trip.
     """
-    return np.flip(np.asarray(data, dtype=np.float32), axis=-2)
+    return np.flipud(np.asarray(native))
 
 
 def build_header(
@@ -223,7 +212,8 @@ def write_products(
 
     def w(name, data, header):
         path = out / name
-        fits.writeto(path, _to_fits_order(data), header, overwrite=overwrite)
+        fits.writeto(path, np.asarray(data, dtype=np.float32), header,
+                     overwrite=overwrite)
         written[name] = path
 
     n_img = geometry.shape_native[0]
@@ -321,24 +311,160 @@ def write_products(
     if parameters is not None:
         (out / "fit_parameters.json").write_text(json.dumps(parameters, indent=2))
 
-    # summary figure
+    # summary figure -- one row per channel in cube mode
     try:
-        _summary_png(products[0], geometry, out / "summary.png")
+        _summary_png(products, geometry, out / "summary.png", freqs)
         written["summary.png"] = out / "summary.png"
     except Exception as e:  # plotting must never kill a fit
         logger.warning("summary figure failed: %s", e)
     return written
 
 
-def _summary_png(p: ProductSet, geometry: ImageGeometry, path: Path) -> None:
+# A cube can have hundreds of channels; past this many the figure stops being
+# readable (and matplotlib stops being able to render it), so an evenly spaced
+# subset is drawn and the title says so.
+MAX_SUMMARY_ROWS = 24
+
+
+def _summary_png_cube(rows, geometry, path, freqs, ext, n_panels, note):
+    """One row per channel, on colour scales shared down each column.
+
+    Shared scales are the point: per-plane autoscaling makes every channel
+    look the same and hides the very thing a cube is for -- where the emission
+    moves and how its brightness changes with velocity.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    n = len(rows)
+    stacks = {
+        "dirty": [np.asarray(r.dirty_image, float) for r in rows],
+        "model": [model_with_points(r, geometry.pixel_scale) for r in rows],
+        "recon": [np.asarray(r.reconvolved, float) for r in rows],
+        "resid": [np.asarray(r.residual_sigma, float) for r in rows],
+    }
+    if rows[0].uncertainty is not None:
+        stacks["unc"] = [np.asarray(r.uncertainty, float) for r in rows]
+
+    def lim(key, symmetric=False):
+        a = np.concatenate([x[np.isfinite(x)].ravel() for x in stacks[key]])
+        if a.size == 0:
+            return None
+        if symmetric:
+            m = max(float(np.max(np.abs(a))), 1e-6)
+            return (-m, m)
+        return (0.0, float(np.max(a)))
+
+    # the model panel is stretched to the *extended* model, as in the single
+    # -channel figure, so a point component cannot saturate it
+    ext_max = max(
+        (float(np.nanmax(r.model_image)) for r in rows
+         if np.isfinite(r.model_image).any()), default=0.0
+    )
+    cols = [
+        ("dirty", "dirty image", "Jy/beam", "inferno", lim("dirty")),
+        ("model", "model", "Jy/pixel", "inferno",
+         (0.0, ext_max) if ext_max > 0 else None),
+        ("recon", "model reconvolved", "Jy/beam", "inferno", lim("recon")),
+        ("resid", "residual", r"$\sigma$", "RdBu_r", lim("resid", True)),
+    ]
+    if "unc" in stacks:
+        cols.append(("unc", "1$\sigma$ uncertainty", "Jy/pixel", "viridis",
+                     lim("unc")))
+    cols = cols[:n_panels]
+
+    fig, axes = plt.subplots(
+        n, len(cols), figsize=(3.6 * len(cols), 3.3 * n), squeeze=False,
+        constrained_layout=True,
+    )
+    f0 = float(np.mean(freqs)) if freqs is not None else None
+    for i, r in enumerate(rows):
+        for j, (key, title, unit, cmap, clim) in enumerate(cols):
+            ax = axes[i][j]
+            im = ax.imshow(stacks[key][i], origin="upper", extent=ext, cmap=cmap)
+            if clim is not None:
+                im.set_clim(*clim)
+            for pt in (r.points or []):
+                ax.plot(pt.d_ra, pt.d_dec, "o", mfc="none", mec="cyan", ms=9,
+                        mew=1.1)
+            if i == 0:
+                ax.set_title(title, fontsize=11)
+            if i == n - 1:
+                ax.set_xlabel("dRA [arcsec]")
+            else:
+                ax.set_xticklabels([])
+            if j == 0:
+                label = f"channel {i + 1}"
+                if freqs is not None:
+                    v = 299792.458 * (f0 - freqs[i]) / f0
+                    label = f"{freqs[i] / 1e9:.4f} GHz\n{v:+.0f} km/s"
+                ax.set_ylabel(label, fontsize=9)
+            else:
+                ax.set_yticklabels([])
+            if key == "resid":
+                rmax = float(np.nanmax(np.abs(stacks["resid"][i])))
+                ax.text(0.03, 0.03, f"max {rmax:.1f}$\sigma$",
+                        transform=ax.transAxes, fontsize=8, color="k",
+                        bbox=dict(fc="white", ec="none", alpha=0.7, pad=1.5))
+
+    # one colour bar per column, spanning it, after every panel exists
+    for j, (key, title, unit, cmap, clim) in enumerate(cols):
+        cb = fig.colorbar(axes[0][j].images[0], ax=[axes[i][j] for i in range(n)],
+                          fraction=0.035, pad=0.02, location="right")
+        cb.set_label(unit, fontsize=9)
+        cb.ax.tick_params(labelsize=8)
+
+    b = rows[0].beam
+    fig.suptitle(
+        f"{n} channels, colour scales shared down each column  |  "
+        f"beam {b.bmaj_arcsec:.3g}\" x {b.bmin_arcsec:.3g}\" "
+        f"pa {b.bpa_deg:.0f} deg  |  prior coefficient "
+        f"{rows[0].coefficient:.3g}{note}",
+        fontsize=11,
+    )
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+
+def _summary_png(
+    products, geometry: ImageGeometry, path: Path, frequencies_hz=None
+) -> None:
+    """One row of panels per channel; a single row for an MFS fit.
+
+    Cube mode used to draw `products[0]` and nothing else, so a summary of an
+    eight-channel cube was a picture of one channel -- indistinguishable, at a
+    glance, from the MFS image.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if isinstance(products, ProductSet):
+        products = [products]
+    rows = list(products)
+    freqs = (np.atleast_1d(np.asarray(frequencies_hz, dtype=float))
+             if frequencies_hz is not None else None)
+    note = ""
+    if len(rows) > MAX_SUMMARY_ROWS:
+        keep = np.linspace(0, len(rows) - 1, MAX_SUMMARY_ROWS).astype(int)
+        note = (f"  |  showing {MAX_SUMMARY_ROWS} of {len(rows)} channels, "
+                "evenly spaced")
+        rows = [rows[i] for i in keep]
+        freqs = freqs[keep] if freqs is not None and len(freqs) > max(keep) else None
+    if freqs is not None and len(freqs) != len(rows):
+        freqs = None
+
+    p = rows[0]
     half = geometry.fov_arcsec / 2.0
     ext = [half, -half, -half, half]  # RA increases leftward
     n_panels = 5 if p.uncertainty is not None else 4
+    if len(rows) > 1:
+        _summary_png_cube(rows, geometry, path, freqs, ext, n_panels, note)
+        return
     fig, axes = plt.subplots(1, n_panels, figsize=(4.25 * n_panels, 4.4),
                              constrained_layout=True)
 

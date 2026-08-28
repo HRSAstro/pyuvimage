@@ -533,7 +533,11 @@ def transformer_memory_gb(transformer_cls, n_vis: int, n_mesh_pixels: int) -> fl
 
 
 def check_memory(
-    n_vis: int, n_mesh_pixels: int, transformer_cls=None
+    n_vis: int,
+    n_mesh_pixels: int,
+    transformer_cls=None,
+    n_chan: int | None = None,
+    prior_thin: int = 1,
 ) -> None:
     """Say what the fit will need, and warn before it is killed.
 
@@ -544,9 +548,25 @@ def check_memory(
     ``transformer_cls`` matters more than everything else put together on the
     JAX path: the mapping matrix for Ruby at a 20x20 mesh is 0.5 GB, and the
     batched nufft2d2 that transforms it asks for 186 GB.
+
+    ``n_chan`` reports the cube case honestly. Cube mode fits each channel
+    separately, which is cheap, but it first runs one MFS fit over *every*
+    channel's visibilities to fix the prior -- and that pass is `n_chan` times
+    the size of any single channel. On Ruby CO(7-6) at a 27x27 mesh the
+    per-channel fits need 2.9 GB each and the MFS pass needs 20.1 GB, so the
+    cube looks unaffordable when only one step of it is.
     """
-    need = estimate_peak_memory_gb(n_vis, n_mesh_pixels)
-    need += transformer_memory_gb(transformer_cls, n_vis, n_mesh_pixels)
+    def _need(nv):
+        return (
+            estimate_peak_memory_gb(nv, n_mesh_pixels)
+            + transformer_memory_gb(transformer_cls, nv, n_mesh_pixels)
+        )
+
+    full = _need(n_vis)
+    per_chan = _need(max(n_vis // n_chan, 1)) if n_chan and n_chan > 1 else None
+    # What the run will actually peak at: in cube mode with a thinned prior
+    # pass, nothing ever sees more than one channel's worth at a time.
+    need = per_chan if (per_chan is not None and prior_thin > 1) else full
     have = available_memory_gb()
     if have is None:
         logger.info("this fit needs roughly %.1f GB of memory", need)
@@ -554,6 +574,29 @@ def check_memory(
     logger.info(
         "this fit needs roughly %.1f GB; about %.1f GB is available", need, have
     )
+    if per_chan is not None:
+        if prior_thin > 1:
+            logger.info(
+                "  one channel at a time, all the way through: the shared "
+                "prior is fitted on a %d-fold thinned set too. A single pass "
+                "over all %d channels would need %.1f GB (--cube-prior mfs).",
+                prior_thin, n_chan, full,
+            )
+        else:
+            logger.info(
+                "  of which the per-channel fits need about %.1f GB each; "
+                "the %.1f GB is the one MFS pass over all %d channels that "
+                "fixes the prior", per_chan, full, n_chan,
+            )
+            if have is not None and full > have >= per_chan:
+                logger.warning(
+                    "the per-channel fits would fit (%.1f GB) but the MFS "
+                    "pass that precedes them would not (%.1f GB against %.1f "
+                    "GB available). --cube-prior channel fits the shared "
+                    "prior on one channel's worth instead, which is the "
+                    "default; a coarser --mesh or --pixel-scale shrinks both.",
+                    per_chan, full, have,
+                )
     if need > have:
         logger.warning(
             "estimated peak memory (%.1f GB) exceeds what looks available "
@@ -1268,6 +1311,11 @@ def optimise_prior(
                 np.sqrt(2.0 / n_data) if n_data else float("nan"),
             )
 
+        # A bisection that runs to the top of the bracket has not chosen a
+        # coefficient, it has run out of room. Recorded here so the structure
+        # criterion can hand back to chi^2 rather than deliver the bound.
+        saturated: list[bool] = []
+
         def coefficient_for_target(log_scale: float | None) -> tuple[float, float]:
             lo, hi = LOG_COEFFICIENT_BOUNDS
             p = (lambda c: np.array([c, log_scale])) if two_d else (
@@ -1285,6 +1333,7 @@ def optimise_prior(
                 hi = min(hi + 3.0, MAX_LOG_COEFFICIENT)
                 value_hi, ev_hi = measure(p(hi))
             if np.isfinite(value_hi) and value_hi < target:
+                saturated.append(True)
                 logger.warning(
                     "even the strongest prior tried (coefficient 1e%g) leaves "
                     "%s at %.3g, below the target of %.3g: the model has far "
@@ -1330,6 +1379,32 @@ def optimise_prior(
                 if np.isfinite(ev) and ev > best_ev:
                     best_ev, best_c, best_ls = ev, c, ls
             best_log = np.array([best_c, best_ls])
+
+        if structure and saturated:
+            # The structure ratio never reached 1 however hard the prior was
+            # pushed, so the model's faint structure is prior-set and the
+            # ratio is not calibrated here -- the small-mock regime described
+            # in design-notes.md, and the reason `--criterion auto` exists.
+            # Delivering the bracket's ceiling would be the worst of both, so
+            # hand back to chi^2, which does have a reachable target.
+            logger.warning(
+                "the structure criterion could not reach a ratio of %.3g at "
+                "any coefficient in range, so it has nothing to select on: "
+                "this fit is too weakly constrained for the residual map to "
+                "be white at chi^2 = N. Falling back to --criterion "
+                "discrepancy.", target,
+            )
+            best, chi_scan = optimise_prior(
+                dataset, geometry, reg_kind=reg_kind, criterion="discrepancy",
+                positive_only=positive_only, nu=nu, fixed_scale=fixed_scale,
+                envelope=envelope, adapt_image=adapt_image,
+                max_evaluations=max_evaluations, chi2_target=chi2_target,
+            )
+            scan.trials.extend(chi_scan.trials)
+            scan.chi2_floor = chi_scan.chi2_floor
+            scan.criterion = "structure->discrepancy (ratio unreachable)"
+            scan.best = best
+            return best, scan
     else:
         # ---- coarse grid then local refinement, maximising the evidence
         coarse_coeff = np.linspace(

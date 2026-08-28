@@ -170,6 +170,60 @@ then over-smooths to `chi^2/N = 1.59`, which the run flags as a model that does
 not reproduce the data. Use it where the data outnumber the model comfortably
 and `chi^2` has gone flat — which is the real-data case it was built for.
 
+## Which way up is the sky
+
+For two days pyuvimage's images were mirrored in declination, and 295 tests
+passed. Worth writing down, because the reason they passed is structural.
+
+**The bug was two bugs that cancelled in the one place anyone looked.**
+
+1. `v` had the opposite sign to the one the imaging grid wants. The grid is
+   `(y, x)` with `y = dDec`, `x = -dRA`, and images are formed as
+   `sum V exp[+2 pi i (u x + v y)]`. Whether that reproduces the sky depends
+   on the sign convention of the measurement set's UVW column, and the two
+   candidates differ by a mirror in Dec.
+2. The FITS writer flipped the array twice — once in `stack()` and once on
+   the way to `fits.writeto` — and two flips cancel.
+
+So the written FITS was *unflipped*, which was correct only because the
+imaging was mirrored. The file looked right; every position the run
+**reported** — the wide-field survey that `--image-centre auto` uses, every
+Dec quoted in a log line — was wrong.
+
+**Why the tests did not catch it.** Every astrometry test was a round trip:
+build a mock with `mock.simulate`, image it, check the source comes back where
+it was put. A round trip cannot see a mirror, because the generator and the
+imager share whatever convention is in force. The same blindness covered the
+double flip: a test asserting `to_fits_orientation` flips, plus a test
+asserting the writer's second flip flips, both passed.
+
+**How it was settled.** Not by argument — by imaging the same visibilities
+four ways and asking which matched CASA. On Ruby CO(7-6), whose source really
+is at (dRA +2", dDec -2"):
+
+| | transform | peak |
+|---|---|---|
+| A | `exp[+2 pi i (+u dRA + v dDec)]` | dRA -1.59, dDec +2.71 |
+| B | `exp[+2 pi i (+u dRA - v dDec)]` | dRA -1.59, dDec -2.71 |
+| C | `exp[+2 pi i (-u dRA + v dDec)]` | dRA +1.59, dDec +2.71 — what pyuvimage did |
+| D | `exp[+2 pi i (-u dRA - v dDec)]` | dRA +1.59, dDec -2.71 — CASA |
+
+`uvdata.V_SIGN` applies D, in the accessor rather than at import so that
+datasets exported earlier keep working. `mock.uv_of` uses the same helper, so
+mocks are built in the frame the imager reads.
+
+**The test that would have caught it**, and now does:
+`tests/test_sky_orientation.py` writes the visibilities of a point source out
+by hand from a forward model stated explicitly in the file, and asks where
+pyuvimage puts it — in the survey, in the written FITS through its own WCS,
+and after recentring. No `mock.simulate`, so no shared convention to hide in.
+
+**The lesson worth keeping.** A round trip tests self-consistency, which is
+not the same as correctness, and every symmetry the round trip shares with the
+code under test is invisible to it. Anything with a handedness — an axis
+direction, a sign convention, a transpose — needs at least one test anchored
+outside the system.
+
 ## One setting for all three real datasets
 
 The question this was built to answer: is there a single choice that works

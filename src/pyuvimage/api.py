@@ -10,6 +10,7 @@ or from the command line:
 
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,7 @@ def run(
     envelope_floor: float = 1e-2,
     adapt_power: float = fitting.ADAPT_POWER,
     criterion: str = "auto",
+    cube_prior: str = "channel",
     chi2_target: float = 1.0,
     positive_only: bool = True,
     enforce_positive: bool = False,
@@ -222,7 +224,19 @@ def run(
     )
     # before anything large is allocated: an OOM kill prints nothing useful,
     # so the moment to speak is while --mesh and --fov are still adjustable
-    fitting.check_memory(uvd.n_samples, n_pix, transformer_cls)
+    prior_thin = 1
+    if mode == "cube" and uvd.n_chan > 1:
+        if cube_prior == "channel":
+            prior_thin = int(uvd.n_chan)
+        elif cube_prior != "mfs":
+            raise ValueError(
+                f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'"
+            )
+    fitting.check_memory(
+        uvd.n_samples, n_pix, transformer_cls,
+        n_chan=uvd.n_chan if mode == "cube" else None,
+        prior_thin=prior_thin,
+    )
     # Resolve `auto` once, here, so that everything downstream -- the fits,
     # the point-source retune, `fit_parameters.json` -- sees the concrete
     # choice rather than re-deriving it or recording "auto".
@@ -252,6 +266,27 @@ def run(
 
     # ----------------------------------------------------------------- MFS
     uv, d, n = uvd.flattened()
+    # In cube mode this fit exists only to fix the prior the channels share,
+    # and it is `n_chan` times the size of any one channel -- the single step
+    # that makes an otherwise affordable cube run out of memory. It does not
+    # need every visibility: thinning by f scales the fitted coefficient by
+    # 1/f exactly (see `fitting.cube_prior_subsample_factor`), so thin it and
+    # scale back.
+    if prior_thin > 1:
+        rng = np.random.default_rng(0)
+        keep = rng.choice(len(d), size=len(d) // prior_thin, replace=False)
+        keep.sort()
+        uv, d, n = uv[keep], d[keep], n[keep]
+        logger.info(
+            "cube mode: fitting the shared prior on a random 1 visibility in "
+            "%d (%d of %d, drawn across all channels) -- the same amount of "
+            "data each channel fit will have, which is what the prior is "
+            "being chosen for. Costs %.1f GB instead of %.1f GB. Pass "
+            "--cube-prior mfs for the full pass over every channel.",
+            prior_thin, len(d), uvd.n_samples,
+            fitting.estimate_peak_memory_gb(len(d), n_pix),
+            fitting.estimate_peak_memory_gb(uvd.n_samples, n_pix),
+        )
     mfs_dataset = fitting.make_dataset(
         uv, d, n, geometry, transformer_cls, mask_shape=mask_shape
     )
@@ -448,9 +483,38 @@ def run(
             "cube mode: source prior frozen from the MFS fit (%s)",
             ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
         )
+        # The MFS dataset and fit are the largest objects in the run -- their
+        # mapping matrix spans every channel's visibilities -- and from here
+        # on only `frozen`, `scan` and a few scalars are needed. Holding them
+        # through the channel loop adds the biggest term to the peak at
+        # exactly the point where the channels are trying to allocate.
+        if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
+            # Freeze the brightness map as well as the coefficient. Without
+            # this every channel re-runs the adaptive prior's first pass --
+            # and that first pass optimises its own hyperparameters, so an
+            # 8-channel cube costs nine full searches instead of one. It is
+            # also what "the channels share a prior" should mean: the same
+            # brightness weighting everywhere, not one per plane.
+            envelope = dict(envelope)
+            envelope["brightness"] = np.clip(
+                np.asarray(mfs_fit.model_mesh_image).ravel(), 0.0, None
+            )
+            logger.info(
+                "cube mode: the adaptive prior's brightness map is frozen "
+                "too, so each channel is a single fit rather than its own "
+                "two-pass search"
+            )
+        mfs_fit = _fit_summary(mfs_fit)
+        mfs_dataset = None
+        gc.collect()
         for c in range(uvd.n_chan):
             ch = uvd.select(channel=c)
             uv_c, d_c, n_c = ch.flattened()
+            # release the previous channel before allocating the next: the
+            # right-hand side is built while the old binding is still live,
+            # so without this two channels overlap at the peak
+            ds_c = sf = None
+            gc.collect()
             ds_c = fitting.make_dataset(
                 uv_c, d_c, n_c, geometry, transformer_cls,
                 mask_shape=mask_shape
@@ -477,6 +541,7 @@ def run(
         uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
         transformer, oversample, dish, pb_factor, pb_correction, mfs_fit, scan,
         envelope=envelope, point_solution=point_solution,
+        prior_thin=prior_thin,
     )
     written = {}
     if write:
@@ -505,10 +570,36 @@ def _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale=None) -> dict | Non
     return prior
 
 
+@dataclass
+class _FitSummary:
+    """The handful of scalars `_parameter_record` needs from a fit.
+
+    Cube mode replaces the MFS `SingleFit` with one of these before the
+    channel loop starts: the real object holds an `ag.FitInterferometer`, and
+    so the transformed mapping matrix over *every* channel's visibilities --
+    the largest allocation in the run, and useless from here on.
+    """
+
+    prior: dict
+    chi_squared: float
+    log_evidence: float
+    positive_only: bool
+    scan: object = None
+
+
+def _fit_summary(fit) -> _FitSummary:
+    return _FitSummary(
+        prior=dict(fit.prior),
+        chi_squared=float(fit.chi_squared),
+        log_evidence=float(fit.log_evidence),
+        positive_only=bool(getattr(fit, "positive_only", True)),
+    )
+
+
 def _parameter_record(
     uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
     transformer, oversample, dish, pb_factor, pb_correction, fit, scan,
-    envelope=None, point_solution=None,
+    envelope=None, point_solution=None, prior_thin=1,
 ) -> dict:
     """Every parameter that defined this run, for the record and for reuse."""
     return {
@@ -551,6 +642,8 @@ def _parameter_record(
             "criterion": criterion if scan is not None else "fixed",
             "chi2_target": float(chi2_target),
             "n_evaluations": (scan or {}).get("n_evaluations", 0),
+            **({"prior_fitted_on_one_visibility_in": int(prior_thin)}
+               if prior_thin > 1 else {}),
         },
         "solver": {
             # what actually ran, not what was asked for -- the guard can

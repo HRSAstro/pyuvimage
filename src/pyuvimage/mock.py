@@ -11,7 +11,7 @@ import numpy as np
 import autogalaxy as ag
 
 from .grids import resolve_geometry
-from .uvdata import C_M_S, UVData
+from .uvdata import C_M_S, V_SIGN, UVData
 
 
 def random_uv_coverage(
@@ -53,6 +53,19 @@ def exponential_image(
     return img / img.sum() * flux_jy
 
 
+def uv_of(uvw_m: np.ndarray, frequency_hz: float) -> np.ndarray:
+    """(u, v) in wavelengths, in the same sky frame `UVData.uv_wavelengths`
+    uses -- `V_SIGN` and all.
+
+    Mocks have to be built in the frame the imager reads, or a round trip
+    closes on a mirrored sky and every astrometry test passes while the real
+    data comes out flipped in declination. That is exactly what happened
+    before 28 Aug; see `uvdata.V_SIGN`.
+    """
+    uv = np.asarray(uvw_m)[:, :2] * (float(frequency_hz) / C_M_S)
+    return np.column_stack((uv[:, 0], V_SIGN * uv[:, 1]))
+
+
 def simulate(
     image_native: np.ndarray,
     pixel_scale: float,
@@ -76,7 +89,7 @@ def simulate(
     n_chan = len(frequencies_hz)
     data = np.zeros((n_chan, n_vis), dtype=complex)
     for c, f in enumerate(frequencies_hz):
-        uv = uvw_m[:, :2] * (f / C_M_S)
+        uv = uv_of(uvw_m, f)
         transformer = ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
         vis = np.asarray(transformer.visibilities_from(image=img))
         noise = rng.normal(0, sigma_jy, n_vis) + 1j * rng.normal(
@@ -275,7 +288,7 @@ def make_demo_dataset(
         },
     )
     if point_flux_jy:
-        uv = uvw[:, :2] * (frequency_hz / C_M_S)
+        uv = uv_of(uvw, frequency_hz)
         y, x = sky_to_grid(*point_centre)
         uvd.data[0] += point_flux_jy * point_visibilities(uv, y, x)
     components = {
@@ -351,7 +364,7 @@ def make_field_dataset(
               "phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0},
     )
     # add the analytic points on top of the already-noisy visibilities
-    uv = uvw[:, :2] * (frequency_hz / C_M_S)
+    uv = uv_of(uvw, frequency_hz)
     for flux, (d_ra, d_dec) in points:
         y, x = sky_to_grid(d_ra, d_dec)
         uvd.data[0] += flux * point_visibilities(uv, y, x)
@@ -442,7 +455,7 @@ def make_multi_spw_dataset(
         if point_flux_jy:
             y, x = sky_to_grid(*point_centre)
             for c, f in enumerate(freqs):
-                uv = uvw[:, :2] * (f / C_M_S)
+                uv = uv_of(uvw, f)
                 uvd.data[c] += point_flux_jy * point_visibilities(uv, y, x)
         spws.append(uvd)
     return MultiSpwUVData(spws=spws), truth, geom

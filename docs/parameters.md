@@ -56,7 +56,8 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 |---|---|---|
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
 | `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
-| `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with the prior frozen from the MFS fit. |
+| `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with a shared prior — see `--cube-prior`. |
+| `--cube-prior` | **channel** | Cube mode only: what the shared prior is fitted on. `channel` uses a random 1-in-`n_chan` subset of the visibilities — the same amount of data each channel fit will have, and `n_chan` times cheaper. `mfs` uses every channel's visibilities at once, which is the single step that makes a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass). See below. |
 | `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
 | `--noise` (on `pyuvimage import` and `convert`) | **difference** | How the per-visibility noise is set. MS weights are relative, not absolute, so the scale is always recomputed from the data. `difference`: from the visibilities alone. `hybrid`: adds the weight column's time profile. `scaled`: whole shape from the weights. `sigma`: trust `SIGMA` as absolute, and warn. On `convert`, `keep` (the default there) leaves the stored map alone. Full discussion in [noise.md](noise.md). |
 | `--dish-diameter`, `--no-pb` | from MS | Gaussian primary beam, FWHM = `1.13 lambda/D`. |
@@ -135,3 +136,47 @@ correct, and considerably slower, since it multiplies the NUFFT calls on
 
 None of this affects the DFT path, `--transformer pynufft`, or JAX's use
 anywhere else in the fit.
+
+
+## What the cube's shared prior is fitted on
+
+Cube mode fits each channel separately and gives them all the same prior, so
+the planes are mutually consistent. The question is what that prior should be
+fitted on — and until 27 Aug the answer was "one MFS fit over every channel's
+visibilities", which is both the most expensive step in the run and the wrong
+size.
+
+**Wrong size** because the prior is *applied* to single channels. A
+coefficient chosen so that all `n_chan` channels together fit to the noise is
+not the coefficient a single channel wants. Measured on Ruby 200 GHz
+continuum, fitting the full set against a random 1/8 of it:
+
+| criterion | full | 1/8, raw | 1/8, x8 | ratio to full |
+|---|---|---|---|---|
+| `structure` | 1.883e8 | 5.008e8 | 4.007e9 | **21.3** |
+| `discrepancy` | 2.920e8 | 3.991e7 | 3.193e8 | **1.09** |
+
+The `discrepancy` row is the algebra working. `(F + lambda C^-1)s = D` has `F`
+and `D` both sums over visibilities, so thinning by `f` and scaling `lambda`
+by `f` reproduces the identical model — and `chi^2/N` is invariant under that,
+so the criterion agrees. 9% is the scatter from the thinned uv coverage.
+
+The `structure` row is why the coefficient must **not** be scaled back. A
+whiter residual map is not a scale-invariant target: a fit with an eighth of
+the data genuinely wants a much stronger prior, and the criterion says so — 21
+times stronger than the scaling law would predict. Since `--criterion auto`
+takes `structure` on any well-constrained fit, scaling back would be wrong
+where it matters most.
+
+So `--cube-prior channel` (the default) fits the prior on a random
+1-in-`n_chan` subset drawn across all channels — a dataset the size of the
+ones the prior will be applied to — and uses the coefficient as fitted. The
+subset is drawn from every channel rather than taken as one channel so that
+the sky it sees is the band average, which matters for a line cube where a
+single channel may be nearly empty.
+
+`--cube-prior mfs` restores the old behaviour.
+
+**Costs**, on Ruby CO(7-6) at `--fov 3` (613,512 samples, 8 channels, 27x27
+mesh): 2.9 GB for the prior pass and each channel fit, against 20.1 GB for the
+MFS pass. `pyuvimage fit` reports both figures before allocating anything.

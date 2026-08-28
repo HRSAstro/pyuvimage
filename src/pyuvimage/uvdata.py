@@ -41,6 +41,35 @@ _FILES = {
 }
 
 
+# The sign of v, measured rather than assumed.
+#
+# The imaging stack works in a grid (y, x) with y = dDec and x = -dRA, and
+# forms images as `sum V exp[+2 pi i (u x + v y)]`. Whether that reproduces
+# the sky depends on the sign convention of the UVW column in the measurement
+# set, and the two candidates differ by a *mirror in declination* -- which no
+# round-trip test can catch, because the mock generator and the imager share
+# whatever convention is in force.
+#
+# Settled against CASA on Ruby CO(7-6) (2026-08-28). The same visibilities
+# imaged four ways, the source's true position being (dRA +2", dDec -2"):
+#
+#     exp[+2 pi i (+u dRA + v dDec)]   ->  dRA -1.59, dDec +2.71
+#     exp[+2 pi i (+u dRA - v dDec)]   ->  dRA -1.59, dDec -2.71
+#     exp[+2 pi i (-u dRA + v dDec)]   ->  dRA +1.59, dDec +2.71   <- was this
+#     exp[+2 pi i (-u dRA - v dDec)]   ->  dRA +1.59, dDec -2.71   <- CASA
+#
+# so v as stored has the opposite sign to the one the grid convention wants,
+# and negating it here puts every downstream product -- images, the fitted
+# model, the FITS WCS, the restoring beam's position angle, the recentring
+# phase ramp -- into the true sky frame at once. Applied in the accessor
+# rather than at import so that datasets exported before this keep working.
+#
+# Hannah found it by imaging the same measurement set in CASA and getting the
+# source in the opposite quadrant in declination. Every Dec this reported
+# before 28 Aug is sign-flipped.
+V_SIGN = -1.0
+
+
 @dataclass
 class UVData:
     """Calibrated Stokes-I visibilities for a single field / spectral window."""
@@ -112,9 +141,13 @@ class UVData:
         return (hi - lo) / mid if mid > 0 else 0.0
 
     def uv_wavelengths(self, channel: int) -> np.ndarray:
-        """(n_vis, 2) u,v in wavelengths for one channel."""
+        """(n_vis, 2) u,v in wavelengths for one channel, in the sky frame.
+
+        See `V_SIGN` for why v changes sign on the way out.
+        """
         scale = self.frequencies[channel] / C_M_S
-        return self.uvw[:, :2] * scale
+        uv = self.uvw[:, :2] * scale
+        return np.column_stack((uv[:, 0], V_SIGN * uv[:, 1]))
 
     @property
     def max_baseline_wavelengths(self) -> float:
@@ -816,32 +849,57 @@ def shift_image_centre(
         data[c] = data[c] * phase
         # A phase rotation mixes the real and imaginary parts, so separate
         # sigma_re and sigma_im no longer describe the rotated visibility.
-        # They agree to well within a per cent on real data (both are the same
-        # receiver noise), so the rotated noise is the quadrature mean.
+        # The rotated noise is their quadrature mean, which preserves the
+        # total variance exactly -- so chi^2 statistics are untouched -- and
+        # is a *better* estimate of each, not a worse one: see below.
         s_re, s_im = noise[c].real, noise[c].imag
         s = np.sqrt(0.5 * (s_re**2 + s_im**2))
         noise[c] = s + 1j * s
-    worst = _reim_asymmetry(dataset.noise)
-    if worst > 0.02:
-        logger.warning(
-            "the real and imaginary noise differ by up to %.0f%% before "
-            "recentring; the rotated noise map is their quadrature mean, so "
-            "individual sigmas are accurate to about that much.",
-            100.0 * worst,
-        )
+    _report_reim_asymmetry(dataset.noise)
     return replace(
         dataset, data=data, noise=noise,
         meta=_with_centre(dataset.meta, y0, x0),
     )
 
 
-def _reim_asymmetry(noise: np.ndarray) -> float:
+#: Above this *median* re/im noise asymmetry, something other than estimator
+#: scatter is going on and it is worth saying so.
+REIM_ASYMMETRY_WARN = 0.25
+
+
+def _report_reim_asymmetry(noise: np.ndarray) -> None:
+    """Say how far sigma_re and sigma_im disagree, and what that means.
+
+    Thermal noise has sigma_re == sigma_im exactly -- they are the same
+    receiver noise projected onto two axes -- so any spread is scatter in the
+    *estimator*, which measures each from a finite number of time differences
+    (fractional scatter ~ 1/sqrt(2N)). Ruby at 200 GHz reads a median of 9%,
+    which is about 60 differences per estimate: entirely expected.
+
+    So pooling the two in quadrature is not an approximation forced by the
+    rotation, it is the better estimate of both -- twice the sample size. Only
+    a *systematic* difference would mean something, hence the median rather
+    than the maximum: one bad baseline should not raise an alarm.
+    """
     a = np.asarray(noise)
     re, im = np.abs(a.real), np.abs(a.imag)
     ok = np.isfinite(re) & np.isfinite(im) & (re > 0) & (im > 0)
     if not np.any(ok):
-        return 0.0
-    return float(np.nanmax(np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))))
+        return
+    asym = np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))
+    median = float(np.nanmedian(asym))
+    logger.info(
+        "  sigma_re and sigma_im differ by %.1f%% (median); recentring pools "
+        "them in quadrature, which preserves the total variance and halves "
+        "the estimator scatter.", 100.0 * median,
+    )
+    if median > REIM_ASYMMETRY_WARN:
+        logger.warning(
+            "the real and imaginary noise differ by %.0f%% at the median, "
+            "which is more than estimator scatter usually explains. Check the "
+            "noise map before trusting per-visibility weights.",
+            100.0 * median,
+        )
 
 
 def _with_centre(meta: dict, y0: float, x0: float) -> dict:

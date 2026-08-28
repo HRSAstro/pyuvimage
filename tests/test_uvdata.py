@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from pyuvimage.uvdata import C_M_S, UVData
+from pyuvimage.uvdata import V_SIGN, C_M_S, UVData
 
 
 def _example(n_chan=2, n_vis=50, seed=0):
@@ -43,9 +43,18 @@ def test_roundtrip_npz(tmp_path):
 
 
 def test_uv_wavelengths_scaling():
+    """u scales; v scales *and changes sign*.
+
+    The stored `uvw` is the measurement set's, and its v has the opposite
+    sign to the one the imaging grid wants -- measured against CASA, see
+    `uvdata.V_SIGN`. Negating it in the accessor is what puts every image,
+    the FITS WCS and the beam position angle into the true sky frame."""
     uvd = _example()
     uv0 = uvd.uv_wavelengths(0)
-    np.testing.assert_allclose(uv0, uvd.uvw[:, :2] * uvd.frequencies[0] / C_M_S)
+    scaled = uvd.uvw[:, :2] * uvd.frequencies[0] / C_M_S
+    np.testing.assert_allclose(uv0[:, 0], scaled[:, 0])
+    np.testing.assert_allclose(uv0[:, 1], -scaled[:, 1])
+    assert V_SIGN == -1.0
 
 
 def test_flatten_respects_flags():
@@ -86,7 +95,11 @@ def test_legacy_conversion_forms_stokes_i():
     np.testing.assert_allclose(uvd.data[0], 0.5 * (xx + yy))
     # two *independent* hands: sigma_I = sigma / sqrt(2)
     np.testing.assert_allclose(uvd.noise.real, 0.1 / np.sqrt(2))
-    np.testing.assert_allclose(uvd.uv_wavelengths(0), uv[0])
+    # legacy files stored the measurement set's own (u, v), so the accessor
+    # applies the same v sign it applies to everything else
+    got = uvd.uv_wavelengths(0)
+    np.testing.assert_allclose(got[:, 0], uv[0][:, 0])
+    np.testing.assert_allclose(got[:, 1], V_SIGN * uv[0][:, 1])
 
 
 def test_legacy_duplicated_hands_do_not_reduce_noise():

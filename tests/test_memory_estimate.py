@@ -151,3 +151,49 @@ def test_the_first_adaptive_pass_is_released_before_the_second_allocates():
         "the first-pass fit was still alive when the second pass began: its "
         "transformed mapping matrix doubles the peak memory"
     )
+
+
+# --- cube mode: the MFS pass is the expensive step -------------------------
+#
+# Cube mode fits each channel separately, which is cheap, but it first runs
+# one MFS fit over *every* channel's visibilities to fix the prior -- and that
+# pass is n_chan times the size of any single channel. Ruby CO(7-6) at a 27x27
+# mesh: 2.9 GB per channel, 20.1 GB for the MFS pass. Reporting one number
+# makes the whole cube look unaffordable when only one step of it is.
+
+
+def test_cube_reports_the_per_channel_cost_separately(caplog):
+    from pyuvimage.fitting import check_memory
+
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        check_memory(613_512, 729, None, n_chan=8)
+    assert "per-channel fits need about" in caplog.text
+    assert "MFS pass over all 8 channels" in caplog.text
+
+
+def test_cube_says_so_when_only_the_mfs_pass_is_unaffordable(monkeypatch, caplog):
+    from pyuvimage import fitting
+
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 6.4)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        fitting.check_memory(613_512, 729, None, n_chan=8)
+    assert "per-channel fits would fit" in caplog.text
+    # and it still names a mesh that would let the MFS pass through
+    assert "per side" in caplog.text
+
+
+def test_mfs_mode_reports_one_number_as_before(caplog):
+    from pyuvimage.fitting import check_memory
+
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        check_memory(613_512, 729, None)
+    assert "per-channel" not in caplog.text
+
+
+def test_the_cube_numbers_are_the_ones_that_were_measured():
+    """Ruby CO(7-6), 613,512 samples over 8 channels, 27x27 mesh."""
+    from pyuvimage.fitting import estimate_peak_memory_gb
+
+    assert estimate_peak_memory_gb(613_512, 729) == pytest.approx(20.1, abs=0.3)
+    assert estimate_peak_memory_gb(613_512 // 8, 729) == pytest.approx(2.9, abs=0.2)
+

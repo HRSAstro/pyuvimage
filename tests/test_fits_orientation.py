@@ -17,7 +17,7 @@ import pytest
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from pyuvimage.products import _to_fits_order, build_header
+from pyuvimage.products import build_header, to_fits_orientation
 
 META = {"phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0}
 PIX = 0.1
@@ -28,7 +28,7 @@ def _write_and_read(array, tmp_path):
     """Round-trip through the real writer path and astropy's WCS."""
     hdr = build_header(N, PIX, META, "Jy/beam")
     path = tmp_path / "t.fits"
-    fits.writeto(path, _to_fits_order(array), hdr, overwrite=True)
+    fits.writeto(path, to_fits_orientation(array), hdr, overwrite=True)
     with fits.open(path) as hdul:
         data, w = hdul[0].data, WCS(hdul[0].header)
     row, col = np.unravel_index(int(np.nanargmax(data)), data.shape)
@@ -82,9 +82,11 @@ def test_the_unflipped_array_would_have_failed(tmp_path):
     )
 
 
-def test_cubes_flip_on_the_row_axis_only():
-    cube = np.arange(2 * 4 * 3, dtype=float).reshape(2, 4, 3)
-    out = _to_fits_order(cube)
-    assert out.shape == cube.shape
-    assert np.array_equal(out[0], cube[0][::-1, :])
-    assert np.array_equal(out[1], cube[1][::-1, :])
+def test_the_flip_is_applied_exactly_once_per_plane():
+    """Twice cancels, and cancelling is what hid a mirrored sky for two days:
+    the writer flipped in `stack()` and again on the way to `fits.writeto`, so
+    the file came out unflipped and only looked right because the imaging was
+    mirrored too. `write_products` now flips once, in `stack()`."""
+    plane = np.arange(4 * 3, dtype=float).reshape(4, 3)
+    assert np.array_equal(to_fits_orientation(plane), plane[::-1, :])
+    assert np.array_equal(to_fits_orientation(to_fits_orientation(plane)), plane)

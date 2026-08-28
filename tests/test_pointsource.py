@@ -326,12 +326,22 @@ def test_adaptive_prior_is_refit_without_the_points_in_its_brightness_map():
         extended=[(0.040, 0.80, (0.0, 0.0), 1.0, 0.0),
                   (0.020, 0.25, (-1.0, -0.9), 0.6, 40.0)],
         # the second point sits on the bright blob: that is the one whose
-        # flux the un-refit adaptive prior used to swallow.  Kept at 6 mJy so
-        # it is reliably *detected* at this small test size -- the failure
-        # being tested is its flux, not its detection.
-        points=[(0.0120, (1.30, -1.20)), (0.0060, (-1.05, -0.85))])
+        # flux the un-refit adaptive prior used to swallow. At 6-9 mJy the
+        # split between it and the mesh underneath is degenerate enough that
+        # the fitted amplitude wanders with the noise realisation -- it even
+        # came out negative on one seed -- so it is kept at 12 mJy, where the
+        # recovery is 78-87% across seeds. The failure being tested is a
+        # factor of two, not a few per cent.
+        points=[(0.0120, (1.30, -1.20)), (0.0120, (-1.05, -0.85))])
+    # Both positions are supplied rather than detected. What this test is
+    # about is the buried point's *flux*, and a faint point on a bright
+    # compact blob is a genuinely marginal detection at this mock's size --
+    # it came and went with the noise realisation, so an unrelated change
+    # elsewhere could fail it for the wrong reason. Positions are given in
+    # image (x, y), so x = -dRA.
     res = pyuvimage.run(uvd, fov=4.0, mesh_shape=geom.mesh_shape,
-                        reg="adaptive", point_sources=True,
+                        reg="adaptive",
+                        point_sources=[(-1.30, -1.20), (1.05, -0.85)],
                         uncertainty_map=False, write=False)
     found = res.products[0].points or []
     assert len(found) == 2
