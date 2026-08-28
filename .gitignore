@@ -15,6 +15,9 @@ pyuvimage_demo/
 *.fits
 !figures/*.fits
 
+# real data used for testing: too big for the repo, and not ours to publish
+testing_data/
+
 # transfer scratch (this is what got committed by accident)
 _to_delete_tmp/
 *.tgz
