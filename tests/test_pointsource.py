@@ -289,6 +289,14 @@ def test_point_fitting_is_refused_when_the_mesh_fit_has_not_converged(caplog):
     it means the model cannot describe the data at all.  The residual is then
     model error, not sky, and the point fitter used to mine it: on this case
     it returned an 11.5 Jy component at 76 sigma in a 0.09 Jy field.
+
+    This used to be enforced by refusing to fit at all when chi^2 was high.
+    That got the causality backwards -- an unmodelled compact source is itself
+    a common reason for a high chi^2, and the demo (a 4 mJy point no 24x24
+    mesh can hold, chi^2/N = 2.87) was blocked by its own symptom. So the fit
+    now runs and the *answer* is judged: it is kept only if it explains most
+    of the excess chi^2 and carries a credible flux. The out-of-field
+    artefact fails both -- 128x the field's flux -- and is still discarded.
     """
     import logging
 
@@ -305,8 +313,8 @@ def test_point_fitting_is_refused_when_the_mesh_fit_has_not_converged(caplog):
                             point_sources=True, uncertainty_map=False,
                             write=False)
     assert (res.products[0].points or []) == []
-    assert any("skipping point-source fitting" in r.message
-               for r in caplog.records)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "discarding the fitted point component" in text
 
 
 def test_adaptive_prior_is_refit_without_the_points_in_its_brightness_map():
@@ -352,3 +360,40 @@ def test_adaptive_prior_is_refit_without_the_points_in_its_brightness_map():
         assert len(near) == 1, f"no unique match for {truth}"
         # the buried point is the one that used to lose half its flux
         assert near[0].flux == pytest.approx(truth["flux"], rel=0.35)
+
+
+def test_the_demo_recovers_its_point_source(caplog):
+    """The shipped demo must demonstrate the feature it is built around.
+
+    `make_demo_dataset(point_flux_jy=0.004)` deliberately includes a point no
+    mesh can represent -- that is the whole reason the demo exists. Measured:
+    the mesh alone reaches chi^2/N = 1.001 without it and 2.870 with it, so
+    the point *is* the excess. Before the guard was changed, that excess
+    tripped a pre-emptive skip and the demo shipped a striped 2.87 fit with
+    the headline feature switched off by its own symptom.
+
+    This is a first run of the tool for most users, so it is worth a test.
+    """
+    import logging
+
+    import pyuvimage
+    from pyuvimage.mock import make_demo_dataset
+
+    uvd, _, _, comps = make_demo_dataset(point_flux_jy=0.004)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        res = pyuvimage.run(
+            uvd, fov=3.0, point_sources=True, uncertainty_map=False,
+            write=False,
+        )
+    points = res.products[0].points or []
+    assert len(points) == 1, "the demo's point source was not recovered"
+
+    p = points[0]
+    truth = comps["points"][0]
+    assert p.flux == pytest.approx(truth["flux"], rel=0.1)
+    assert p.d_ra == pytest.approx(truth["centre"][0], abs=0.05)
+    assert p.d_dec == pytest.approx(truth["centre"][1], abs=0.05)
+
+    # and the fit it was blocking must actually converge
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "explain" in text and "keeping them" in text

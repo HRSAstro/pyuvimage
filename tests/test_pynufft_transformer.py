@@ -278,3 +278,113 @@ def test_a_broken_jax_is_diagnosed_as_a_different_thing(monkeypatch):
     diagnosis = fitting.jax_path_diagnosis()
     assert diagnosis is not None and "cannot be imported" in diagnosis
     assert "nufftax" not in diagnosis
+
+
+# --- the adjoint scale ------------------------------------------------------
+#
+# pynufft's adjoint applies its own internal IFFT normalisation, leaving it a
+# factor `4 * N_y * N_x` below the plain mathematical adjoint that both
+# `TransformerDFT` and the nufftax `TransformerNUFFT` return. autoarray's
+# `Interferometer.apply_sparse_operator` passes `use_adjoint_scaling=True` when
+# it builds the w-tilde operator's dirty image, precisely so `D` lands on the
+# same scale as the kernel `W~`.
+#
+# Our vendored `image_from` used to end in `**kwargs`, which swallowed that
+# argument without a word. The consequence was not a crash: the sparse
+# reconstruction had the right morphology at ~1/10000 of the right amplitude,
+# the residual map kept 99.99% of the source (231 sigma on Ruby), and chi^2 was
+# identical to eleven significant figures across twelve orders of magnitude of
+# `lambda` -- because an `F` that large swamps any `H` in the search range --
+# so the hyperparameter search had nothing to bisect and ran to its ceiling.
+#
+# Every one of these tests exists to make that failure loud.
+
+def _adjoint_problem(n_pix=16, n_vis=300, pscale=0.1, seed=0):
+    rng = np.random.default_rng(seed)
+    mask = ag.Mask2D.all_false(shape_native=(n_pix, n_pix), pixel_scales=pscale)
+    pixel_rad = pscale * np.pi / (180 * 3600)
+    nyquist = 1.0 / (2.0 * pixel_rad)
+    uv = rng.uniform(-0.4 * nyquist, 0.4 * nyquist, size=(n_vis, 2))
+    vis = ag.Visibilities(
+        visibilities=rng.normal(size=n_vis) + 1j * rng.normal(size=n_vis)
+    )
+    return mask, uv, vis
+
+
+@pynufft_only
+def test_image_from_accepts_use_adjoint_scaling_by_name():
+    """Not via **kwargs. The signature is the thing that broke."""
+    import inspect
+
+    params = inspect.signature(TransformerPyNUFFT.image_from).parameters
+    assert "use_adjoint_scaling" in params
+    assert not any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ), "a **kwargs catch-all is how this argument got silently dropped before"
+
+
+@pynufft_only
+@pytest.mark.parametrize("n_pix", [16, 24, 32])
+def test_the_scaled_adjoint_matches_the_dft(n_pix):
+    """The invariant the sparse inversion's data vector depends on."""
+    mask, uv, vis = _adjoint_problem(n_pix=n_pix)
+    reference = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .image_from(visibilities=vis).native
+    )
+    scaled = np.asarray(
+        TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+        .image_from(visibilities=vis, use_adjoint_scaling=True).native
+    )
+    error = np.abs(scaled - reference).max() / np.abs(reference).max()
+    assert error < 1e-3, f"relative error {error:.2e}"
+
+
+@pynufft_only
+def test_the_factor_is_four_ny_nx():
+    """Measured, not assumed -- our transformer is a reimplementation."""
+    mask, uv, vis = _adjoint_problem(n_pix=24)
+    pn = TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+    raw = np.asarray(pn.image_from(visibilities=vis).native)
+    reference = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .image_from(visibilities=vis).native
+    )
+    keep = np.abs(raw) > np.abs(raw).max() * 1e-3
+    measured = np.median(reference[keep] / raw[keep])
+    assert measured == pytest.approx(4 * 24 * 24, rel=1e-3)
+    assert pn.adjoint_scaling == pytest.approx(4 * 24 * 24)
+
+
+@pynufft_only
+def test_the_default_is_still_the_unscaled_adjoint():
+    """Everything else in pyuvimage reads the dirty image unscaled; only the
+    sparse operator asks for the common scale. Changing the default would move
+    every dirty image and beam product at once."""
+    mask, uv, vis = _adjoint_problem()
+    pn = TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+    a = np.asarray(pn.image_from(visibilities=vis).native)
+    b = np.asarray(pn.image_from(visibilities=vis, use_adjoint_scaling=False).native)
+    np.testing.assert_allclose(a, b)
+
+
+@pynufft_only
+def test_the_preflight_guard_passes_a_correct_transformer():
+    fitting.assert_adjoint_scale_consistent(TransformerPyNUFFT)
+
+
+@pynufft_only
+def test_the_preflight_guard_catches_a_swallowed_argument():
+    """Reintroduce the exact bug and confirm the guard names it."""
+
+    class Swallowing(TransformerPyNUFFT):
+        def image_from(self, visibilities, xp=np, **kwargs):
+            return super().image_from(visibilities, use_adjoint_scaling=False)
+
+    with pytest.raises(RuntimeError, match="does not honour use_adjoint_scaling"):
+        fitting.assert_adjoint_scale_consistent(Swallowing)
+
+
+def test_the_preflight_guard_passes_the_dft():
+    """A no-op for the DFT, and it must stay a no-op rather than an error."""
+    fitting.assert_adjoint_scale_consistent(ag.TransformerDFT)

@@ -11,10 +11,16 @@ pip install -e ".[jax]"     # + JAX/nufftax
 Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
 `version: python_version_check: False` in a local `config/general.yaml`).
 
-JAX is optional. The NumPy path is fully supported and is what most of the
-measurements in these docs were made on — see
-[large-datasets.md](large-datasets.md) for why the JAX NUFFT is not the right
-backend for large fits anyway.
+JAX is optional, and it is **not** what makes the transform fast — `pynufft`
+is (see [parameters.md](parameters.md#why-auto-never-picks-the-jax-nufft): the
+JAX NUFFT's batched gather buffer puts it out of reach on any laptop, so
+`--transformer auto` never selects it). Install `pynufft` for speed.
+
+What JAX is for is autoarray's w-tilde inversion path, which sidesteps the
+mapping matrix entirely and is the route to fitting large datasets in
+megabytes rather than gigabytes. That path requires JAX; the NumPy path is
+fully supported without it and is what most of the measurements in these docs
+were made on.
 
 ## An arm64 conda environment on Apple silicon
 

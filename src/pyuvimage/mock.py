@@ -243,11 +243,22 @@ def make_demo_dataset(
 ):
     """The self-contained demo: an extended disc plus one true point source.
 
-    Deliberately *well-posed*: 1200 visibilities against a 32x32 mesh is 2400
-    data against 1024 model pixels. The original demo used 300 visibilities,
-    i.e. 1.7 model pixels per datum -- the under-constrained regime where the
-    generalisation tests found spurious point detections. A first run of the
-    tool should not be in that regime.
+    Deliberately well-posed: 1200 visibilities is 2400 data points, against
+    the 576 model pixels the fit resolves to at `--fov 3` (a 24x24 mesh; the
+    truth here is built on a finer 32x32 grid, which is why the disc is not
+    exactly representable and the fit lands at chi^2/N = 1.001 rather than
+    below it). The original demo used 300 visibilities, i.e. 1.7 model pixels
+    per datum -- the under-constrained regime where the generalisation tests
+    found spurious point detections. A first run of the tool should not be in
+    that regime.
+
+    Note the residual map still reads a structure ratio near 0.56. That is the
+    small-mock artefact documented in design-notes.md, not overfitting: with
+    1200 visibilities behind a 48x48 image grid the map has far more pixels
+    than independent measurements, so its rms is set by the beam's correlated
+    structure rather than by chi^2/N. More visibilities make it *worse*, not
+    better -- measured 0.56 at 2400 and 0.14 at 3600 -- so it is not a knob to
+    turn here.
 
     `point_flux_jy` is off by default so the mock stays a plain extended
     source for regression tests; the CLI demo turns it on.

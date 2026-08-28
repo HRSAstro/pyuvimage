@@ -12,8 +12,10 @@ maximisation is available as an alternative criterion.
 from __future__ import annotations
 
 import gc
+import hashlib
 import logging
 import math
+import time
 import warnings
 from dataclasses import dataclass, field
 
@@ -274,15 +276,47 @@ def pynufft_transformer_class():
                 * (self.uv_wavelengths[:, 1] + self.uv_wavelengths[:, 0])
             )
 
+            # What `image_from(use_adjoint_scaling=True)` multiplies by, to put
+            # pynufft's internally-normalised adjoint back on the plain
+            # mathematical adjoint's scale -- the one TransformerDFT and the
+            # nufftax TransformerNUFFT already use. Same expression as
+            # autoarray's own `TransformerNUFFTPyNUFFT.adjoint_scaling`.
+            self.adjoint_scaling = float(4 * shape[0] * shape[1])
+
         def visibilities_from(self, image, xp=np):
             vis = self.forward(np.asarray(image.native.array)[::-1, :])
             return ag.Visibilities(visibilities=vis * self.shift)
 
-        def image_from(self, visibilities, xp=np, **kwargs):
+        def image_from(self, visibilities, use_adjoint_scaling=False, xp=np):
+            """Adjoint transform, optionally on the common adjoint scale.
+
+            `use_adjoint_scaling` is **load-bearing here and nowhere else**.
+            pynufft's adjoint applies its own internal IFFT normalisation,
+            which leaves the result a factor `4 * N_y * N_x` below the plain
+            mathematical adjoint that `TransformerDFT` and the nufftax
+            `TransformerNUFFT` both return. autoarray's
+            `Interferometer.apply_sparse_operator` passes `use_adjoint_scaling
+            =True` when it builds the w-tilde operator's dirty image, so that
+            `D` is on the same scale as the kernel `W~` regardless of which
+            transformer produced it.
+
+            This signature used to end in `**kwargs`, which swallowed the
+            argument silently. The result was not a crash but a plausible
+            image: `D` came out `4 N_y N_x` too small while `F` did not, so
+            the sparse reconstruction had the right morphology at ~1/10000 of
+            the right amplitude, the residual map kept 99.99% of the source
+            (231 sigma on Ruby), and -- because an `F` that large swamps any
+            `H = lambda C^-1` in the search range -- chi^2 was identical to
+            eleven significant figures across twelve orders of magnitude of
+            `lambda`, so the hyperparameter search had nothing to bisect and
+            ran to the ceiling. Never accept this argument into `**kwargs`.
+            """
             shifted = np.asarray(visibilities) * np.conj(self.shift)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 image = np.real(self.adjoint(shifted))[::-1, :]
+            if use_adjoint_scaling:
+                image = image * self.adjoint_scaling
             return aa.Array2D(values=image, mask=self.real_space_mask)
 
         def transform_mapping_matrix(self, mapping_matrix, xp=np):
@@ -532,12 +566,35 @@ def transformer_memory_gb(transformer_cls, n_vis: int, n_mesh_pixels: int) -> fl
     return nufftax_gather_gb(n_vis, block)
 
 
+def current_memory_gb() -> float:
+    """Resident memory this process is already holding, in GB.
+
+    It belongs in the budget. By the time a fit allocates, the interpreter,
+    numpy, autoarray and -- if it is installed -- JAX with its own arena are
+    already resident, and on one 8 GB laptop that was around a gigabyte before
+    the first mapping matrix existed. Comparing the *allocation* against total
+    available memory ignores it and reports a comfortable margin that is not
+    there: a fit estimated at 2.1 GB against 6.9 GB available was killed.
+    """
+    try:  # pragma: no cover - platform dependent
+        import resource
+
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # ru_maxrss is kB on Linux and bytes on macOS
+        return r / 1e9 if r > 1e8 else r / 1e6
+    except Exception:
+        return 0.0
+
+
 def check_memory(
     n_vis: int,
     n_mesh_pixels: int,
     transformer_cls=None,
     n_chan: int | None = None,
     prior_thin: int = 1,
+    inversion: str = "dense",
+    n_image_pixels: int | None = None,
+    kernel_cached: bool = False,
 ) -> None:
     """Say what the fit will need, and warn before it is killed.
 
@@ -556,14 +613,46 @@ def check_memory(
     per-channel fits need 2.9 GB each and the MFS pass needs 20.1 GB, so the
     cube looks unaffordable when only one step of it is.
     """
+    held = current_memory_gb()
+    if inversion == "sparse":
+        # A different regime entirely, and the reason it exists: nothing here
+        # scales with n_vis, so the dense estimate would refuse fits that are
+        # comfortable. Report what will actually be allocated.
+        if n_image_pixels is None:
+            return
+        chunk_k = sparse_chunk_k_for_budget(n_image_pixels)
+        need = sparse_peak_memory_gb(
+            n_image_pixels, n_mesh_pixels, chunk_k=chunk_k,
+            kernel_cached=kernel_cached,
+        ) + held
+        have = available_memory_gb()
+        logger.info(
+            "sparse inversion: roughly %.1f GB (%.1f GB already resident), "
+            "independent of the %d visibilities -- the kernel build streams "
+            "them %d at a time onto a fixed %d-pixel grid",
+            need, held, n_vis, chunk_k, n_image_pixels,
+        )
+        if have is not None and need > have:
+            logger.warning(
+                "estimated peak memory (%.1f GB) exceeds what looks "
+                "available (%.1f GB). On the sparse path the ceiling is the "
+                "model, not the data: reduce --mesh (F is n_mesh^2) or the "
+                "image size (--fov, --pixel-scale).",
+                need, have,
+            )
+        return
+
     def _need(nv):
         return (
             estimate_peak_memory_gb(nv, n_mesh_pixels)
             + transformer_memory_gb(transformer_cls, nv, n_mesh_pixels)
         )
 
-    full = _need(n_vis)
-    per_chan = _need(max(n_vis // n_chan, 1)) if n_chan and n_chan > 1 else None
+    full = _need(n_vis) + held
+    per_chan = (
+        _need(max(n_vis // n_chan, 1)) + held
+        if n_chan and n_chan > 1 else None
+    )
     # What the run will actually peak at: in cube mode with a thinned prior
     # pass, nothing ever sees more than one channel's worth at a time.
     need = per_chan if (per_chan is not None and prior_thin > 1) else full
@@ -572,7 +661,9 @@ def check_memory(
         logger.info("this fit needs roughly %.1f GB of memory", need)
         return
     logger.info(
-        "this fit needs roughly %.1f GB; about %.1f GB is available", need, have
+        "this fit needs roughly %.1f GB (%.1f GB already resident + %.1f GB "
+        "to allocate); about %.1f GB is available",
+        need, held, need - held, have,
     )
     if per_chan is not None:
         if prior_thin > 1:
@@ -768,6 +859,368 @@ def resolve_transformer(
         stacklevel=2,
     )
     return ag.TransformerDFT
+
+
+# --------------------------------------------------------------------------
+# The sparse (w-tilde) inversion: memory that does not scale with n_vis
+# --------------------------------------------------------------------------
+#
+# The dense inversion builds an `n_vis x n_mesh` transformed mapping matrix
+# and then throws it away, so peak memory scales with the number of
+# visibilities: 21.6 GB for Ruby CO(7-6) at a 28x28 mesh, to produce an `F`
+# that is 4.9 MB. CASA never does this -- tclean accumulates visibilities into
+# a fixed-size uv grid and FFTs once, so its memory is set by the image.
+#
+# autoarray ships the equivalent for a regularised inversion. A
+# translation-invariant kernel `W~` is accumulated over the visibilities in
+# chunks -- shape (2 Ny, 2 Nx), sub-megabyte on every dataset we have -- and
+# `F = A^T W~ A` is then assembled from sparse mapping triplets, a batch of
+# source-pixel columns at a time, with no dense matrix anywhere.
+#
+# Verified against the dense path on Ruby 200 GHz (fov 3, mesh 16, matern,
+# coefficient 1e8): chi^2 = 305200.43 both ways -- identical to eight
+# significant figures -- total flux agreeing to seven, and 0.3 s against
+# 25.4 s. Not an approximation; the same answer, ~85x faster.
+SPARSE_CHUNK_K = 4096       # visibilities per chunk while building W~
+SPARSE_BATCH_SIZE = 128     # source-pixel columns per batch while assembling F
+SPARSE_KERNEL_SUFFIX = ".wtilde.npy"
+SPARSE_CHUNK_K_MIN = 64
+# Concurrent (Ny, Nx, chunk_k) float64 temporaries inside the kernel build.
+# `accum_from_corner_np` evaluates
+#     phase = dx[..., None] * ku[k0:k1] + dy[..., None] * kv[k0:k1]
+#     acc  += np.sum(np.cos(phase) * w[k0:k1], axis=2)
+# which is two temporaries for `phase` (the product, then the sum), `cos(phase)`
+# while `phase` is still referenced, and the weighted product. Four is the
+# honest ceiling; numpy frees some of them earlier.
+SPARSE_KERNEL_BUILD_ARRAYS = 4
+# Concurrent (batch, 2Ny, 2Nx) complex128 temporaries in `apply_operator`:
+# F_pad, Fhat, Ghat, G_pad.
+SPARSE_OPERATOR_BATCH_ARRAYS = 4
+
+
+def sparse_kernel_build_gb(n_image_pixels: int, chunk_k: int = SPARSE_CHUNK_K) -> float:
+    """Peak GB of the one-off W~ kernel build.
+
+    This is the whole point of the sparse path, so read the scaling carefully:
+    **n_image_pixels x chunk_k**. The visibility count is not in it. The build
+    streams the data in chunks of `chunk_k` and accumulates into a fixed
+    (2Ny, 2Nx) array, exactly as tclean streams visibilities onto a fixed uv
+    grid -- so a dataset ten times larger costs ten times the *time* and not
+    one byte more memory, and `chunk_k` trades the two against each other.
+    """
+    return (
+        SPARSE_KERNEL_BUILD_ARRAYS
+        * float(n_image_pixels) * float(chunk_k) * 8.0 / 1e9
+    )
+
+
+def sparse_peak_memory_gb(
+    n_image_pixels: int,
+    n_mesh_pixels: int,
+    chunk_k: int = SPARSE_CHUNK_K,
+    batch_size: int = SPARSE_BATCH_SIZE,
+    kernel_cached: bool = False,
+) -> float:
+    """Rough peak RSS for one sparse inversion, in GB.
+
+    Three terms, none of which involves n_vis:
+
+    * the kernel build, `n_image x chunk_k` (skipped when a cached kernel is
+      reused, which is why `--kernel-cache` is worth having);
+    * the operator itself, a (2Ny, 2Nx) kernel and its FFT, plus the
+      `batch_size` columns in flight while F is assembled;
+    * F and the regularisation matrix, `n_mesh^2` each, plus the solver's copy.
+
+    The last term is the one that eventually bites: the sparse path moves the
+    ceiling off the data and onto the model, so it is `--mesh` that limits a
+    sparse fit, not the size of the measurement set.
+    """
+    kernel = 0.0 if kernel_cached else sparse_kernel_build_gb(n_image_pixels, chunk_k)
+    operator = (
+        4.0 * float(n_image_pixels) * (8.0 + 16.0)              # W~ and Khat
+        + SPARSE_OPERATOR_BATCH_ARRAYS
+        * float(batch_size) * 4.0 * float(n_image_pixels) * 16.0  # padded FFTs
+    ) / 1e9
+    curvature = 3.0 * float(n_mesh_pixels) ** 2 * 8.0 / 1e9
+    return MEMORY_BASE_GB + kernel + operator + curvature
+
+
+def sparse_chunk_k_for_budget(
+    n_image_pixels: int,
+    available_gb: float | None = None,
+    chunk_k: int = SPARSE_CHUNK_K,
+    budget: float = 0.25,
+) -> int:
+    """Shrink `chunk_k` until the kernel build fits in `budget` of memory.
+
+    A knob that tunes itself. `chunk_k` costs only time, so there is no reason
+    to make the user discover it: pick the largest chunk that fits and say so
+    in the log if it had to come down.
+    """
+    if available_gb is None:
+        available_gb = available_memory_gb()
+    if available_gb is None or available_gb <= 0:
+        return int(chunk_k)
+    allowance = budget * available_gb * 1e9 / (
+        SPARSE_KERNEL_BUILD_ARRAYS * 8.0 * max(float(n_image_pixels), 1.0)
+    )
+    return int(max(SPARSE_CHUNK_K_MIN, min(float(chunk_k), math.floor(allowance))))
+
+
+def sparse_inversion_diagnosis() -> str | None:
+    """Why the sparse inversion is unavailable, or None if it can run."""
+    if not hasattr(ag.Interferometer, "apply_sparse_operator"):
+        return (
+            "this autoarray has no `Interferometer.apply_sparse_operator`; "
+            "the sparse inversion needs a version that ships the w-tilde path."
+        )
+    diagnosis = jax_path_diagnosis()
+    if diagnosis is not None and "nufftax" not in diagnosis:
+        # nufftax is the NUFFT's problem, not the sparse operator's -- the
+        # sparse path only needs jax.numpy
+        return f"the sparse inversion needs JAX: {diagnosis}"
+    try:  # pragma: no cover - environment dependent
+        import jax.numpy  # noqa: F401
+    except Exception as e:
+        return (
+            f"the sparse inversion needs JAX ({type(e).__name__}: {e}). "
+            "`--inversion dense` is the fallback and needs nothing."
+        )
+    return None
+
+
+def sparse_kernel_key(uv_wavelengths, noise, geometry) -> str:
+    """A short hash identifying the (uv coverage, noise, geometry) a W~ kernel
+    belongs to.
+
+    Everything that changes the kernel is in it. The noise matters because the
+    kernel is inverse-variance weighted -- and recentring the field pools the
+    real and imaginary sigmas, so a recentred dataset needs its own kernel even
+    though its uv coordinates are unchanged.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    for a in (np.ascontiguousarray(np.asarray(uv_wavelengths, dtype=np.float64)),
+              np.ascontiguousarray(np.asarray(noise, dtype=np.complex128))):
+        h.update(a.tobytes())
+    h.update(
+        f"{geometry.shape_native}|{geometry.pixel_scale!r}|"
+        f"{geometry.mesh_shape}".encode()
+    )
+    return h.hexdigest()
+
+
+def sparse_kernel_cache_path(cache_dir, key: str):
+    """Where a W~ kernel for `key` lives, or None if caching is off."""
+    if cache_dir is None:
+        return None
+    from pathlib import Path
+
+    return Path(cache_dir) / f"pyuvimage-{key}{SPARSE_KERNEL_SUFFIX}"
+
+
+def assert_adjoint_scale_consistent(
+    transformer_cls, n_pix: int = 16, tolerance: float = 1e-2
+) -> None:
+    """Check a transformer's adjoint is on the scale the w-tilde kernel assumes.
+
+    `apply_sparse_operator` builds `D` from
+    `transformer.image_from(..., use_adjoint_scaling=True)` while `W~` is
+    accumulated directly from `1/sigma^2`. If the transformer ignores that
+    argument, `D` and `F` end up on different scales and the reconstruction
+    comes out uniformly too small -- with the right morphology, a plausible
+    log-evidence, and no error anywhere. That is exactly what happened on
+    Ruby: a 231 sigma residual and a chi^2 that did not move across twelve
+    orders of magnitude of `lambda`.
+
+    So check it, on a tiny synthetic problem where `TransformerDFT` is the
+    reference. Milliseconds, and it makes the failure loud.
+
+    `tolerance` is deliberately loose. A NUFFT is an approximation and its
+    error grows as the grid shrinks -- on a 16x16 probe it is ~1e-5, on an 8x8
+    one ~2e-3 -- while the failure this guards against is a factor of
+    `4 * N_y * N_x`, i.e. a relative error of order 1. Four orders of magnitude
+    separate the two, so there is no need to sit close to the noise floor.
+    """
+    mask = ag.Mask2D.all_false(shape_native=(n_pix, n_pix), pixel_scales=0.1)
+    rng = np.random.default_rng(0)
+    pixel_rad = 0.1 * math.pi / (180 * 3600)
+    nyquist = 1.0 / (2.0 * pixel_rad)
+    uv = rng.uniform(-0.4 * nyquist, 0.4 * nyquist, size=(64, 2))
+    vis = ag.Visibilities(
+        visibilities=rng.normal(size=64) + 1j * rng.normal(size=64)
+    )
+
+    reference = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .image_from(visibilities=vis).native
+    )
+    got = np.asarray(
+        transformer_cls(uv_wavelengths=uv, real_space_mask=mask)
+        .image_from(visibilities=vis, use_adjoint_scaling=True).native
+    )
+
+    scale = np.abs(reference).max()
+    error = np.abs(got - reference).max() / scale
+    if error < tolerance:
+        return
+
+    ratio = np.median(
+        reference[np.abs(got) > 0] / got[np.abs(got) > 0]
+    ) if np.any(np.abs(got) > 0) else float("nan")
+    raise RuntimeError(
+        f"{transformer_cls.__name__}.image_from does not honour "
+        f"use_adjoint_scaling: its adjoint sits a factor ~{ratio:.4g} off "
+        f"TransformerDFT's (relative error {error:.2e}). The sparse "
+        "inversion builds its data vector through this call, so the "
+        "reconstruction would come out uniformly mis-scaled with no other "
+        "symptom. Fix the transformer, or use --inversion dense."
+    )
+
+
+def with_sparse_operator(
+    dataset,
+    uv_wavelengths,
+    noise,
+    geometry,
+    cache_dir=None,
+    chunk_k: int | None = None,
+    batch_size: int = SPARSE_BATCH_SIZE,
+):
+    """Attach the w-tilde operator, building or reusing its kernel.
+
+    The kernel depends only on the uv coverage, the noise and the geometry --
+    never on the data values or the source prior -- so it is the one expensive
+    invariant of a run and is cached on disk, the way CASA caches its
+    convolution functions in `cfcache`.
+    """
+    reason = sparse_inversion_diagnosis()
+    if reason is not None:
+        raise RuntimeError(reason)
+    assert_adjoint_scale_consistent(type(dataset.transformer))
+
+    key = sparse_kernel_key(uv_wavelengths, noise, geometry)
+    path = sparse_kernel_cache_path(cache_dir, key)
+    kernel = None
+    if path is not None and path.exists():
+        try:
+            kernel = np.load(path)
+            logger.info("reusing the cached w-tilde kernel %s", path.name)
+        except Exception as e:  # a corrupt cache must never stop a fit
+            logger.warning("could not read %s (%s); rebuilding", path, e)
+            kernel = None
+
+    if kernel is None:
+        n_image_pixels = int(np.prod(geometry.shape_native))
+        if chunk_k is None:
+            chunk_k = sparse_chunk_k_for_budget(n_image_pixels)
+            if chunk_k < SPARSE_CHUNK_K:
+                logger.info(
+                    "streaming %d visibilities at a time rather than %d to "
+                    "keep the kernel build under %.1f GB",
+                    chunk_k, SPARSE_CHUNK_K,
+                    sparse_kernel_build_gb(n_image_pixels, chunk_k),
+                )
+        t = time.time()
+        logger.info(
+            "building the w-tilde kernel (one pass over %d visibilities; this "
+            "is the only step whose cost scales with the data)",
+            len(np.asarray(uv_wavelengths)),
+        )
+        kernel = np.asarray(dataset.psf_precision_operator_from(chunk_k=chunk_k))
+        logger.info(
+            "  kernel %s, %.2f MB, %.1f s", kernel.shape, kernel.nbytes / 1e6,
+            time.time() - t,
+        )
+        if path is not None:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(path, kernel)
+                logger.info("  cached as %s; a re-fit of this field reuses it",
+                            path.name)
+            except Exception as e:
+                logger.warning("could not cache the kernel at %s (%s)", path, e)
+
+    sparse = dataset.apply_sparse_operator(
+        nufft_precision_operator=kernel, batch_size=batch_size
+    )
+    return repair_sparse_dirty_image(sparse, dataset)
+
+
+def scaled_dirty_image(dataset) -> np.ndarray:
+    """The inverse-variance-weighted adjoint, on the w-tilde kernel's scale.
+
+    Exactly what `apply_sparse_operator` computes internally -- reproduced here
+    so we can check its answer rather than trust it.
+    """
+    from autoarray.structures.visibilities import Visibilities
+
+    data = np.asarray(dataset.data)
+    noise = np.asarray(dataset.noise_map)
+    weighted = (
+        data.real * noise.real ** -2.0 + 1j * data.imag * noise.imag ** -2.0
+    )
+    return np.asarray(
+        dataset.transformer.image_from(
+            visibilities=Visibilities(visibilities=weighted),
+            use_adjoint_scaling=True,
+        ).array
+    )
+
+
+def repair_sparse_dirty_image(sparse_dataset, dataset, tolerance: float = 1e-6):
+    """Put the operator's dirty image on the kernel's scale if it is not.
+
+    `D = L^T dirty_image` while `W~` is accumulated straight from `1/sigma^2`,
+    so the two are only comparable if the adjoint was scaled. autoarray builds
+    that dirty image itself, via
+
+        self.transformer.image_from(..., use_adjoint_scaling=True)
+
+    and whether the flag is actually passed has varied between versions -- it
+    is a no-op for `TransformerDFT` and the nufftax `TransformerNUFFT`, so a
+    release that drops it looks harmless and breaks only the pynufft path.
+    autoarray 2026.8.17.1 passes it; 2026.8.23.1, measured, does not.
+
+    Trusting the caller here is what produced a 231 sigma fit whose chi^2 was
+    identical to eleven significant figures across twelve orders of magnitude
+    of `lambda`. So verify, repair, and say so.
+    """
+    import dataclasses
+
+    operator = getattr(sparse_dataset, "sparse_operator", None)
+    if operator is None or getattr(operator, "dirty_image", None) is None:
+        return sparse_dataset
+
+    want = scaled_dirty_image(dataset)
+    got = np.asarray(operator.dirty_image)
+    if got.shape != want.shape:
+        logger.warning(
+            "the sparse operator's dirty image has shape %s, expected %s -- "
+            "leaving it alone, but the reconstruction's scale is unverified",
+            got.shape, want.shape,
+        )
+        return sparse_dataset
+
+    scale = max(np.abs(want).max(), 1e-300)
+    if np.abs(got - want).max() <= tolerance * scale:
+        return sparse_dataset
+
+    ratio = np.abs(want).max() / max(np.abs(got).max(), 1e-300)
+    logger.warning(
+        "this autoarray builds the sparse operator's dirty image without "
+        "adjoint scaling, leaving it a factor %.6g off the w-tilde kernel's "
+        "scale. Correcting it. (Uncorrected, the reconstruction keeps its "
+        "morphology at 1/%.0f of the right amplitude and chi^2 stops "
+        "depending on the regularisation coefficient entirely.)",
+        ratio, ratio,
+    )
+    # `InterferometerSparseOperator` is a frozen dataclass, so it is replaced
+    # rather than mutated; `Interferometer` is not a dataclass and holds
+    # `sparse_operator` as a plain attribute, so it is assigned.
+    sparse_dataset.sparse_operator = dataclasses.replace(
+        operator, dirty_image=want
+    )
+    return sparse_dataset
 
 
 def make_dataset(

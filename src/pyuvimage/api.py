@@ -29,6 +29,15 @@ from .uvdata import MultiSpwUVData, UVData, read_dataset
 
 logger = logging.getLogger("pyuvimage")
 
+# When a mesh fit sits well above the chi^2 target, point components are still
+# fitted -- an unmodelled compact source is a common cause of exactly that --
+# but the answer has to earn its place. A real point removes most of the excess
+# and carries a flux comparable to or smaller than the extended model's. The
+# out-of-field artefact that motivated these tests explained little of the
+# excess and came back at 11.5 Jy in a 0.09 Jy field: 128 times the field.
+POINT_EXPLAINED_FRACTION = 0.5
+POINT_FLUX_SANITY = 2.0
+
 # Which baseline length the automatic mesh scale is sized from. The longest
 # baseline is the information limit, but on a real array only a handful of
 # samples reach it: PJ0116 at 245 GHz has a median baseline of 213 klambda and
@@ -79,6 +88,8 @@ def run(
     positive_only: bool = True,
     enforce_positive: bool = False,
     transformer: str = "auto",
+    inversion: str = "dense",
+    kernel_cache: str | None = None,
     mask_shape: str = "square",
     oversample: int = 2,
     pb_correction: bool = True,
@@ -224,6 +235,43 @@ def run(
     )
     # before anything large is allocated: an OOM kill prints nothing useful,
     # so the moment to speak is while --mesh and --fov are still adjustable
+    if inversion not in ("dense", "sparse"):
+        raise ValueError(f"unknown inversion {inversion!r}: 'dense' or 'sparse'")
+    if inversion == "sparse":
+        # Not a correctness problem -- a performance cliff, and a total one.
+        # Our point components are not autoarray linear objects; they are a
+        # bordered system (`pointsource.PointExtendedSystem`) built on top of
+        # the framework's inversion, and its first act is
+        #
+        #     self.A = np.asarray(inversion.operated_mapping_matrix)
+        #
+        # to form the cross-terms B = A^dagger N^-1 P between the mesh columns
+        # and the point columns. `operated_mapping_matrix` is inherited
+        # unchanged by `InversionInterferometerSparse` and calls
+        # `transformer.transform_mapping_matrix` -- the dense n_vis x n_mesh
+        # build that the whole w-tilde path exists to avoid (21.6 GB on Ruby
+        # CO(7-6)). So the fit would be correct, would allocate exactly what
+        # the user chose --inversion sparse to escape, and would most likely
+        # be OOM-killed. Refuse, and say which of the two to give up.
+        if point_sources:
+            raise ValueError(
+                "--inversion sparse cannot yet fit point sources. The point "
+                "components are solved as a bordered system whose cross-terms "
+                "need the dense operated mapping matrix (n_vis x n_mesh) -- "
+                "the one allocation the w-tilde path exists to avoid, so "
+                "asking for both gives up the entire benefit. Use "
+                "--inversion dense, or drop --point-sources."
+            )
+        if mode == "cube":
+            raise ValueError(
+                "--inversion sparse is mfs-only for now: every channel has "
+                "its own uv coverage in wavelengths and so needs its own "
+                "w-tilde kernel, which is not wired up yet."
+            )
+        reason = fitting.sparse_inversion_diagnosis()
+        if reason is not None:
+            raise RuntimeError(reason)
+
     prior_thin = 1
     if mode == "cube" and uvd.n_chan > 1:
         if cube_prior == "channel":
@@ -236,6 +284,8 @@ def run(
         uvd.n_samples, n_pix, transformer_cls,
         n_chan=uvd.n_chan if mode == "cube" else None,
         prior_thin=prior_thin,
+        inversion=inversion,
+        n_image_pixels=int(np.prod(geometry.shape_native)),
     )
     # Resolve `auto` once, here, so that everything downstream -- the fits,
     # the point-source retune, `fit_parameters.json` -- sees the concrete
@@ -290,6 +340,12 @@ def run(
     mfs_dataset = fitting.make_dataset(
         uv, d, n, geometry, transformer_cls, mask_shape=mask_shape
     )
+    if inversion == "sparse":
+        mfs_dataset = fitting.with_sparse_operator(
+            mfs_dataset, uv, n, geometry,
+            cache_dir=kernel_cache if kernel_cache is not None else Path(out).parent
+            if out is not None else None,
+        )
     logger.info("fitting MFS image (%d visibility samples)...", len(d))
     # The natural correlation length of a Gaussian-process source prior is
     # the resolution element: structure finer than the synthesised beam is
@@ -363,21 +419,34 @@ def run(
     # Opt-in: never added unless asked for, and auto-detected candidates are
     # kept only above `point_significance`.
     point_solution = None
-    if point_sources and mfs_fit.chi_squared / (2 * len(d)) > 2.0 * chi2_target:
-        # The coefficient search drives chi^2 to the target, so a mesh fit
-        # still far above it means the model cannot describe the data at all
-        # -- emission outside --fov being the usual cause.  The residual is
-        # then model error, not sky, and fitting points to it produces
-        # nonsense: on the out-of-field test it returned an 11.5 Jy "source"
-        # in a 0.09 Jy field, at 76 sigma.
+    # A mesh fit far above the target means the model cannot describe the data,
+    # and fitting points to that residual can produce nonsense: on the
+    # out-of-field test it returned an 11.5 Jy "source" in a 0.09 Jy field, at
+    # 76 sigma. This used to be a pre-emptive skip, but that got the causality
+    # backwards -- an unmodelled compact source is itself one of the commonest
+    # reasons chi^2 is high, and refusing to fit it guarantees the fit stays
+    # bad. The demo is exactly that case: a 4 mJy point no 24x24 mesh can hold
+    # puts the fit at chi^2/N = 2.87, and the skip then withheld the one thing
+    # that would have fixed it.
+    #
+    # So fit, then judge the answer -- which is testable in a way the
+    # precondition is not. A real point explains the excess and has a sane
+    # flux; the out-of-field artefact explains little and is many times the
+    # field's own flux.
+    speculative = (
+        bool(point_sources)
+        and mfs_fit.chi_squared / (2 * len(d)) > 2.0 * chi2_target
+    )
+    if speculative:
         logger.warning(
-            "skipping point-source fitting: the pixelized model sits at "
-            "chi^2/N = %.4g against a target of %.3g, so the residual is "
-            "model error rather than sky and any point fitted to it would be "
-            "spurious. Fix the fit first (usually --fov).",
+            "the pixelized model sits at chi^2/N = %.4g against a target of "
+            "%.3g. Fitting point components anyway, since an unmodelled "
+            "compact source is a common cause of exactly this -- but the "
+            "result will be discarded unless it explains the excess and has "
+            "a credible flux.",
             mfs_fit.chi_squared / (2 * len(d)), chi2_target,
         )
-    elif point_sources:
+    if point_sources:
         from .pointsource import fit_point_sources
 
         positions = point_sources if isinstance(point_sources, list) else None
@@ -443,7 +512,39 @@ def run(
                 if refit_solution.points:
                     mfs_fit, point_solution = mfs_refit, refit_solution
 
-        if point_solution.points:
+        if speculative and point_solution.points:
+            # Judge the answer, now that there is one to judge. Two tests, both
+            # of which the out-of-field artefact fails badly and a real point
+            # passes easily.
+            before = mfs_fit.chi_squared / (2 * len(d))
+            after = point_solution.chi_squared / (2 * len(d))
+            extended = float(
+                np.sum(np.clip(np.asarray(point_solution.mesh_values), 0.0, None))
+            )
+            point_flux = point_solution.total_point_flux
+            explained = (before - after) / max(before - chi2_target, 1e-30)
+            plausible = point_flux <= POINT_FLUX_SANITY * max(extended, 1e-30)
+            if explained >= POINT_EXPLAINED_FRACTION and plausible:
+                logger.info(
+                    "  the point components explain %.0f%% of the excess "
+                    "chi^2 (%.3f -> %.3f) and carry %.4g Jy against the "
+                    "extended model's %.4g Jy: keeping them",
+                    100 * explained, before, after, point_flux, extended,
+                )
+            else:
+                logger.warning(
+                    "discarding the fitted point component(s): they explain "
+                    "%.0f%% of the excess chi^2 (%.3f -> %.3f) and carry "
+                    "%.4g Jy against the extended model's %.4g Jy. That is "
+                    "the signature of fitting structure the mesh cannot "
+                    "describe -- emission outside --fov is the usual cause -- "
+                    "rather than of a real source. Fix the fit first (usually "
+                    "--fov).",
+                    100 * explained, before, after, point_flux, extended,
+                )
+                point_solution = None
+
+        if point_solution is not None and point_solution.points:
             from .pointsource import PointAugmentedFit
 
             mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
@@ -541,7 +642,7 @@ def run(
         uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
         transformer, oversample, dish, pb_factor, pb_correction, mfs_fit, scan,
         envelope=envelope, point_solution=point_solution,
-        prior_thin=prior_thin,
+        prior_thin=prior_thin, inversion=inversion,
     )
     written = {}
     if write:
@@ -599,7 +700,7 @@ def _fit_summary(fit) -> _FitSummary:
 def _parameter_record(
     uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
     transformer, oversample, dish, pb_factor, pb_correction, fit, scan,
-    envelope=None, point_solution=None, prior_thin=1,
+    envelope=None, point_solution=None, prior_thin=1, inversion="dense",
 ) -> dict:
     """Every parameter that defined this run, for the record and for reuse."""
     return {
@@ -653,6 +754,7 @@ def _parameter_record(
                 if fit is not None else positive_only
             ),
             "transformer": transformer,
+            "inversion": inversion,
             "jax": fitting.jax_available(),
         },
         "primary_beam": {

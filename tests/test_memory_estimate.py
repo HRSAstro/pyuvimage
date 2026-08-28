@@ -197,3 +197,45 @@ def test_the_cube_numbers_are_the_ones_that_were_measured():
     assert estimate_peak_memory_gb(613_512, 729) == pytest.approx(20.1, abs=0.3)
     assert estimate_peak_memory_gb(613_512 // 8, 729) == pytest.approx(2.9, abs=0.2)
 
+
+
+# --- what the process is already holding ------------------------------------
+#
+# A fit estimated at 2.1 GB against "6.9 GB available" was killed on an 8 GB
+# laptop. The estimate of the allocation was right (1.88 GB measured); what
+# was missing from the budget was the gigabyte the process was already
+# holding -- interpreter, numpy, autoarray, and JAX with its own arena, all
+# resident before the first mapping matrix exists.
+
+
+def test_the_budget_includes_what_is_already_resident(monkeypatch, caplog):
+    from pyuvimage import fitting
+
+    monkeypatch.setattr(fitting, "current_memory_gb", lambda: 1.2)
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 6.9)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        fitting.check_memory(148_477, 256)
+    assert "already resident" in caplog.text
+    # 1.2 resident + ~1.7 to allocate, reported as one number
+    line = next(l for l in caplog.text.splitlines() if "already resident" in l)
+    assert "1.2 GB already resident" in line
+
+
+def test_resident_memory_is_reported_in_gb():
+    """ru_maxrss is kB on Linux and bytes on macOS; either way this is GB and
+    a running interpreter is more than nothing and less than a terabyte."""
+    from pyuvimage import fitting
+
+    held = fitting.current_memory_gb()
+    assert 0.001 < held < 1000.0
+
+
+def test_a_resident_process_can_tip_a_fit_over(monkeypatch, caplog):
+    """The case that was killed: it fits on paper and not in practice."""
+    from pyuvimage import fitting
+
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 2.5)
+    monkeypatch.setattr(fitting, "current_memory_gb", lambda: 1.2)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        fitting.check_memory(148_477, 256)
+    assert "may be killed outright" in caplog.text

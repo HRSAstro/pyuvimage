@@ -259,6 +259,27 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_fit.add_argument(
+        "--inversion", default="dense", choices=["dense", "sparse"],
+        help=(
+            "how the curvature matrix is built. dense (default) forms the "
+            "n_vis x n_mesh mapping matrix, which is what limits large "
+            "datasets. sparse uses the w-tilde formalism: one streaming pass "
+            "over the visibilities builds a small translation-invariant "
+            "kernel, and the fit then costs the same whether the dataset has "
+            "10^5 visibilities or 10^8. It is exact, not an approximation -- "
+            "identical chi^2 to eight figures on Ruby, ~85x faster. Needs "
+            "JAX, is mfs-only, and cannot be combined with --point-sources"
+        ),
+    )
+    p_fit.add_argument(
+        "--kernel-cache", default=None, metavar="DIR",
+        help="--inversion sparse only: where to keep w-tilde kernels "
+        "(default: beside the output). The kernel depends only on the uv "
+        "coverage, the noise and the geometry, so re-fitting the same field "
+        "with different regularisation reuses it and skips the one expensive "
+        "step -- the same trick as CASA's cfcache",
+    )
+    p_fit.add_argument(
         "--cube-prior", default="channel", choices=["channel", "mfs"],
         help="cube mode only: what the shared prior is fitted on. channel "
         "(default) uses a random 1-in-n_chan subset -- the same amount of "
@@ -402,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
                else {'adapt_power': args.adapt_power}),
             criterion=args.criterion,
             cube_prior=args.cube_prior,
+            inversion=args.inversion,
+            kernel_cache=args.kernel_cache,
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
             enforce_positive=args.enforce_positive,

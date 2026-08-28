@@ -176,3 +176,55 @@ def test_chunking_is_costed_at_the_block_size_not_the_whole_stack(monkeypatch):
     whole = fitting.transformer_memory_gb(ag.TransformerNUFFT, 148_477, 400)
     split = fitting.transformer_memory_gb(chunked, 148_477, 400)
     assert split < whole / 100
+
+
+# --- is the JAX branch reachable at all? -----------------------------------
+#
+# Hannah, on seeing pynufft chosen on every dataset: "it seems likely that the
+# jax nufft will never be invoked. is this expected?" It is, and structurally
+# rather than by tuning -- the two thresholds do not overlap:
+#
+#   the DFT gives up at      n_vis x n_mesh > 2.5e7   (1e8 / oversample^2)
+#   the JAX gather fits at   n_vis x n_mesh <= 1.9e5  (on a 4.7 GB machine)
+#
+# 133x apart. These tests pin that gap so that if either constant moves, the
+# consequence for the JAX path is visible rather than silent.
+
+
+def test_the_two_thresholds_do_not_overlap_on_a_laptop(jax_and_pynufft, monkeypatch):
+    """A sweep over plausible (mesh, n_vis): `auto` never picks the JAX NUFFT."""
+    import autogalaxy as ag
+
+    for have in (4.7, 16.0, 64.0):
+        monkeypatch.setattr(fitting, "available_memory_gb", lambda have=have: have)
+        for mesh in (8, 12, 16, 20, 26, 32, 40, 50, 64, 80, 100, 140):
+            for n_vis in (10**3, 10**4, 10**5, 10**6, 10**7):
+                cls = fitting.resolve_transformer(
+                    n_vis=n_vis, n_image_pixels=(2 * mesh) ** 2,
+                    n_mesh_pixels=mesh * mesh,
+                )
+                assert not (
+                    isinstance(cls, type) and issubclass(cls, ag.TransformerNUFFT)
+                ), f"{have} GB, mesh {mesh}, {n_vis} vis picked {cls.__name__}"
+
+
+def test_the_ram_needed_before_the_jax_branch_opens_is_absurd():
+    """Quantifies the gap rather than just asserting it: the machine would
+    need hundreds of GB before `auto` could ever reach the JAX NUFFT."""
+    per_element = fitting.nufftax_gather_gb(1, 1)
+    dft_boundary = fitting.DFT_MAX_PRODUCT / 4  # oversample 2
+    ram = dft_boundary * per_element / fitting.NUFFTAX_GATHER_BUDGET
+    assert ram > 500.0, f"only {ram:.0f} GB -- has a constant moved?"
+
+
+def test_forcing_it_is_still_possible(monkeypatch):
+    """Unreachable by `auto` is not the same as removed: `--transformer nufft`
+    still gets there, chunked."""
+    import autogalaxy as ag
+
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 4.7)
+    cls = fitting.resolve_transformer(
+        n_vis=613_512, transformer="nufft", n_image_pixels=3600,
+        n_mesh_pixels=900,
+    )
+    assert issubclass(cls, ag.TransformerNUFFT)

@@ -322,9 +322,11 @@ See [docs/large-datasets.md](docs/large-datasets.md).
 dominant step — transforming the mapping matrix — is the one step the JAX NUFFT
 cannot do at these sizes: it batches every mesh pixel into a single `nufft2d2`
 whose gather buffer runs to hundreds of GB. `--transformer auto` therefore
-picks `pynufft` for large fits, and every figure above is on that path. `pip
+picks `pynufft` — always, in fact: the two thresholds are 133x apart, so no
+laptop-sized machine ever reaches the JAX branch. Every figure above is on the
+pynufft path. `pip
 install pynufft` is the install that matters for speed here; the arithmetic is
-in [docs/parameters.md](docs/parameters.md#why-auto-usually-picks-pynufft-over-jax).
+in [docs/parameters.md](docs/parameters.md#why-auto-never-picks-the-jax-nufft).
 
 **Averaging the data down first is usually the bigger win**, up to the point
 where bandwidth and time-average smearing set in — see
@@ -397,6 +399,6 @@ Full discussion: [docs/noise.md](docs/noise.md).
 
 ## Development
 
-`python -m pytest tests/` — 301 tests, including end-to-end regressions on
+`python -m pytest tests/` — 307 tests, including end-to-end regressions on
 simulated data (adjoint consistency, flux conservation, WCS, restore centring,
 the noise estimator, and one test per bug listed in the docs above).

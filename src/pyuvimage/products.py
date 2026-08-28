@@ -371,7 +371,7 @@ def _summary_png_cube(rows, geometry, path, freqs, ext, n_panels, note):
         ("resid", "residual", r"$\sigma$", "RdBu_r", lim("resid", True)),
     ]
     if "unc" in stacks:
-        cols.append(("unc", "1$\sigma$ uncertainty", "Jy/pixel", "viridis",
+        cols.append(("unc", r"1$\sigma$ uncertainty", "Jy/pixel", "viridis",
                      lim("unc")))
     cols = cols[:n_panels]
 
@@ -405,7 +405,7 @@ def _summary_png_cube(rows, geometry, path, freqs, ext, n_panels, note):
                 ax.set_yticklabels([])
             if key == "resid":
                 rmax = float(np.nanmax(np.abs(stacks["resid"][i])))
-                ax.text(0.03, 0.03, f"max {rmax:.1f}$\sigma$",
+                ax.text(0.03, 0.03, rf"max {rmax:.1f}$\sigma$",
                         transform=ax.transAxes, fontsize=8, color="k",
                         bbox=dict(fc="white", ec="none", alpha=0.7, pad=1.5))
 

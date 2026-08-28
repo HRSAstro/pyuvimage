@@ -56,6 +56,8 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 |---|---|---|
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
 | `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
+| `--inversion` | **dense** | How the curvature matrix `F` is built. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT. Exact, not an approximation — identical `chi^2` to eight significant figures on Ruby, and ~85x faster. Needs JAX; MFS only; cannot be combined with `--point-sources`. See below. |
+| `--kernel-cache` | beside the output | `--inversion sparse` only: where w-tilde kernels are kept. The kernel depends on the uv coverage, the noise and the geometry and nothing else, so re-fitting the same field with different regularisation reuses it. |
 | `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with a shared prior — see `--cube-prior`. |
 | `--cube-prior` | **channel** | Cube mode only: what the shared prior is fitted on. `channel` uses a random 1-in-`n_chan` subset of the visibilities — the same amount of data each channel fit will have, and `n_chan` times cheaper. `mfs` uses every channel's visibilities at once, which is the single step that makes a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass). See below. |
 | `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
@@ -95,7 +97,7 @@ non-negative, but the prior may have little effect on it — which is the
 trade-off the automatic fallback exists to avoid.
 
 
-## Why `auto` usually picks pynufft over JAX
+## Why `auto` never picks the JAX NUFFT
 
 The JAX NUFFT is the faster transform and the worse *transformer* for this
 job, because of one line in how the mapping matrix is transformed.
@@ -129,10 +131,34 @@ consults `chunk_size`.
 pynufft has no equivalent: its mapping-matrix transform is a loop over mesh
 pixels that never holds more than one column. So `--transformer auto` compares
 the JAX buffer against available memory and takes pynufft when it will not
-fit, saying so in the log. `--transformer nufft` still forces JAX, but the
-mapping-matrix transform is then split into blocks small enough to survive —
-correct, and considerably slower, since it multiplies the NUFFT calls on
-*every* trial of the hyperparameter search.
+fit, saying so in the log.
+
+**In practice that is always.** The two thresholds do not overlap, and not by a
+little:
+
+| | condition |
+|---|---|
+| the DFT gives up when | `n_vis × n_image_pixels > 1e8`, i.e. `n_vis × n_mesh > 2.5e7` at `oversample 2` |
+| the JAX gather fits when | `n_vis × n_mesh ≤ 1.9e5` on a 4.7 GB machine |
+
+A factor of 133 apart. Raising the memory does not help much either, since the
+gap is fixed: **a window opens only on a machine with ~627 GB of RAM**, and
+even then only for meshes of 8–16 pixels a side. A brute-force sweep over
+`(mesh, n_vis)` at 4.7, 16 and 64 GB finds no combination where `auto` picks
+it.
+
+So the JAX NUFFT is reachable only through an explicit `--transformer nufft`,
+where the mapping-matrix transform is split into blocks small enough to
+survive — correct, and considerably slower than pynufft, since it multiplies
+the NUFFT calls on *every* trial of the hyperparameter search. The memory
+check stays because it is the right general mechanism: if upstream ever makes
+`transform_mapping_matrix` honour `chunk_size`, the JAX path becomes reachable
+again with no change here.
+
+**None of this makes JAX pointless.** It is required by autoarray's w-tilde
+(`InversionInterferometerSparse`) path, which sidesteps the mapping matrix
+altogether and is where the real gain is — see the CASA comparison in the
+project notes. JAX's value to us is the inversion, not the transform.
 
 None of this affects the DFT path, `--transformer pynufft`, or JAX's use
 anywhere else in the fit.
@@ -180,3 +206,74 @@ single channel may be nearly empty.
 **Costs**, on Ruby CO(7-6) at `--fov 3` (613,512 samples, 8 channels, 27x27
 mesh): 2.9 GB for the prior pass and each channel fit, against 20.1 GB for the
 MFS pass. `pyuvimage fit` reports both figures before allocating anything.
+
+
+## The sparse (w-tilde) inversion
+
+`--inversion sparse` changes how `F = M^T N^-1 M` is computed, and nothing
+else. The image, the criterion, the regularisation and the products are all
+identical — on Ruby 200 GHz continuum (fov 3, mesh 16, matern, coefficient
+1e8) the two paths give `chi^2 = 305200.43` and total fluxes agreeing to seven
+significant figures. What changes is what it costs:
+
+| | dense | sparse |
+|---|---|---|
+| Ruby continuum, fov 3, mesh 16 | 25.4 s | **0.3 s** |
+| largest allocation | `n_vis x n_mesh` mapping matrix | `n_image x chunk_k` streaming buffer |
+| Ruby CO(7-6) that allocation | 21.6 GB | 0.10 MB kernel |
+| scales with the number of visibilities | yes | **no** |
+
+The last row is the whole point, and it is the lesson taken from CASA's
+`tclean`: stream the data onto a fixed-size grid rather than holding a matrix
+whose size is the data. A dataset ten times larger costs ten times the *time*
+in the kernel build and not one byte more memory. `chunk_k` — how many
+visibilities are accumulated at once — trades the two against each other and
+is chosen automatically to keep the build inside a quarter of available
+memory, so there is no knob to find.
+
+The kernel is the one expensive invariant of a run, and it depends only on the
+uv coverage, the noise and the geometry — never on the data values or the
+source prior. So it is cached on disk (`pyuvimage-<key>.wtilde.npy`, beside
+the output unless `--kernel-cache` says otherwise) and a re-fit of the same
+field with different regularisation skips straight past it. This is CASA's
+`cfcache` idea, doing the same job.
+
+The noise is in the cache key, not just the uv coordinates, and that matters
+in practice: `--image-centre` recentres the field by an exact phase ramp,
+which leaves every uv coordinate untouched while pooling the real and
+imaginary sigmas. A key built on uv alone would hand the recentred fit a
+stale kernel, and it would look perfectly healthy.
+
+**Where the ceiling moves to.** The sparse path takes the data out of the
+memory bill and leaves the model in it: `F` is `n_mesh^2`, so the limit on a
+sparse fit is `--mesh`, not the size of the measurement set. Below about a
+64x64 mesh the curvature matrix is not even the largest allocation — the
+padded FFT batch is. Above it, `--mesh` is the only lever that matters.
+
+**A scale trap, now guarded.** `apply_sparse_operator` builds the data vector
+through `transformer.image_from(..., use_adjoint_scaling=True)`, while `W̃` is
+accumulated straight from `1/σ²`. pynufft's adjoint carries its own internal
+IFFT normalisation, so without that argument it comes back a factor
+`4·N_y·N_x` low — and `D` and `F` end up on different scales. The symptom is
+nasty precisely because it isn't an error: the reconstruction keeps the right
+morphology at a tiny fraction of the right amplitude, the residual map retains
+almost all of the source, and `χ²` stops depending on the coefficient at all,
+so the hyperparameter search has nothing to bisect and runs to its ceiling.
+pyuvimage now checks the transformer against `TransformerDFT` on a small
+synthetic problem before every sparse fit and refuses to continue if they
+disagree.
+
+**Three things it will not do.**
+
+* **It needs JAX.** The kernel build is pure NumPy, but the operator itself
+  (`Khat`, and the FFT convolution that applies it) is `jax.numpy`. There is
+  no fallback; `--inversion dense` needs nothing.
+* **It refuses `--point-sources`.** Not for correctness — for cost. Point
+  components are solved as a bordered system, and its cross-terms between the
+  mesh columns and the point columns need `operated_mapping_matrix`: the dense
+  `n_vis × n_mesh` build that the w-tilde path exists to avoid (21.6 GB on
+  Ruby CO(7-6)). Asking for both would give up the entire benefit and most
+  likely be OOM-killed, so pyuvimage raises and asks which one to drop.
+* **It is MFS only.** Each channel has its own uv coverage *in wavelengths*,
+  so a cube needs a kernel per channel. That is wiring, not physics, and it is
+  not done yet.

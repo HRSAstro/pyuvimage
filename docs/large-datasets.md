@@ -138,6 +138,18 @@ Because `n_mesh` goes as `fov²`, recentring is the single biggest lever:
 
 Same data, same resolution, seven times less memory.
 
+### Or take the data out of the bill entirely
+
+Everything above is about making `n_vis × n_mesh` small enough to hold.
+`--inversion sparse` (experimental) removes that matrix altogether: one
+streaming pass over the visibilities builds a small kernel, and the memory
+then depends on the image size and the mesh but **not** on the number of
+visibilities. Ruby continuum at fov 3, mesh 16: 0.3 s and ~1.7 GB against
+25.4 s dense, for an identical `chi^2`. It needs JAX, is MFS only, and cannot
+be combined with `--point-sources` — see
+[parameters.md](parameters.md#the-sparse-w-tilde-inversion). Where it applies,
+it is the answer to this whole section.
+
 ### Averaging the data down
 
 **Averaging the data down first is usually the bigger win.** A modern dataset
