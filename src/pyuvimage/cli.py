@@ -267,8 +267,10 @@ def main(argv: list[str] | None = None) -> int:
             "over the visibilities builds a small translation-invariant "
             "kernel, and the fit then costs the same whether the dataset has "
             "10^5 visibilities or 10^8. It is exact, not an approximation -- "
-            "identical chi^2 to eight figures on Ruby, ~85x faster. Needs "
-            "JAX, is mfs-only, and cannot be combined with --point-sources"
+            "exact, not an approximation. Works in cube mode too, where it "
+            "builds one kernel per channel -- the same total work as one MFS "
+            "kernel, since each streams only its own channel. Needs JAX, and "
+            "cannot yet be combined with --point-sources"
         ),
     )
     p_fit.add_argument(

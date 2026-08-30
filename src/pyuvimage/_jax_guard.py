@@ -129,3 +129,54 @@ def report_if_disabled() -> None:
     _REPORTED = True
     kind, _, detail = DISABLED_REASON.partition(": ")
     logger.warning(MESSAGE, kind, detail)
+
+
+def enable_double_precision() -> None:
+    """Ask JAX for float64, before anything imports it.
+
+    JAX defaults to 32-bit. The PyAuto stack knows this and ships
+    `autonerves.jax_wrapper` (imported as `autoconf.jax_wrapper` at the top of
+    the autolens_workspace scripts, before every other import) which sets
+    `JAX_ENABLE_X64=True` and says double precision "is required for most
+    scientific computing applications". pyuvimage never imported it, so every
+    JAX code path here ran in single precision.
+
+    That is nearly invisible until it isn't. The sparse inversion builds the
+    curvature matrix through JAX, and on Ruby it announced itself only as
+    three UserWarnings from `inversion_interferometer_util`::
+
+        Explicitly requested dtype float64 requested in zeros is not
+        available, and will be truncated to dtype float32
+
+    F, its regularised copy and the solve were all float32 -- about seven
+    decimal digits for a matrix whose condition number is not small, and no
+    hope of matching the dense NumPy path to better than that.
+
+    The environment variable is the mechanism because it has to be set before
+    `import jax`; `jax.config.update` after the fact does not retrofit arrays
+    that already exist. `setdefault` so an explicit choice is never overridden.
+    """
+    import os
+
+    if "JAX_ENABLE_X64" not in os.environ:
+        os.environ["JAX_ENABLE_X64"] = "True"
+
+
+def jax_double_precision_active() -> bool | None:
+    """Whether JAX is actually in 64-bit mode, or None if JAX is absent.
+
+    Read at the point of use rather than assumed: a caller who imported JAX
+    before pyuvimage gets whatever they configured, and the environment
+    variable we set arrived too late to matter.
+    """
+    try:  # pragma: no cover - environment dependent
+        import jax
+    except Exception:
+        return None
+    try:
+        return bool(jax.config.jax_enable_x64)
+    except Exception:
+        try:
+            return bool(jax.config.read("jax_enable_x64"))
+        except Exception:
+            return None

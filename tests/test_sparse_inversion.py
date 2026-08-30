@@ -301,13 +301,45 @@ def test_sparse_refuses_point_sources(tmp_path):
         api.run(**_run_kwargs(tmp_path, point_sources=True))
 
 
-def test_sparse_refuses_cube_mode(tmp_path):
-    """Each channel has its own uv coverage in wavelengths, so each needs its
-    own kernel. Not wired up, so say so rather than silently reusing one."""
+def test_sparse_accepts_cube_mode(tmp_path, caplog):
+    """Cube mode is supported, and the guard that refused it is gone.
+
+    Each channel's uv coordinates are the same baselines in metres scaled by
+    its own frequency, so each needs its own kernel. That is cheap rather than
+    expensive: a channel's build streams only that channel's visibilities, so
+    n_chan builds over n_vis/n_chan each total one pass over the dataset --
+    the same work as the single MFS kernel.
+
+    This only checks that the guard no longer fires and that the cost is
+    explained; the fit itself needs JAX, which this environment lacks.
+    """
+    import logging
+
     from pyuvimage import api
 
-    with pytest.raises(ValueError, match="mfs-only"):
-        api.run(**_run_kwargs(tmp_path, n_chan=4, mode="cube"))
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        with pytest.raises((RuntimeError, ValueError)) as excinfo:
+            api.run(**_run_kwargs(tmp_path, n_chan=4, mode="cube"))
+    # whatever stops it, it must not be the old mfs-only refusal
+    assert "mfs-only" not in str(excinfo.value)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "one w-tilde kernel per channel" in text
+
+
+def test_the_per_channel_kernels_key_apart(tmp_path):
+    """The cache needs no channel index: scaling uv by the channel frequency
+    changes the hash on its own. If it did not, every channel would silently
+    reuse the first channel's kernel."""
+    rng = np.random.default_rng(0)
+    uvw = rng.normal(0, 100.0, (256, 2))
+    noise = np.full(256, 0.1 + 0.1j)
+    g = _Geom()
+    C = 299792458.0
+    keys = {
+        fitting.sparse_kernel_key(uvw * (f / C), noise, g)
+        for f in (2.30e11, 2.31e11, 2.32e11)
+    }
+    assert len(keys) == 3
 
 
 def test_inversion_is_recorded_in_the_parameter_file():
@@ -408,3 +440,157 @@ def test_no_operator_is_not_an_error(monkeypatch):
     _patched(monkeypatch, want)
     ds = _FakeDataset(want, sparse_operator=None)
     assert fitting.repair_sparse_dirty_image(ds, _FakeDataset(want)) is ds
+
+
+# --------------------------------------------------------------------------
+# The w-tilde reduction assumes sigma_re == sigma_im
+# --------------------------------------------------------------------------
+#
+# Confirmed by autoarray: unequal real and imaginary sigmas degrade agreement
+# between the sparse and dense paths generally, not just for particular
+# blocks. The asymmetry enters twice and differently -- `W~` is accumulated
+# from `noise_map_real` alone, while the data vector's dirty image weights the
+# two parts separately -- so `F` and `D` end up on different weightings.
+#
+# `--image-centre` pools them in quadrature, which removes the discrepancy and
+# is independently the better noise estimate (twice the sample size), so a
+# recentred fit satisfies the assumption exactly. These tests cover the rest.
+
+def test_equal_sigmas_pass_quietly(caplog):
+    import logging
+
+    noise = np.full(64, 0.1 + 0.1j)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        assert fitting.warn_on_reim_asymmetry(noise) == pytest.approx(0.0)
+    assert caplog.records == []
+
+
+def test_unequal_sigmas_are_reported_with_their_size(caplog):
+    """Ruby unrecentred reads 9%. The number belongs in the message: it bounds
+    how well the two paths can be expected to agree."""
+    import logging
+
+    noise = np.full(64, 0.10 + 0.11j)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        asym = fitting.warn_on_reim_asymmetry(noise)
+    assert asym == pytest.approx(0.0952, rel=1e-2)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "9.5%" in text
+    assert "--image-centre" in text
+
+
+def test_a_recentred_dataset_satisfies_the_assumption_exactly():
+    """Recentring is the fix, so check it actually equalises them."""
+    from pyuvimage import uvdata
+
+    rng = np.random.default_rng(0)
+    n_vis = 128
+    uvd = uvdata.UVData(
+        uvw=rng.normal(0, 100.0, (n_vis, 3)),
+        frequencies=np.array([2.3e11]),
+        data=rng.normal(size=(1, n_vis)) + 1j * rng.normal(size=(1, n_vis)),
+        noise=np.full((1, n_vis), 0.10 + 0.11j),
+        meta={},
+    )
+    assert uvdata.reim_asymmetry(uvd.noise) > 0.09
+    shifted = uvdata.shift_image_centre(uvd, (0.5, -0.5))
+    assert uvdata.reim_asymmetry(shifted.noise) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_asymmetry_measure_survives_unusable_noise():
+    from pyuvimage import uvdata
+
+    assert uvdata.reim_asymmetry(np.zeros(8, dtype=complex)) == 0.0
+    assert uvdata.reim_asymmetry(np.full(8, np.nan + 1j * np.nan)) == 0.0
+
+
+# --------------------------------------------------------------------------
+# JAX must be in 64-bit mode
+# --------------------------------------------------------------------------
+#
+# JAX defaults to float32. The PyAuto stack knows this and ships
+# `autonerves.jax_wrapper` (imported as `autoconf.jax_wrapper` at the top of
+# the autolens_workspace scripts, before every other import) which sets
+# JAX_ENABLE_X64=True because double precision "is required for most
+# scientific computing applications". pyuvimage never imported it.
+#
+# Measured on Ruby with autoarray 2026.8.29.1: three UserWarnings from
+# inversion_interferometer_util saying a requested float64 was "truncated to
+# dtype float32" -- for `vals`, for `C0`, and for `F` itself. The curvature
+# matrix, its regularised copy and the solve were all single precision.
+
+def test_importing_pyuvimage_asks_jax_for_float64():
+    """The environment variable is the mechanism, and it has to be set before
+    `import jax` -- `jax.config.update` afterwards does not retrofit arrays
+    that already exist."""
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "JAX_ENABLE_X64"}
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import os; import pyuvimage; print(os.environ['JAX_ENABLE_X64'])"],
+        capture_output=True, text=True, env=env,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip().lower() == "true"
+
+
+def test_the_setting_happens_before_the_guard_imports_jax():
+    """Ordering is the whole fix, and it is one line away from breaking.
+
+    `disable_broken_jax()` does `import jax` at package-import time -- that is
+    its entire purpose, to get in ahead of the PyAuto packages' on-disk check.
+    But JAX reads JAX_ENABLE_X64 when it is imported, so our own guard was
+    what pinned it to 32-bit: `autonerves.jax_wrapper` sets the variable when
+    autogalaxy loads it, which is after we have already imported JAX, and by
+    then it changes nothing.
+
+    Swapping these two calls back would restore the bug and no test that
+    merely checks the final value of the variable would notice, because
+    autonerves sets it to True either way.
+    """
+    import inspect
+
+    import pyuvimage
+
+    src = inspect.getsource(pyuvimage)
+    assert src.index("enable_double_precision()") < src.index(
+        "disable_broken_jax()"
+    ), "the 64-bit setting must be in the environment before JAX is imported"
+
+
+def test_single_precision_is_reported(monkeypatch, caplog):
+    import logging
+
+    from pyuvimage import _jax_guard
+
+    monkeypatch.setattr(_jax_guard, "jax_double_precision_active", lambda: False)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        assert fitting.warn_on_single_precision() is False
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "32-bit" in text and "JAX_ENABLE_X64" in text
+
+
+def test_double_precision_passes_quietly(monkeypatch, caplog):
+    import logging
+
+    from pyuvimage import _jax_guard
+
+    monkeypatch.setattr(_jax_guard, "jax_double_precision_active", lambda: True)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        assert fitting.warn_on_single_precision() is True
+    assert caplog.records == []
+
+
+def test_absent_jax_is_not_a_warning(monkeypatch, caplog):
+    """No JAX means no sparse path at all; a precision warning would be noise."""
+    import logging
+
+    from pyuvimage import _jax_guard
+
+    monkeypatch.setattr(_jax_guard, "jax_double_precision_active", lambda: None)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        assert fitting.warn_on_single_precision() is None
+    assert caplog.records == []

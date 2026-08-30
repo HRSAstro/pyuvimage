@@ -253,20 +253,37 @@ def run(
         # CO(7-6)). So the fit would be correct, would allocate exactly what
         # the user chose --inversion sparse to escape, and would most likely
         # be OOM-killed. Refuse, and say which of the two to give up.
+        # Unblocked upstream, not yet wired up here: autoarray has added the
+        # mapper-function and function-function block methods to
+        # `InterferometerSparseOperator`, so this restriction is ours to
+        # remove rather than theirs. See docs/sparse-analytic-components.md --
+        # in particular that the operator already carries the inverse-variance
+        # weighting, so columns go in un-weighted, unlike our own bordered
+        # system and unlike the imaging operator.
         if point_sources:
             raise ValueError(
-                "--inversion sparse cannot yet fit point sources. The point "
+                "--inversion sparse cannot yet fit point sources. Our point "
                 "components are solved as a bordered system whose cross-terms "
                 "need the dense operated mapping matrix (n_vis x n_mesh) -- "
                 "the one allocation the w-tilde path exists to avoid, so "
-                "asking for both gives up the entire benefit. Use "
+                "asking for both would give up the entire benefit. autoarray "
+                "now provides the sparse block methods that make this "
+                "unnecessary; wiring them up here is pending. For now use "
                 "--inversion dense, or drop --point-sources."
             )
-        if mode == "cube":
-            raise ValueError(
-                "--inversion sparse is mfs-only for now: every channel has "
-                "its own uv coverage in wavelengths and so needs its own "
-                "w-tilde kernel, which is not wired up yet."
+        if mode == "cube" and uvd.n_chan > 1:
+            # Each channel's uv coordinates are the same metres scaled by its
+            # own frequency, so each needs its own kernel. That sounds
+            # expensive and is not: a channel's build streams only that
+            # channel's visibilities, so n_chan builds over n_vis/n_chan each
+            # come to one pass over the dataset -- the same total work as the
+            # single MFS kernel, in the same fixed memory.
+            logger.info(
+                "cube mode: building one w-tilde kernel per channel (%d of "
+                "them). Each streams only its own channel's visibilities, so "
+                "the total is one pass over the dataset -- the same work as "
+                "the single MFS kernel, at %d x the (small) kernel storage.",
+                uvd.n_chan, uvd.n_chan,
             )
         reason = fitting.sparse_inversion_diagnosis()
         if reason is not None:
@@ -340,11 +357,16 @@ def run(
     mfs_dataset = fitting.make_dataset(
         uv, d, n, geometry, transformer_cls, mask_shape=mask_shape
     )
+    # Hoisted: cube mode needs the same directory once per channel.
+    if kernel_cache is not None:
+        kernel_cache_dir = kernel_cache
+    elif out is not None:
+        kernel_cache_dir = Path(out).parent
+    else:
+        kernel_cache_dir = None
     if inversion == "sparse":
         mfs_dataset = fitting.with_sparse_operator(
-            mfs_dataset, uv, n, geometry,
-            cache_dir=kernel_cache if kernel_cache is not None else Path(out).parent
-            if out is not None else None,
+            mfs_dataset, uv, n, geometry, cache_dir=kernel_cache_dir,
         )
     logger.info("fitting MFS image (%d visibility samples)...", len(d))
     # The natural correlation length of a Gaussian-process source prior is
@@ -414,6 +436,11 @@ def run(
         nu=nu, fixed_scale=beam_scale, envelope=envelope,
         optimise_envelope=locals().get("optimise_env", False),
         chi2_target=chi2_target,
+        # With point components to come, a high chi^2 here is expected rather
+        # than alarming -- an unmodelled compact source is the commonest
+        # reason for it. The warning after the point fit judges the model the
+        # user actually gets.
+        warn_on_chi2=not point_sources,
     )
     # Optional analytic point components, solved in the same linear system.
     # Opt-in: never added unless asked for, and auto-detected candidates are
@@ -501,6 +528,14 @@ def run(
                     positive_only=positive_only, prior=None, nu=nu,
                     fixed_scale=beam_scale, envelope=envelope_np,
                     chi2_target=chi2_target,
+                    warn_on_chi2=False,  # the point fit follows; see above
+                    # Was omitted here, and this is the fit that gets kept
+                    # whenever point components are found -- so
+                    # --enforce-positive was silently ignored on exactly the
+                    # runs that use it. Measured on the demo: both with and
+                    # without the flag the delivered model had ~70 negative
+                    # mesh pixels.
+                    enforce_positive=enforce_positive,
                 )
                 refit_solution = _fit_points(mfs_refit)
             except Exception as e:
@@ -547,6 +582,23 @@ def run(
         if point_solution is not None and point_solution.points:
             from .pointsource import PointAugmentedFit
 
+            if positive_only:
+                # `PointExtendedSystem.solve` eliminates the mesh block with a
+                # Cholesky solve -- `cho_solve`, unconstrained -- so the mesh
+                # values that come back with point components present are not
+                # non-negative, whatever was asked for. Measured on the demo:
+                # 0 negative mesh pixels without points, 78 with them (0.59%
+                # of the flux) even under --enforce-positive.
+                #
+                # Say so rather than silently returning a model that does not
+                # satisfy the constraint the user set.
+                logger.warning(
+                    "positivity does not extend to the mesh once point "
+                    "components are fitted: the bordered system is solved by "
+                    "Cholesky elimination, which is unconstrained, so the "
+                    "delivered mesh may contain small negative values. The "
+                    "point amplitudes themselves are unaffected."
+                )
             mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
             logger.info(
                 "  %d point source(s), total %.4g Jy; chi2/N now %.3f",
@@ -620,6 +672,13 @@ def run(
                 uv_c, d_c, n_c, geometry, transformer_cls,
                 mask_shape=mask_shape
             )
+            if inversion == "sparse":
+                # This channel's own kernel. `sparse_kernel_key` hashes the uv
+                # coordinates and the noise, so the channels key apart on
+                # their own and the cache needs no channel index.
+                ds_c = fitting.with_sparse_operator(
+                    ds_c, uv_c, n_c, geometry, cache_dir=kernel_cache_dir,
+                )
             sf = fitting.fit_dataset(
                 ds_c, geometry, reg_kind=reg, prior=frozen,
                 positive_only=positive_only, enforce_positive=enforce_positive,

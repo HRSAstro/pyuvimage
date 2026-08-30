@@ -397,3 +397,79 @@ def test_the_demo_recovers_its_point_source(caplog):
     # and the fit it was blocking must actually converge
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "explain" in text and "keeping them" in text
+
+
+def test_positivity_not_extending_to_the_mesh_is_stated(caplog):
+    """The mesh solve is unconstrained once point components are present.
+
+    `PointExtendedSystem.solve` eliminates the mesh block with `cho_solve`,
+    which has no non-negative option, so the mesh values that come back are
+    not constrained however positivity was set. Measured on the demo mock:
+
+        points off, --enforce-positive     0 negative mesh pixels
+        points on,  --enforce-positive    78 negative mesh pixels (0.59%)
+
+    Fixing that means a constrained solve of the bordered system, which is
+    real work. Until then the honest thing is to say it, because a user who
+    passed --enforce-positive and got negatives has been told something
+    untrue by silence.
+    """
+    import logging
+
+    import pyuvimage
+    from pyuvimage.mock import make_demo_dataset
+
+    uvd, *_ = make_demo_dataset(point_flux_jy=0.004)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        res = pyuvimage.run(
+            uvd, fov=3.0, point_sources=True, positive_only=True,
+            enforce_positive=True, uncertainty_map=False, write=False,
+        )
+    assert res.products[0].points, "the demo's point source was not recovered"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "positivity does not extend to the mesh" in text
+
+
+def test_no_such_warning_without_point_components():
+    """Positivity does hold when the mesh is solved on its own -- so the
+    warning must not fire there and teach users to ignore it."""
+    import logging
+
+    import pyuvimage
+    from pyuvimage.mock import make_demo_dataset
+
+    uvd, *_ = make_demo_dataset(point_flux_jy=0.0)
+    with caplog_at(logging.WARNING) as records:
+        res = pyuvimage.run(
+            uvd, fov=3.0, point_sources=False, positive_only=True,
+            enforce_positive=True, uncertainty_map=False, write=False,
+        )
+    mesh = np.asarray(res.products[0].model_mesh)
+    assert (mesh >= 0).all(), "positivity was requested and not delivered"
+    assert not any(
+        "positivity does not extend" in r.getMessage() for r in records
+    )
+
+
+class caplog_at:
+    """Minimal log capture, so this test does not depend on fixture order."""
+
+    def __init__(self, level):
+        self.level = level
+        self.records = []
+
+    def __enter__(self):
+        import logging
+
+        self._handler = logging.Handler()
+        self._handler.emit = self.records.append
+        self._logger = logging.getLogger("pyuvimage")
+        self._logger.addHandler(self._handler)
+        self._old = self._logger.level
+        self._logger.setLevel(self.level)
+        return self.records
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._old)
+        return False

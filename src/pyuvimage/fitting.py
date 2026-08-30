@@ -101,6 +101,14 @@ MAX_LOG_COEFFICIENT = 18.0
 # on both large datasets k=2 lands within 0.1% of where the independent
 # `structure` criterion puts the coefficient (Ruby 1.0233 vs 1.0225,
 # 9io9 1.0321 vs 1.0298), which is a strong sign it is the right scale.
+#: Smallest relative change in the reconstruction, between regularisation
+#: coefficients twelve decades apart, that counts as the prior having any
+#: effect at all. Below this the non-negative solver is ignoring it. A working
+#: prior changes the model by order 1 across that range -- on Ruby the
+#: structure ratio runs 0.228 to 3.51 -- so 1% is far below anything healthy
+#: and well above solver noise.
+POSITIVITY_PRIOR_RESPONSE = 0.01
+
 CHI2_FLOOR_SIGMAS = 2.0
 # Fallback when the sample count is unknown, and a cap so that a very small
 # dataset -- where sqrt(2/N) is large -- cannot be given unlimited slack.
@@ -632,6 +640,19 @@ def check_memory(
             "them %d at a time onto a fixed %d-pixel grid",
             need, held, n_vis, chunk_k, n_image_pixels,
         )
+        if n_chan and n_chan > 1:
+            # The dense path's cube warning is about one pass over every
+            # channel dwarfing the per-channel fits. There is no such pass
+            # here: the estimate above is already per channel, and it is the
+            # same for every channel because it depends on the image and the
+            # mesh, not on how many visibilities the channel holds.
+            logger.info(
+                "  and the same for each of the %d channels: on the sparse "
+                "path the cube costs no more memory than one channel, only "
+                "more time. Each channel's kernel streams only its own "
+                "visibilities, so the %d builds total one pass over the "
+                "dataset.", n_chan, n_chan,
+            )
         if have is not None and need > have:
             logger.warning(
                 "estimated peak memory (%.1f GB) exceeds what looks "
@@ -1097,6 +1118,8 @@ def with_sparse_operator(
     if reason is not None:
         raise RuntimeError(reason)
     assert_adjoint_scale_consistent(type(dataset.transformer))
+    warn_on_reim_asymmetry(noise)
+    warn_on_single_precision()
 
     key = sparse_kernel_key(uv_wavelengths, noise, geometry)
     path = sparse_kernel_cache_path(cache_dir, key)
@@ -1144,6 +1167,105 @@ def with_sparse_operator(
         nufft_precision_operator=kernel, batch_size=batch_size
     )
     return repair_sparse_dirty_image(sparse, dataset)
+
+
+#: Median re/im noise asymmetry above which the sparse path is worth a word.
+#: Ruby reads 9% unrecentred, which is estimator scatter rather than anything
+#: physical, but it is still a real inconsistency in the linear system.
+SPARSE_REIM_ASYMMETRY_WARN = 0.02
+
+
+def _model_response(fit_fn, weak_coefficient, strong_coefficient):
+    """Relative change in the reconstruction between two prior strengths.
+
+    None when either fit cannot be made or the models are not comparable --
+    an unknown response must never be read as "no response", or a solver
+    failure would masquerade as the pathology and switch positivity off.
+    """
+    models = []
+    for coefficient in (weak_coefficient, strong_coefficient):
+        try:
+            fit = fit_fn(coefficient)
+            models.append(np.asarray(fit.inversion.reconstruction, dtype=float))
+            del fit
+        except Exception:
+            return None
+    weak, strong = models
+    if weak.shape != strong.shape:
+        return None
+    scale = float(np.linalg.norm(weak))
+    if scale <= 0:
+        return None
+    return float(np.linalg.norm(strong - weak)) / scale
+
+
+def warn_on_single_precision() -> bool | None:
+    """Say so if JAX is in 32-bit mode, which silently halves the solve.
+
+    `pyuvimage/__init__.py` sets `JAX_ENABLE_X64` before JAX is imported, so
+    this normally passes. It can still fail: a caller who imported JAX first
+    gets whatever they configured, and by then the environment variable is
+    too late.
+
+    The consequence is not subtle once you know to look for it -- the sparse
+    curvature matrix, its regularised copy and the solve all drop to float32,
+    roughly seven decimal digits for a matrix whose condition number is not
+    small -- but nothing announces it except three UserWarnings from deep
+    inside autoarray about a requested float64 being "truncated to float32".
+    """
+    from ._jax_guard import jax_double_precision_active
+
+    active = jax_double_precision_active()
+    if active is False:
+        logger.warning(
+            "JAX is in 32-bit mode, so the sparse curvature matrix and its "
+            "solve will be built in float32 -- about seven decimal digits, "
+            "against the dense path's sixteen. Set JAX_ENABLE_X64=True "
+            "before importing JAX (importing pyuvimage first does this for "
+            "you), or expect the two paths to agree only to ~1e-7 at best."
+        )
+    return active
+
+
+def warn_on_reim_asymmetry(noise) -> float:
+    """Say so when sigma_re != sigma_im, which the w-tilde reduction assumes.
+
+    The asymmetry is not symmetric in its effects, so to speak: `W~` is
+    accumulated from `noise_map_real` **alone**
+
+        nufft_precision_operator_from(noise_map_real=self.noise_map.array.real, ...)
+
+    while the data vector's dirty image weights the two parts separately
+
+        data.real * noise.real**-2 + 1j * data.imag * noise.imag**-2
+
+    so `F` and `D` are built on different weightings whenever the sigmas
+    differ, and the solution of `(F + H)s = D` is correspondingly off.
+    autoarray confirms this degrades agreement with the dense path on the
+    sparse route generally, not merely for particular blocks.
+
+    `--image-centre` pools the two in quadrature (see
+    `uvdata.shift_image_centre`), which is both the fix and, by the argument
+    in `uvdata._report_reim_asymmetry`, the better noise estimate anyway --
+    twice the sample size. So a recentred fit satisfies the assumption
+    exactly, and most real fits are recentred. This warns about the rest.
+    """
+    from .uvdata import reim_asymmetry
+
+    asymmetry = reim_asymmetry(noise)
+    if asymmetry > SPARSE_REIM_ASYMMETRY_WARN:
+        logger.warning(
+            "sigma_re and sigma_im differ by %.1f%% (median), and the "
+            "w-tilde reduction assumes they are equal: it builds the "
+            "curvature matrix from sigma_re alone while the data vector "
+            "weights the two separately, so the sparse and dense paths will "
+            "not agree to better than about that. Recentring the field "
+            "(--image-centre) pools them in quadrature, which removes the "
+            "discrepancy and is the better noise estimate in any case; "
+            "--inversion dense is unaffected either way.",
+            100.0 * asymmetry,
+        )
+    return asymmetry
 
 
 def scaled_dirty_image(dataset) -> np.ndarray:
@@ -2239,7 +2361,17 @@ def fit_dataset(
     optimise_envelope: bool = False,
     chi2_target: float = 1.0,
     adapt_image=None,
+    warn_on_chi2: bool = True,
 ) -> SingleFit:
+    """Fit one dataset, optimising the source prior unless `prior` is given.
+
+    `warn_on_chi2=False` suppresses the "does not reproduce the data" warning
+    for a fit that is an intermediate stage rather than the answer. The demo
+    is the case: its 4 mJy point source is one no mesh can hold, so every
+    mesh-only pass sits at chi^2/N ~ 2.9 and told the user three times that
+    the products should not be trusted -- before the point fit that brings it
+    to 1.000. The caller that knows more is the one that should speak.
+    """
     """Fit one Interferometer dataset (one channel, or the MFS stack).
 
     ``prior`` fixes the source-prior hyperparameters (keys ``coefficient``
@@ -2294,6 +2426,18 @@ def fit_dataset(
             except Exception:
                 return np.nan
 
+        def _probe_model(coefficient, positive):
+            """The reconstruction itself, which is what the prior acts on."""
+            try:
+                fit = fit_at(
+                    dataset, mesh_shape, reg_kind, coefficient,
+                    positive_only=positive, **probe_kwargs)
+                model = np.asarray(fit.inversion.reconstruction, dtype=float)
+                del fit  # the fit holds the transformed mapping matrix
+                return model
+            except Exception:
+                return None
+
         free = _probe(1.0, False)
         constrained = _probe(1.0, True)
         n_vis = len(np.asarray(dataset.data))
@@ -2308,21 +2452,39 @@ def fit_dataset(
             )
         else:
             # Second, independent symptom: the solver *ignores* the prior.
-            # Compare two strengths twelve decades apart -- no real prior can
-            # give the same chi^2 at both.  This is what the single-point
-            # comparison above misses, and it is the common failure: on a
-            # coarse-beam mock every coefficient from 1e-6 to 5.9 returned
-            # chi^2/N = 1.159 to four figures.
-            weak, strong = _probe(1e-3, True), _probe(1e9, True)
+            # Compare two strengths twelve decades apart -- but compare the
+            # **reconstruction**, not chi^2.
+            #
+            # This used to test chi^2, and that was wrong. chi^2 being
+            # insensitive to the coefficient is a normal property of
+            # well-constrained data, not a symptom: on Ruby (439 data points
+            # per model pixel) chi^2 moves 0.4% across twelve decades while
+            # the model changes out of all recognition -- the structure ratio
+            # runs 0.228 to 3.51 over the same range. The old test fired on
+            # every such dataset and silently disabled positivity on a fit
+            # where the prior was working perfectly well.
+            #
+            # The claim in the message is about the prior's effect on the
+            # solution, so measure that. A solver that is genuinely ignoring
+            # the prior returns the same model at both ends; a working one
+            # cannot.
+            weak_m = _probe_model(1e-3, True)
+            strong_m = _probe_model(1e9, True)
             if (
-                np.isfinite(weak) and np.isfinite(strong) and weak > 0
-                and abs(strong - weak) / weak < 0.01
+                weak_m is not None and strong_m is not None
+                and weak_m.shape == strong_m.shape
             ):
-                reason = (
-                    f"it returns the same chi^2 ({weak:.4g}) for "
-                    f"regularisation strengths twelve decades apart, so it is "
-                    f"ignoring the prior entirely"
+                scale = float(np.linalg.norm(weak_m))
+                change = (
+                    float(np.linalg.norm(strong_m - weak_m)) / scale
+                    if scale > 0 else 0.0
                 )
+                if change < POSITIVITY_PRIOR_RESPONSE:
+                    reason = (
+                        f"the reconstruction changes by only {100 * change:.2g}% "
+                        f"between regularisation strengths twelve decades "
+                        f"apart, so it is ignoring the prior entirely"
+                    )
         if reason is not None and enforce_positive:
             logger.warning(
                 "the non-negative solver looks unreliable on this data: %s. "
@@ -2450,26 +2612,36 @@ def fit_dataset(
             # Second, stronger check on the non-negative solver.  The probe
             # above compares it with the unconstrained solve at a single
             # coefficient, and that misses the case where it merely *ignores*
-            # the prior: here every trial spanning many decades of coefficient
-            # returned chi^2/N = 1.448 to four figures, which no real prior
-            # can do.  Detect a flat response and fall back.
-            # tried[0] is the coefficient the *unconstrained* search chose,
-            # so it sits apart from the rest; judge the flatness on the
-            # constrained bisection trials alone.
+            # the prior: on one dataset every trial spanning many decades of
+            # coefficient returned the same answer, which no real prior can do.
+            #
+            # As with the earlier probe, judge the **reconstruction** and not
+            # chi^2. A flat chi^2 across the bisection is normal on
+            # well-constrained data -- Ruby moves 0.4% across twelve decades
+            # -- and testing it here disabled positivity on a fit whose prior
+            # was working, with the structure ratio running 0.228 to 3.51 over
+            # the same range.
+            # tried[0] is the coefficient the *unconstrained* search chose, so
+            # it sits apart from the rest; judge on the constrained trials.
             finite = [
                 (co, c) for co, c in tried[1:] if np.isfinite(c) and c > 0
             ]
-            if len(finite) >= 3:
-                spread = max(c for _, c in finite) / min(c for _, c in finite)
+            if len(finite) >= 3 and not enforce_positive:
                 decades = np.ptp(np.log10([co for co, _ in finite]))
-                if spread < 1.01 and decades > 3.0 and not enforce_positive:
+                lo_co = min(co for co, _ in finite)
+                hi_co = max(co for co, _ in finite)
+                change = _model_response(_fit, lo_co, hi_co)
+                if (
+                    decades > 3.0 and change is not None
+                    and change < POSITIVITY_PRIOR_RESPONSE
+                ):
                     logger.warning(
-                        "the non-negative solver returned the same chi^2 "
-                        "(%.4g) across %.0f decades of regularisation "
+                        "the non-negative solver's reconstruction changes by "
+                        "only %.2g%% across %.0f decades of regularisation "
                         "strength: it is ignoring the prior. Disabling "
                         "positivity for this fit; the model may contain "
                         "small negative values.",
-                        finite[0][1], decades,
+                        100 * change, decades,
                     )
                     positive_only = False
                     prior, scan = optimise_prior(
@@ -2484,7 +2656,7 @@ def fit_dataset(
 
     chi2_final = _chi_squared(fit)
     n_data_final = 2 * len(np.asarray(dataset.data))
-    if np.isfinite(chi2_final):
+    if np.isfinite(chi2_final) and warn_on_chi2:
         ratio = chi2_final / (chi2_target * n_data_final)
         if ratio > CHI2_UNREACHABLE_FACTOR:
             logger.warning(

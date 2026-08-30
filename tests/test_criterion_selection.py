@@ -79,8 +79,16 @@ def demo_geometry():
 
 
 class _FakeInversion:
-    def __init__(self, chi2):
+    def __init__(self, chi2, reconstruction=None):
         self.fast_chi_squared = chi2
+        # The positivity probe asks whether the *reconstruction* responds to
+        # the coefficient, not whether chi^2 does -- chi^2 being flat in the
+        # coefficient is normal on well-constrained data (Ruby: 0.4% across
+        # twelve decades) and is not by itself a symptom. So the fake has to
+        # carry a model too, or the probe sees nothing to judge.
+        self.reconstruction = (
+            np.zeros(4) if reconstruction is None else reconstruction
+        )
 
 
 class _FakeFit:
@@ -92,17 +100,27 @@ class _FakeFit:
     and the unconstrained one can.
     """
 
-    def __init__(self, chi2):
-        self.inversion = _FakeInversion(chi2)
+    def __init__(self, chi2, reconstruction=None):
+        self.inversion = _FakeInversion(chi2, reconstruction)
         self.figure_of_merit = -0.5 * chi2
 
 
 def _fake_fit_at(n_data, floor_free, floor_positive, gain=0.5):
+    """`gain` drives chi^2 *and* the model, together.
+
+    A solver ignoring the prior returns the same answer at every coefficient,
+    which is what `gain=0.0` now means: flat chi^2 and a frozen model. A
+    healthy one moves both.
+    """
     def fit_at(dataset, mesh_shape, reg_kind, coefficient, positive_only=True,
                **kwargs):
         floor = floor_positive if positive_only else floor_free
         c = float(coefficient)
-        return _FakeFit(n_data * (floor + gain * c / (c + 1e3)))
+        response = gain * c / (c + 1e3)
+        return _FakeFit(
+            n_data * (floor + response),
+            reconstruction=np.full(4, 1.0 + response),
+        )
     return fit_at
 
 
@@ -442,3 +460,73 @@ def test_auto_says_which_it_took_and_why(caplog):
         fitting.resolve_criterion("auto", 296_954, 676)
     assert "auto -> structure" in caplog.text
     assert "--criterion discrepancy to override" in caplog.text
+
+
+def test_a_flat_chi2_alone_does_not_disable_positivity(
+    monkeypatch, demo_geometry, caplog
+):
+    """The regression, from Ruby 200 GHz on the sparse path.
+
+    chi^2 being insensitive to the regularisation coefficient is a normal
+    property of well-constrained data, not a broken solver. At 439 data points
+    per model pixel Ruby's chi^2 moves 0.4% across twelve decades of
+    coefficient -- under the old 1% threshold -- while the model changes out
+    of all recognition over the same range, the structure ratio running from
+    0.228 to 3.51. The probe concluded the solver was "ignoring the prior
+    entirely" and silently switched positivity off on a fit where the prior
+    was working perfectly.
+
+    So: a model that responds means the prior is being applied, however flat
+    chi^2 is.
+    """
+    import logging
+
+    dataset, geometry = demo_geometry
+    n_data = 2 * len(np.asarray(dataset.data))
+
+    def fit_at(dataset_, mesh_shape, reg_kind, coefficient,
+               positive_only=True, **kwargs):
+        c = float(coefficient)
+        # chi^2 moves 0.4% across the whole range -- Ruby's number, and below
+        # the 1% the old test demanded
+        chi2 = n_data * (1.018 + 0.004 * c / (c + 1e3))
+        # ...but the model keeps moving, as a working prior must. Logarithmic
+        # rather than saturating: a Matern prior goes on smoothing as the
+        # coefficient grows, so the response must not flatten out at the top
+        # of the range where the bisection actually looks.
+        return _FakeFit(
+            chi2, reconstruction=np.full(4, 10.0 + np.log10(max(c, 1e-30)))
+        )
+
+    monkeypatch.setattr(fitting, "fit_at", fit_at)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        sf = fitting.fit_dataset(
+            dataset, geometry, reg_kind="constant", positive_only=True
+        )
+    assert sf.positive_only is True, "positivity was disabled on a healthy fit"
+    assert "ignoring the prior" not in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_a_frozen_model_still_disables_positivity(
+    monkeypatch, demo_geometry, caplog
+):
+    """The genuine pathology the probe exists for: same answer at every
+    coefficient. Fixing the false positive above must not cost the true one."""
+    import logging
+
+    dataset, geometry = demo_geometry
+    n_data = 2 * len(np.asarray(dataset.data))
+    monkeypatch.setattr(
+        fitting, "fit_at",
+        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
+    )
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        sf = fitting.fit_dataset(
+            dataset, geometry, reg_kind="constant", positive_only=True
+        )
+    assert sf.positive_only is False
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ignoring the prior" in text
+    assert "reconstruction changes by only" in text

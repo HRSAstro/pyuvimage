@@ -55,7 +55,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | Parameter | Default | Meaning |
 |---|---|---|
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
-| `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
+| `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. **Note:** positivity applies to the mesh-only solve. With `--point-sources`, the bordered system is eliminated by an unconstrained Cholesky solve, so the delivered mesh may contain small negative values whatever this is set to (measured on the demo: 0 negative mesh pixels without points, 78 carrying 0.59% of the flux with them). The point amplitudes are unaffected. pyuvimage warns when this applies. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
 | `--inversion` | **dense** | How the curvature matrix `F` is built. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT. Exact, not an approximation — identical `chi^2` to eight significant figures on Ruby, and ~85x faster. Needs JAX; MFS only; cannot be combined with `--point-sources`. See below. |
 | `--kernel-cache` | beside the output | `--inversion sparse` only: where w-tilde kernels are kept. The kernel depends on the uv coverage, the noise and the geometry and nothing else, so re-fitting the same field with different regularisation reuses it. |
 | `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with a shared prior — see `--cube-prior`. |
@@ -263,7 +263,16 @@ pyuvimage now checks the transformer against `TransformerDFT` on a small
 synthetic problem before every sparse fit and refuses to continue if they
 disagree.
 
-**Three things it will not do.**
+**It assumes σ_re = σ_im.** The `W̃` kernel is accumulated from the real
+part's sigma alone, while the data vector weights the real and imaginary parts
+separately — so where the two differ, `F` and `D` are built on different
+weightings and the sparse and dense paths will not agree to better than about
+that difference. `--image-centre` pools the sigmas in quadrature, so a
+recentred fit satisfies the assumption exactly (and gets the better noise
+estimate into the bargain); pyuvimage warns before a sparse fit when they
+differ by more than 2%.
+
+**Two things it will not do.**
 
 * **It needs JAX.** The kernel build is pure NumPy, but the operator itself
   (`Khat`, and the FFT convolution that applies it) is `jax.numpy`. There is
@@ -274,6 +283,11 @@ disagree.
   `n_vis × n_mesh` build that the w-tilde path exists to avoid (21.6 GB on
   Ruby CO(7-6)). Asking for both would give up the entire benefit and most
   likely be OOM-killed, so pyuvimage raises and asks which one to drop.
-* **It is MFS only.** Each channel has its own uv coverage *in wavelengths*,
-  so a cube needs a kernel per channel. That is wiring, not physics, and it is
-  not done yet.
+* ~~It is MFS only.~~ **Cube mode works.** Each channel's uv coordinates are
+  the same baselines in metres scaled by its own frequency, so each channel
+  needs its own kernel — but a channel's build streams only that channel's
+  visibilities, so `n_chan` builds over `n_vis/n_chan` each come to one pass
+  over the dataset: the same total work as the single MFS kernel. Memory is
+  per-channel and identical to a single-channel fit, because it depends on the
+  image and the mesh rather than on how many visibilities a channel holds. The
+  kernel cache keys on uv and noise, so the channels separate on their own.

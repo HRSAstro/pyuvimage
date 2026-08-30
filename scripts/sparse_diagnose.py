@@ -60,6 +60,30 @@ def main() -> None:
         len(d), geom.mesh_shape, geom.shape_native,
     )
 
+    # ---- 0. what this autoarray provides --------------------------------
+    import autoarray
+    from autoarray.inversion.inversion.interferometer import (
+        inversion_interferometer_util as iiu,
+        sparse as isparse,
+    )
+    from autoarray.dataset.interferometer.dataset import Interferometer
+
+    log.info("0. autoarray %s", getattr(autoarray, "__version__", "unknown"))
+    op_cls = iiu.InterferometerSparseOperator
+    for name in ("curvature_matrix_diag_from",
+                 "curvature_matrix_off_diag_from",
+                 "curvature_matrix_off_diag_func_list_from"):
+        log.info("   InterferometerSparseOperator.%-42s %s", name,
+                 "yes" if hasattr(op_cls, name) else "NO")
+    src = __import__("inspect").getsource(isparse)
+    log.info("   interferometer/sparse.py dispatches on func lists:   %s",
+             "yes" if "AbstractLinearObjFuncList" in src else "NO")
+    passes = "use_adjoint_scaling=True" in __import__("inspect").getsource(
+        Interferometer.apply_sparse_operator
+    )
+    log.info("   apply_sparse_operator passes use_adjoint_scaling:    %s",
+             "yes" if passes else "NO (pyuvimage repairs this)")
+
     # ---- 1. which transformer -------------------------------------------
     cls = fitting.resolve_transformer(
         n_vis=len(d), transformer="auto",

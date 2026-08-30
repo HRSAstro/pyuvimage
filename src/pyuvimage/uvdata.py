@@ -867,6 +867,22 @@ def shift_image_centre(
 REIM_ASYMMETRY_WARN = 0.25
 
 
+def reim_asymmetry(noise: np.ndarray) -> float:
+    """Median fractional disagreement between sigma_re and sigma_im.
+
+    Returns 0.0 when there is nothing usable to measure. Split out from the
+    reporting below because the sparse inversion needs the number, not a log
+    line: its `W~` reduction assumes the two are equal.
+    """
+    a = np.asarray(noise)
+    re, im = np.abs(a.real), np.abs(a.imag)
+    ok = np.isfinite(re) & np.isfinite(im) & (re > 0) & (im > 0)
+    if not np.any(ok):
+        return 0.0
+    asym = np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))
+    return float(np.nanmedian(asym))
+
+
 def _report_reim_asymmetry(noise: np.ndarray) -> None:
     """Say how far sigma_re and sigma_im disagree, and what that means.
 
