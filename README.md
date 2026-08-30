@@ -281,82 +281,32 @@ conda-forge with pip installs each do it too. If you would rather not use JAX,
 
 ## Run time and memory
 
-**There are two regimes, and `--inversion auto` picks between them at 5000
-visibilities.**
+Two paths, chosen by `--inversion auto` at 5000 visibilities:
 
-Below that, and on any fit forced to `--inversion dense`, both scale with
-**`n_vis × n_mesh_pixels`** — the transformed mapping matrix, built once per
-hyperparameter trial, dominating everything else. Note what is *not* in that
-product: the size of the output image. Making the products finer is nearly
-free; more visibilities or a larger field are not.
+| | limited by | Ruby at 200 GHz (148k samples, 26×26 mesh) |
+|---|---|---|
+| **sparse** (≥5000 vis) | `--mesh`, as `n_mesh²` | ~1.1 GB, independent of visibility count |
+| **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
 
-Above it, `auto` uses the **sparse (w-tilde) inversion**, and the visibility
-count drops out of the memory entirely. One streaming pass builds a small
-kernel, and the peak is `n_image_pixels × chunk_k` — Ruby's 148,477 samples
-fit in ~1.1 GB regardless of how many visibilities there are, against 3.8 GB
-dense at the same mesh. What limits a sparse fit instead is `--mesh`, because
-the curvature matrix is `n_mesh²`. It needs JAX, and `auto` falls back to
-dense (saying so) when JAX is absent, when `--point-sources` is requested, or
-when the real and imaginary noise differ by more than 5%.
+Sparse needs JAX; `auto` falls back to dense and says so when it is missing,
+when `--point-sources` is requested, or when the real and imaginary noise
+differ by more than 5%. On the dense path `pip install pynufft` is what makes
+it fast. A full fit is roughly 30–40 hyperparameter trials, doubled for the
+default `adaptive` prior; Ruby above is ~30 s sparse and tens of minutes dense.
 
-The sparse path is **new and not yet verified against dense on identical
-code**, so the figures below — all measured on the dense path — remain the
-ones with a track record. `--inversion dense` forces it.
+**Two levers, in order of effect:**
 
-Small fits, on 2 CPU cores with the NumPy backend, matern prior, no
-uncertainty map:
+1. **Average the data down first**, up to the point where bandwidth and
+   time-average smearing set in. A modern dataset carries far more channels
+   and time samples than a small field needs — see
+   [docs/large-datasets.md](docs/large-datasets.md#averaging-the-data-down).
+2. **Recentre on the source** (`--image-centre`). Cost goes as `fov²`, so
+   reaching a source from the phase centre is expensive: Ruby at `--fov 8`
+   needs ~32 GB at Nyquist on the dense path, and the same data recentred at
+   `--fov 3` needs ~4.4 GB *at the same resolution*.
 
-| model pixels | mesh | time | peak RSS |
-|---|---|---|---|
-| 1024 | 32×32 | 17 s | 0.3 GB |
-| 2304 | 48×48 | 53 s | 0.4 GB |
-| 4096 | 64×64 | 88 s | 0.6 GB |
-
-(3000 visibility samples; the default `adaptive` prior runs two passes, so
-roughly doubles these, and the uncertainty map adds more again.)
-
-Real data, same machine. **PJ0116 at 245 GHz** (5,158 samples, 50×50 mesh,
-`--fov 8`): 20 min for `matern` with the default criterion, 26 min with
-`--criterion structure`, and ~43 min for the default `adaptive` — two passes —
-with the uncertainty map. How many hyperparameter trials the search needs
-varies, so treat these as the scale rather than a specification.
-
-**Ruby at 200 GHz** (148,477 samples, `--fov 8`) is 29× more visibilities, and
-shows what the mesh then costs, per hyperparameter trial:
-
-| mesh | pixel scale | per trial | peak RSS |
-|---|---|---|---|
-| 16×16 | 0.50″ | 12 s | 1.9 GB |
-| 24×24 | 0.33″ | 25 s | 3.8 GB |
-| 32×32 | 0.25″ | ~44 s | ~6.7 GB |
-| 70×70 | 0.11″ (Nyquist) | ~210 s | ~32 GB |
-
-A full fit is roughly 30–40 trials, doubled for `adaptive`.
-
-**Recentring is the biggest single lever**, because `n_mesh` goes as `fov²`:
-Ruby at `--fov 8` from the phase centre needs ~32 GB at Nyquist, and the same
-data recentred on the ring at `--fov 3` needs ~4.4 GB *at the same resolution*.
-See [docs/large-datasets.md](docs/large-datasets.md).
-
-**The JAX NUFFT is not the answer to the table above.** On the dense path the
-dominant step — transforming the mapping matrix — is the one step it cannot do
-at these sizes: it batches every mesh pixel into a single `nufft2d2` whose
-gather buffer runs to hundreds of GB. `--transformer auto` therefore picks
-`pynufft` — always, in fact: the two thresholds are 133x apart, so no
-laptop-sized machine ever reaches the JAX branch. Every figure above is on the
-pynufft path, and `pip install pynufft` is the install that matters for dense
-speed. The arithmetic is in
-[docs/parameters.md](docs/parameters.md#why-auto-never-picks-the-jax-nufft).
-
-**JAX still matters, for a different reason:** the sparse inversion needs it,
-and the sparse path never transforms a mapping matrix at all, so the gather
-buffer that rules the JAX NUFFT out never arises there. On a dataset above the
-5000-visibility threshold, having JAX installed is what lets `auto` take the
-path where the table above stops applying.
-
-**Averaging the data down first is usually the bigger win**, up to the point
-where bandwidth and time-average smearing set in — see
-[docs/large-datasets.md](docs/large-datasets.md#averaging-the-data-down).
+Making the output products finer is nearly free either way — the image size is
+not in either scaling law.
 
 ## Noise
 
