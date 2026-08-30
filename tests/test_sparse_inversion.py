@@ -594,3 +594,105 @@ def test_absent_jax_is_not_a_warning(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
         assert fitting.warn_on_single_precision() is None
     assert caplog.records == []
+
+
+# --------------------------------------------------------------------------
+# `--inversion auto`
+# --------------------------------------------------------------------------
+#
+# Sparse above 5000 visibilities, dense below -- but only where sparse can
+# deliver the same answer. Every fallback below is a case where dense is
+# faster, better conditioned, or the only one that works. An explicit
+# `--inversion sparse` still raises rather than falling back: a user who asked
+# for it by name wants to know it could not be given.
+
+def test_auto_takes_dense_on_a_small_dataset(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        got = fitting.resolve_inversion("auto", n_vis=4999)
+    assert got == "dense"
+    assert "below the 5000" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_auto_takes_sparse_above_the_threshold(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        got = fitting.resolve_inversion("auto", n_vis=5000)
+    assert got == "sparse"
+    assert "does not scale with the data" in "\n".join(
+        r.getMessage() for r in caplog.records
+    )
+
+
+def test_the_threshold_is_inclusive_at_5000(monkeypatch):
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    assert fitting.resolve_inversion("auto", n_vis=5000) == "sparse"
+    assert fitting.resolve_inversion("auto", n_vis=4999) == "dense"
+
+
+def test_auto_avoids_sparse_when_point_sources_are_wanted(monkeypatch):
+    """Sparse cannot fit them yet, and auto must not turn that into an error."""
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    assert fitting.resolve_inversion(
+        "auto", n_vis=10**6, point_sources=True
+    ) == "dense"
+
+
+def test_auto_falls_back_when_sparse_is_unavailable(monkeypatch, caplog):
+    """No JAX must degrade, not crash -- and must say which half is missing."""
+    import logging
+
+    monkeypatch.setattr(
+        fitting, "sparse_inversion_diagnosis", lambda: "the sparse inversion needs JAX"
+    )
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        got = fitting.resolve_inversion("auto", n_vis=10**6)
+    assert got == "dense"
+    assert "needs JAX" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_auto_avoids_sparse_on_unequal_sigmas(monkeypatch):
+    """The W~ reduction assumes sigma_re == sigma_im and degrades roughly in
+    proportion to the difference; dense has no such assumption. Ruby reads 9%
+    unrecentred and 0% recentred."""
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    unequal = np.full(64, 0.10 + 0.11j)
+    equal = np.full(64, 0.10 + 0.10j)
+    assert fitting.resolve_inversion(
+        "auto", n_vis=10**6, noise=unequal) == "dense"
+    assert fitting.resolve_inversion(
+        "auto", n_vis=10**6, noise=equal) == "sparse"
+
+
+def test_auto_falls_back_on_a_scale_inconsistent_transformer(monkeypatch):
+    """The condition that produced the 231 sigma fit. Under `auto` it is a
+    reason to use dense, not to stop."""
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+
+    def bad(_cls):
+        raise RuntimeError("does not honour use_adjoint_scaling")
+
+    monkeypatch.setattr(fitting, "assert_adjoint_scale_consistent", bad)
+    assert fitting.resolve_inversion(
+        "auto", n_vis=10**6, transformer_cls=object) == "dense"
+
+
+@pytest.mark.parametrize("choice", ["dense", "sparse"])
+def test_an_explicit_choice_is_returned_untouched(choice, monkeypatch):
+    """No silent downgrade of something the user named -- the guards in
+    api.run raise instead, so the reason reaches them."""
+    monkeypatch.setattr(
+        fitting, "sparse_inversion_diagnosis", lambda: "no JAX"
+    )
+    assert fitting.resolve_inversion(
+        choice, n_vis=1, point_sources=True) == choice
+
+
+def test_an_unknown_inversion_is_still_rejected():
+    with pytest.raises(ValueError, match="unknown inversion"):
+        fitting.resolve_inversion("wtilde", n_vis=10)

@@ -56,7 +56,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 |---|---|---|
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
 | `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. **Note:** positivity applies to the mesh-only solve. With `--point-sources`, the bordered system is eliminated by an unconstrained Cholesky solve, so the delivered mesh may contain small negative values whatever this is set to (measured on the demo: 0 negative mesh pixels without points, 78 carrying 0.59% of the flux with them). The point amplitudes are unaffected. pyuvimage warns when this applies. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
-| `--inversion` | **dense** | How the curvature matrix `F` is built. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT. Exact, not an approximation — identical `chi^2` to eight significant figures on Ruby, and ~85x faster. Needs JAX; MFS only; cannot be combined with `--point-sources`. See below. |
+| `--inversion` | **auto** | How the curvature matrix `F` is built. `auto` takes `sparse` at or above 5000 visibilities and `dense` below, and falls back to `dense` whenever sparse cannot give the same answer — JAX missing, `--point-sources` requested, a transformer whose adjoint is not scale-consistent, or σ_re and σ_im differing by more than 5% — logging which and why. Naming `sparse` explicitly raises instead of falling back. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT, so its cost stops depending on the number of visibilities. Works in MFS and cube mode. Needs JAX and cannot yet be combined with `--point-sources`. Experimental: it has not yet been compared against `dense` under conditions that would establish they agree. See below. |
 | `--kernel-cache` | beside the output | `--inversion sparse` only: where w-tilde kernels are kept. The kernel depends on the uv coverage, the noise and the geometry and nothing else, so re-fitting the same field with different regularisation reuses it. |
 | `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with a shared prior — see `--cube-prior`. |
 | `--cube-prior` | **channel** | Cube mode only: what the shared prior is fitted on. `channel` uses a random 1-in-`n_chan` subset of the visibilities — the same amount of data each channel fit will have, and `n_chan` times cheaper. `mfs` uses every channel's visibilities at once, which is the single step that makes a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass). See below. |
@@ -211,14 +211,14 @@ MFS pass. `pyuvimage fit` reports both figures before allocating anything.
 ## The sparse (w-tilde) inversion
 
 `--inversion sparse` changes how `F = M^T N^-1 M` is computed, and nothing
-else. The image, the criterion, the regularisation and the products are all
-identical — on Ruby 200 GHz continuum (fov 3, mesh 16, matern, coefficient
-1e8) the two paths give `chi^2 = 305200.43` and total fluxes agreeing to seven
-significant figures. What changes is what it costs:
+else — the image, the criterion, the regularisation and the products all
+follow the same code afterwards. In principle the two paths give the same
+answer; **that has not yet been demonstrated**, so treat the sparse path as
+experimental (see "What has and has not been verified" below). What changes
+is what it costs:
 
 | | dense | sparse |
 |---|---|---|
-| Ruby continuum, fov 3, mesh 16 | 25.4 s | **0.3 s** |
 | largest allocation | `n_vis x n_mesh` mapping matrix | `n_image x chunk_k` streaming buffer |
 | Ruby CO(7-6) that allocation | 21.6 GB | 0.10 MB kernel |
 | scales with the number of visibilities | yes | **no** |
@@ -249,6 +249,21 @@ memory bill and leaves the model in it: `F` is `n_mesh^2`, so the limit on a
 sparse fit is `--mesh`, not the size of the measurement set. Below about a
 64x64 mesh the curvature matrix is not even the largest allocation — the
 padded FFT batch is. Above it, `--mesh` is the only lever that matters.
+
+### What has and has not been verified
+
+Measured, on Ruby 200 GHz continuum (fov 3, mesh 26, recentred, `--reg
+adaptive`): `chi^2/N` = 1.022, structure ratio 1.00, largest residual 4.3σ,
+33 s end to end with the kernel served from cache. That is a healthy fit and
+it agrees with the dense figure of record — but the dense figure was taken on
+an earlier code version, so this is not a controlled comparison.
+
+Not measured: sparse against dense, same code, same data, in float64, at a
+coefficient that actually affects the model. Until that exists, `--inversion
+sparse` is experimental. An earlier claim in these docs of "identical `chi^2`
+to eight significant figures, ~85x faster" has been **withdrawn**: it came
+from a probe run at a coefficient above the top of the search range, which
+nulls the model on both paths, so it compared two near-zero reconstructions.
 
 **A scale trap, now guarded.** `apply_sparse_operator` builds the data vector
 through `transformer.image_from(..., use_adjoint_scaling=True)`, while `W̃` is

@@ -898,10 +898,16 @@ def resolve_transformer(
 # `F = A^T W~ A` is then assembled from sparse mapping triplets, a batch of
 # source-pixel columns at a time, with no dense matrix anywhere.
 #
-# Verified against the dense path on Ruby 200 GHz (fov 3, mesh 16, matern,
-# coefficient 1e8): chi^2 = 305200.43 both ways -- identical to eight
-# significant figures -- total flux agreeing to seven, and 0.3 s against
-# 25.4 s. Not an approximation; the same answer, ~85x faster.
+# NOT yet verified against the dense path. An earlier version of this comment
+# claimed "chi^2 = 305200.43 both ways, identical to eight significant
+# figures, 0.3 s against 25.4 s". That measurement was worthless: the probe
+# ran at a fixed coefficient of 1e8, above the top of the search range, which
+# nulls the model on *both* paths -- two near-zero reconstructions compared
+# and found equal. It is withdrawn. What has been measured since is a healthy
+# sparse fit on Ruby (chi^2/N = 1.022, structure ratio 1.00, residual 4.3
+# sigma), which agrees with the dense figure of record but was taken on
+# different code. A like-for-like comparison in float64, at a coefficient
+# that actually bites, is still owed.
 SPARSE_CHUNK_K = 4096       # visibilities per chunk while building W~
 SPARSE_BATCH_SIZE = 128     # source-pixel columns per batch while assembling F
 SPARSE_KERNEL_SUFFIX = ".wtilde.npy"
@@ -986,6 +992,87 @@ def sparse_chunk_k_for_budget(
         SPARSE_KERNEL_BUILD_ARRAYS * 8.0 * max(float(n_image_pixels), 1.0)
     )
     return int(max(SPARSE_CHUNK_K_MIN, min(float(chunk_k), math.floor(allowance))))
+
+
+#: Visibility count at or above which `--inversion auto` prefers the sparse
+#: w-tilde path. Below it the dense mapping matrix is small, already fast, and
+#: the one path with a long track record; above it the dense build is what
+#: costs the memory, and the sparse operator's cost stops depending on the
+#: data at all.
+SPARSE_AUTO_MIN_VISIBILITIES = 5000
+
+#: Above this median re/im noise asymmetry, `auto` stays on the dense path:
+#: the W~ reduction assumes sigma_re == sigma_im and degrades roughly in
+#: proportion to the difference, and dense has no such assumption. Recentring
+#: pools the two, so a recentred fit reads 0 here. Ruby unrecentred reads 9%.
+SPARSE_AUTO_MAX_ASYMMETRY = 0.05
+
+
+def resolve_inversion(
+    inversion: str,
+    n_vis: int,
+    point_sources=False,
+    transformer_cls=None,
+    noise=None,
+) -> str:
+    """Turn `auto` into `dense` or `sparse`, and say why.
+
+    `auto` prefers sparse on anything big enough for the dense mapping matrix
+    to be the thing that costs -- but only when sparse can actually deliver
+    the same answer. Every condition below is a case where dense is either
+    faster, better conditioned, or the only one that works, and an explicit
+    `--inversion sparse` still raises rather than falling back, because a user
+    who asked for it by name wants to know it could not be given.
+    """
+    if inversion not in ("auto", "dense", "sparse"):
+        raise ValueError(
+            f"unknown inversion {inversion!r}: 'auto', 'dense' or 'sparse'"
+        )
+    if inversion != "auto":
+        return inversion
+
+    def _dense(why):
+        logger.info("inversion auto -> dense: %s", why)
+        return "dense"
+
+    if n_vis < SPARSE_AUTO_MIN_VISIBILITIES:
+        return _dense(
+            f"only {n_vis} visibilities, below the {SPARSE_AUTO_MIN_VISIBILITIES} "
+            "at which the w-tilde path starts to pay for its kernel build. "
+            "Pass --inversion sparse to use it anyway"
+        )
+    if point_sources:
+        return _dense(
+            "point components were requested, and the sparse path cannot fit "
+            "them yet (their cross-terms need the dense mapping matrix)"
+        )
+    reason = sparse_inversion_diagnosis()
+    if reason is not None:
+        return _dense(reason)
+    if transformer_cls is not None:
+        try:
+            assert_adjoint_scale_consistent(transformer_cls)
+        except Exception as e:
+            return _dense(f"the transformer is not scale-consistent ({e})")
+    if noise is not None:
+        from .uvdata import reim_asymmetry
+
+        asymmetry = reim_asymmetry(noise)
+        if asymmetry > SPARSE_AUTO_MAX_ASYMMETRY:
+            return _dense(
+                f"sigma_re and sigma_im differ by {100 * asymmetry:.1f}%, and "
+                "the w-tilde reduction assumes they are equal -- dense has no "
+                "such assumption. Recentring (--image-centre) pools them"
+            )
+
+    logger.info(
+        "inversion auto -> sparse: %d visibilities, above the %d at which the "
+        "dense n_vis x n_mesh mapping matrix is the dominant cost. The "
+        "w-tilde path's cost does not scale with the data at all. Pass "
+        "--inversion dense to force the mapping-matrix path.",
+        n_vis, SPARSE_AUTO_MIN_VISIBILITIES,
+    )
+    return "sparse"
 
 
 def sparse_inversion_diagnosis() -> str | None:

@@ -88,7 +88,7 @@ def run(
     positive_only: bool = True,
     enforce_positive: bool = False,
     transformer: str = "auto",
-    inversion: str = "dense",
+    inversion: str = "auto",
     kernel_cache: str | None = None,
     mask_shape: str = "square",
     oversample: int = 2,
@@ -234,9 +234,15 @@ def run(
         n_mesh_pixels=n_pix,
     )
     # before anything large is allocated: an OOM kill prints nothing useful,
-    # so the moment to speak is while --mesh and --fov are still adjustable
-    if inversion not in ("dense", "sparse"):
-        raise ValueError(f"unknown inversion {inversion!r}: 'dense' or 'sparse'")
+    # so the moment to speak is while --mesh and --fov are still adjustable.
+    # `auto` is resolved here, once, so that everything downstream -- the
+    # memory report, the guards, fit_parameters.json -- sees the concrete
+    # choice rather than re-deriving it or recording "auto". The noise is the
+    # post-recentring one, which is what the w-tilde kernel would be built on.
+    inversion = fitting.resolve_inversion(
+        inversion, n_vis=uvd.n_samples, point_sources=point_sources,
+        transformer_cls=transformer_cls, noise=uvd.noise,
+    )
     if inversion == "sparse":
         # Not a correctness problem -- a performance cliff, and a total one.
         # Our point components are not autoarray linear objects; they are a

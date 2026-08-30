@@ -259,18 +259,20 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_fit.add_argument(
-        "--inversion", default="dense", choices=["dense", "sparse"],
+        "--inversion", default="auto", choices=["auto", "dense", "sparse"],
         help=(
-            "how the curvature matrix is built. dense (default) forms the "
-            "n_vis x n_mesh mapping matrix, which is what limits large "
-            "datasets. sparse uses the w-tilde formalism: one streaming pass "
-            "over the visibilities builds a small translation-invariant "
-            "kernel, and the fit then costs the same whether the dataset has "
-            "10^5 visibilities or 10^8. It is exact, not an approximation -- "
-            "exact, not an approximation. Works in cube mode too, where it "
-            "builds one kernel per channel -- the same total work as one MFS "
-            "kernel, since each streams only its own channel. Needs JAX, and "
-            "cannot yet be combined with --point-sources"
+            "how the curvature matrix is built. auto (default) takes sparse "
+            "above 5000 visibilities and dense below, and falls back to dense "
+            "whenever sparse cannot deliver the same answer -- no JAX, point "
+            "components requested, or unequal real/imaginary sigmas -- saying "
+            "which and why. dense forms the n_vis x n_mesh mapping matrix, "
+            "which is what limits large datasets. sparse uses the w-tilde "
+            "formalism: one streaming pass over the visibilities builds a "
+            "small translation-invariant kernel, and the fit then costs the "
+            "same whether the dataset has 10^5 visibilities or 10^8. Works in "
+            "cube mode, building one kernel per channel for the same total "
+            "work as one MFS kernel. Asking for sparse by name raises rather "
+            "than falling back"
         ),
     )
     p_fit.add_argument(
