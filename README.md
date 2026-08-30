@@ -20,10 +20,12 @@ pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
 
-Python ≥ 3.12. JAX is optional and the NumPy path is fully supported — see
-[docs/install.md](docs/install.md), which also covers building an **arm64**
-conda environment on Apple silicon, the one setup detail whose symptoms
-otherwise appear much later.
+Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but on
+datasets above 5000 visibilities it is what lets `--inversion auto` take the
+sparse path, which is where the memory ceiling comes off — without it every
+fit uses the dense mapping matrix. See [docs/install.md](docs/install.md),
+which also covers building an **arm64** conda environment on Apple silicon,
+the one setup detail whose symptoms otherwise appear much later.
 
 ## Use
 
@@ -98,6 +100,7 @@ to be left alone. These are the ones worth reaching for:
 | `--pixel-scale nyquist` | you want the longest baselines sampled — finer mesh, several times slower, and only worth it if the long baselines are well populated |
 | `--criterion structure` | rarely — `auto` already picks this on any well-constrained fit. Force it if the structure ratio the run prints is far from 1 while `chi^2/N` looks fine |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
+| `--inversion dense` | you want the long-established path on a big dataset. `auto` (the default) switches to the sparse w-tilde inversion above 5000 visibilities, which is where the dense mapping matrix starts to dominate — see [Run time and memory](#run-time-and-memory). The sparse path is new; force `dense` if you want to compare |
 | `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on a 1-in-`n_chan` subset by default (`--cube-prior`), which is what makes a cube affordable — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
 
 Full reference: [docs/parameters.md](docs/parameters.md).
@@ -278,10 +281,27 @@ conda-forge with pip installs each do it too. If you would rather not use JAX,
 
 ## Run time and memory
 
-Both scale with **`n_vis × n_mesh_pixels`** — the transformed mapping matrix,
-which is built once per hyperparameter trial and dominates everything else.
-Note what is *not* in that product: the size of the output image. Making the
-products finer is nearly free; more visibilities or a larger field are not.
+**There are two regimes, and `--inversion auto` picks between them at 5000
+visibilities.**
+
+Below that, and on any fit forced to `--inversion dense`, both scale with
+**`n_vis × n_mesh_pixels`** — the transformed mapping matrix, built once per
+hyperparameter trial, dominating everything else. Note what is *not* in that
+product: the size of the output image. Making the products finer is nearly
+free; more visibilities or a larger field are not.
+
+Above it, `auto` uses the **sparse (w-tilde) inversion**, and the visibility
+count drops out of the memory entirely. One streaming pass builds a small
+kernel, and the peak is `n_image_pixels × chunk_k` — Ruby's 148,477 samples
+fit in ~1.1 GB regardless of how many visibilities there are, against 3.8 GB
+dense at the same mesh. What limits a sparse fit instead is `--mesh`, because
+the curvature matrix is `n_mesh²`. It needs JAX, and `auto` falls back to
+dense (saying so) when JAX is absent, when `--point-sources` is requested, or
+when the real and imaginary noise differ by more than 5%.
+
+The sparse path is **new and not yet verified against dense on identical
+code**, so the figures below — all measured on the dense path — remain the
+ones with a track record. `--inversion dense` forces it.
 
 Small fits, on 2 CPU cores with the NumPy backend, matern prior, no
 uncertainty map:
@@ -318,15 +338,21 @@ Ruby at `--fov 8` from the phase centre needs ~32 GB at Nyquist, and the same
 data recentred on the ring at `--fov 3` needs ~4.4 GB *at the same resolution*.
 See [docs/large-datasets.md](docs/large-datasets.md).
 
-**JAX is not the answer to this.** It accelerates the rest of the fit, but the
-dominant step — transforming the mapping matrix — is the one step the JAX NUFFT
-cannot do at these sizes: it batches every mesh pixel into a single `nufft2d2`
-whose gather buffer runs to hundreds of GB. `--transformer auto` therefore
-picks `pynufft` — always, in fact: the two thresholds are 133x apart, so no
+**The JAX NUFFT is not the answer to the table above.** On the dense path the
+dominant step — transforming the mapping matrix — is the one step it cannot do
+at these sizes: it batches every mesh pixel into a single `nufft2d2` whose
+gather buffer runs to hundreds of GB. `--transformer auto` therefore picks
+`pynufft` — always, in fact: the two thresholds are 133x apart, so no
 laptop-sized machine ever reaches the JAX branch. Every figure above is on the
-pynufft path. `pip
-install pynufft` is the install that matters for speed here; the arithmetic is
-in [docs/parameters.md](docs/parameters.md#why-auto-never-picks-the-jax-nufft).
+pynufft path, and `pip install pynufft` is the install that matters for dense
+speed. The arithmetic is in
+[docs/parameters.md](docs/parameters.md#why-auto-never-picks-the-jax-nufft).
+
+**JAX still matters, for a different reason:** the sparse inversion needs it,
+and the sparse path never transforms a mapping matrix at all, so the gather
+buffer that rules the JAX NUFFT out never arises there. On a dataset above the
+5000-visibility threshold, having JAX installed is what lets `auto` take the
+path where the table above stops applying.
 
 **Averaging the data down first is usually the bigger win**, up to the point
 where bandwidth and time-average smearing set in — see
@@ -365,7 +391,11 @@ Full discussion: [docs/noise.md](docs/noise.md).
 3. The **inversion** solves `(F + H)s = D` on a rectangular source mesh, with
    the prior's hyperparameters optimised first by the fast unconstrained
    solver, then the coefficient re-bisected with the constrained solver so the
-   delivered model fits to the noise level rather than through it.
+   delivered model fits to the noise level rather than through it. `F` is
+   built either from the dense `n_vis × n_mesh` mapping matrix or, above 5000
+   visibilities, by the sparse w-tilde formalism — one streaming pass over the
+   visibilities onto a fixed-size kernel, the same idea as CASA's `tclean`
+   gridding, which takes the data size out of the memory bill.
 4. **Products**: the restoring beam is a Gaussian fitted to the dirty beam;
    dirty images are naturally weighted and normalised so the dirty beam peaks
    at 1 (→ Jy/beam); the image rms is analytic (`1/√(Σw)`), verified against
@@ -381,6 +411,14 @@ Full discussion: [docs/noise.md](docs/noise.md).
 - Total flux cannot be resolved beyond the maximum recovery scale of the data
   set, which is determined by the baseline length distribution: emission
   resolved out by the array cannot be recovered (same as CLEAN).
+- The sparse (w-tilde) inversion that `--inversion auto` selects above 5000
+  visibilities is **new**. It should give the same answer as the dense path
+  and has not yet been shown to, on identical code and data. If a result
+  matters, check it against `--inversion dense`.
+- Positivity applies to the mesh-only solve. With `--point-sources` the
+  bordered system is eliminated by an unconstrained Cholesky solve, so the
+  delivered mesh may hold small negative values whatever `--enforce-positive`
+  is set to; the point amplitudes are unaffected.
 
 ## Further reading
 
