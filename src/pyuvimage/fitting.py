@@ -1126,6 +1126,35 @@ def sparse_kernel_cache_path(cache_dir, key: str):
     return Path(cache_dir) / f"pyuvimage-{key}{SPARSE_KERNEL_SUFFIX}"
 
 
+def adjoint_image(transformer, visibilities):
+    """`image_from`, on the plain mathematical adjoint's scale.
+
+    `use_adjoint_scaling` is passed only when the transformer accepts it,
+    because autoarray removed the argument from its own transformers in
+    2026.8.29.1 -- `TransformerDFT.image_from()` there raises TypeError on it,
+    and `apply_sparse_operator` no longer passes it either. That removal is
+    consistent rather than careless: the flag was always a no-op for
+    `TransformerDFT` and the nufftax `TransformerNUFFT`, whose adjoints are
+    already the plain mathematical one.
+
+    It is *not* a no-op for a pynufft-backed transformer, whose internal IFFT
+    normalisation leaves its raw adjoint a factor `4 N_y N_x` low -- which is
+    why ours still accepts it and why `assert_adjoint_scale_consistent`
+    measures the result against the DFT rather than trusting any of this.
+    """
+    import inspect
+
+    try:
+        accepts = "use_adjoint_scaling" in inspect.signature(
+            transformer.image_from).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        accepts = False
+    if accepts:
+        return transformer.image_from(
+            visibilities=visibilities, use_adjoint_scaling=True)
+    return transformer.image_from(visibilities=visibilities)
+
+
 def assert_adjoint_scale_consistent(
     transformer_cls, n_pix: int = 16, tolerance: float = 1e-2
 ) -> None:
@@ -1159,12 +1188,14 @@ def assert_adjoint_scale_consistent(
     )
 
     reference = np.asarray(
-        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
-        .image_from(visibilities=vis).native
+        adjoint_image(
+            ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask), vis
+        ).native
     )
     got = np.asarray(
-        transformer_cls(uv_wavelengths=uv, real_space_mask=mask)
-        .image_from(visibilities=vis, use_adjoint_scaling=True).native
+        adjoint_image(
+            transformer_cls(uv_wavelengths=uv, real_space_mask=mask), vis
+        ).native
     )
 
     scale = np.abs(reference).max()
@@ -1369,9 +1400,8 @@ def scaled_dirty_image(dataset) -> np.ndarray:
         data.real * noise.real ** -2.0 + 1j * data.imag * noise.imag ** -2.0
     )
     return np.asarray(
-        dataset.transformer.image_from(
-            visibilities=Visibilities(visibilities=weighted),
-            use_adjoint_scaling=True,
+        adjoint_image(
+            dataset.transformer, Visibilities(visibilities=weighted)
         ).array
     )
 

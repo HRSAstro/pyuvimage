@@ -134,6 +134,98 @@ def multi_component_image(
     return img
 
 
+def make_sparse_test_dataset(
+    n_vis: int = 8000,
+    mesh_n: int = 24,
+    point_flux_jy: float = 0.004,
+    fov_arcsec: float = 3.0,
+    seed: int = 0,
+):
+    """The demo's source, sized to exercise the sparse (w-tilde) inversion.
+
+    Same sky as `make_demo_dataset` -- an exponential disc plus one true point
+    source no mesh can represent -- but with enough visibilities to cross
+    `fitting.SPARSE_AUTO_MIN_VISIBILITIES`, so `--inversion auto` takes the
+    sparse path on it. At the default 8000 visibilities the fit resolves a
+    20x20 mesh, i.e. 40 data points per model pixel, which is the
+    well-constrained regime where `--criterion auto` takes `structure`.
+
+    Two things this is for:
+
+    * **Comparing the two inversions.** The sparse path has never been checked
+      against the dense one on identical code and data at a coefficient that
+      actually moves the model -- the one earlier attempt compared two nulled
+      models and proved nothing. `scripts/compare_inversions.py` and
+      `tests/test_sparse_vs_dense.py` use this dataset for exactly that, and
+      the truth is known, so both paths can be scored against the sky rather
+      than only against each other.
+    * **Point components on the sparse path.** `--inversion sparse` refuses
+      them today, so `auto` falls back to dense whenever `point_flux_jy` is
+      non-zero and points are requested. autoarray now ships the block methods
+      that make it possible, and when that is wired up this dataset is the
+      case to wire it up against. Pass `point_flux_jy=0.0` for a
+      pixelizable-only sky in the meantime.
+
+    Unlike `make_demo_dataset`, the truth is built on the mesh the **fit** will
+    resolve -- `resolve_geometry` with the 95th-percentile baseline, exactly as
+    `api.run` does -- rather than on a grid chosen up front. Two reasons, both
+    learned the hard way:
+
+    * A truth on a different grid from the model cannot be compared against it,
+      so the one check that catches both inversions being wrong *together*
+      quietly disappears.
+    * Forcing the fit onto the truth's own `mesh_n` grid is worse still: that
+      grid is Nyquist-sampled by the longest baseline by construction, so its
+      highest spatial frequencies are barely constrained, `F` is
+      ill-conditioned, and the unregularised solve blows up. Measured: a peak
+      four orders of magnitude above any regularised solution, and a relative
+      error against the truth of 7.5. Sizing from the 95th percentile leaves
+      the mesh comfortably inside what the data constrain.
+
+    Returns (uvdata, truth, geometry, components), as `make_demo_dataset` does.
+    """
+    from .pointsource import point_visibilities, sky_to_grid
+
+    fov_rad = fov_arcsec / 206265.0
+    uv_max = mesh_n / (2.0 * fov_rad)
+    frequency_hz = 230e9
+    uvw = random_uv_coverage(
+        n_vis, max_baseline_m=uv_max * C_M_S / frequency_hz,
+        frequency_hz=frequency_hz, seed=seed,
+    )
+    b = np.hypot(uvw[:, 0], uvw[:, 1]) * frequency_hz / C_M_S
+    geom = resolve_geometry(
+        fov_arcsec,
+        max_baseline_wavelengths=float(np.max(b)),
+        effective_baseline_wavelengths=float(np.percentile(b, 95.0)),
+    )
+    truth = exponential_image(
+        geom.mesh_shape, geom.mesh_pixel_scale, flux_jy=0.05,
+        r_eff_arcsec=fov_arcsec / 8,
+    )
+    uvd = simulate(
+        truth, geom.mesh_pixel_scale, uvw, np.array([frequency_hz]),
+        sigma_jy=2e-4, seed=seed + 1,
+        meta={
+            "telescope": "mock", "dish_diameter_m": 12.0,
+            "phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0,
+        },
+    )
+    point_centre = (0.85, -0.65)
+    if point_flux_jy:
+        y, x = sky_to_grid(*point_centre)
+        uvd.data[0] += point_flux_jy * point_visibilities(
+            uv_of(uvw, frequency_hz), y, x)
+    components = {
+        "extended": [{"flux": 0.05, "centre": (0.0, 0.0)}],
+        "points": (
+            [{"flux": point_flux_jy, "centre": point_centre}]
+            if point_flux_jy else []
+        ),
+    }
+    return uvd, truth, geom, components
+
+
 def make_multi_component_dataset(
     n_vis: int = 600,
     frequency_hz: float = 230e9,

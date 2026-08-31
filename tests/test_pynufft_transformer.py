@@ -388,3 +388,37 @@ def test_the_preflight_guard_catches_a_swallowed_argument():
 def test_the_preflight_guard_passes_the_dft():
     """A no-op for the DFT, and it must stay a no-op rather than an error."""
     fitting.assert_adjoint_scale_consistent(ag.TransformerDFT)
+
+
+def test_a_transformer_without_the_argument_is_accepted_when_correctly_scaled():
+    """autoarray 2026.8.29.1 removed `use_adjoint_scaling` from its own
+    transformers, so `TransformerDFT.image_from()` now raises TypeError on it.
+
+    That removal is consistent: the flag was always a no-op there, because the
+    DFT's adjoint is already the plain mathematical one. But passing it
+    unconditionally crashed the guard on any dataset small enough for `auto` to
+    pick the DFT -- which is every mock, including the one written to test the
+    sparse path. `adjoint_image` passes it only where the signature takes it,
+    and the guard then measures the result rather than trusting the signature.
+    """
+
+    class NoSuchArgument(ag.TransformerDFT):
+        def image_from(self, visibilities, xp=np):  # no use_adjoint_scaling
+            return super().image_from(visibilities=visibilities)
+
+    fitting.assert_adjoint_scale_consistent(NoSuchArgument)
+
+
+def test_a_transformer_that_needs_scaling_but_lacks_the_argument_is_caught():
+    """The reverse case, and the dangerous one: no way to ask for the common
+    scale, and an adjoint that is not on it. Signature inspection alone would
+    wave this through; measuring against the DFT does not."""
+
+    class NeedsScalingButCannot(ag.TransformerDFT):
+        def image_from(self, visibilities, xp=np):
+            out = super().image_from(visibilities=visibilities)
+            return ag.Array2D(values=np.asarray(out.native) / 1024.0,
+                              mask=self.real_space_mask)
+
+    with pytest.raises(RuntimeError, match="does not honour use_adjoint_scaling"):
+        fitting.assert_adjoint_scale_consistent(NeedsScalingButCannot)
