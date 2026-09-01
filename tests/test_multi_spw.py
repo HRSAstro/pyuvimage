@@ -233,3 +233,66 @@ def test_single_spw_npz_still_reads_as_uvdata(multi, tmp_path):
     back = read_dataset(f)
     assert isinstance(back, UVData)
     assert back.n_chan == s.n_chan and back.n_vis == s.n_vis
+
+
+def test_pooling_the_noise_works_on_a_multi_spw_dataset():
+    """A multi-spw dataset is a *list* of UVData with no `noise` field of its
+    own, so `dataclasses.replace(uvd, noise=...)` raises TypeError on one.
+
+    That is precisely what `pyuvimage fit 9io9_135GHz_cont.npz --fov 8` did:
+    9io9 is four spectral windows, its 15.6% re/im asymmetry sent the sparse
+    path into the pooling branch, and the run died in `api.run` before fitting
+    anything. Every single-spw dataset went through the same line untouched,
+    which is why the tests missed it -- so this one uses the shape that broke.
+    """
+    from pyuvimage.uvdata import (
+        MultiSpwUVData,
+        reim_asymmetry,
+        with_pooled_noise,
+    )
+
+    rng = np.random.default_rng(0)
+
+    def spw(n_vis, freq):
+        return UVData(
+            uvw=rng.normal(0, 100.0, (n_vis, 3)),
+            frequencies=np.array([freq]),
+            data=rng.normal(size=(1, n_vis)) + 1j * rng.normal(size=(1, n_vis)),
+            noise=np.full((1, n_vis), 0.10 + 0.13j),
+            meta={"telescope": "test"},
+        )
+
+    # ragged on purpose: different row counts per window, as real data is
+    uvd = MultiSpwUVData(spws=[spw(40, 1.35e11), spw(25, 1.37e11)])
+    assert reim_asymmetry(uvd.noise) > 0.2
+
+    pooled = with_pooled_noise(uvd)
+    assert isinstance(pooled, MultiSpwUVData)
+    assert pooled.n_spw == 2
+    assert pooled.n_samples == uvd.n_samples
+    assert reim_asymmetry(pooled.noise) == pytest.approx(0.0, abs=1e-12)
+    # total variance preserved, so chi^2 statistics are untouched
+    before = np.abs(np.asarray(uvd.noise)) ** 2
+    after = np.abs(np.asarray(pooled.noise)) ** 2
+    np.testing.assert_allclose(after.sum(), before.sum())
+
+
+def test_pooling_leaves_the_visibilities_alone():
+    """It is a noise-map change and nothing else."""
+    from pyuvimage.uvdata import MultiSpwUVData, with_pooled_noise
+
+    rng = np.random.default_rng(1)
+    spw = UVData(
+        uvw=rng.normal(0, 100.0, (16, 3)),
+        frequencies=np.array([1.35e11]),
+        data=rng.normal(size=(1, 16)) + 1j * rng.normal(size=(1, 16)),
+        noise=np.full((1, 16), 0.10 + 0.13j),
+        meta={},
+    )
+    uvd = MultiSpwUVData(spws=[spw])
+    # `flattened()` is what the fit consumes, and the only data accessor a
+    # multi-spw dataset has -- there is no `.data`, because the windows are
+    # ragged and there is no rectangular array to hold them.
+    _, before, _ = uvd.flattened()
+    _, after, _ = with_pooled_noise(uvd).flattened()
+    np.testing.assert_allclose(after, before)

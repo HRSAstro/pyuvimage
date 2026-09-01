@@ -79,7 +79,7 @@ def run(
     nu: float = fitting.DEFAULT_NU,
     envelope_fwhm: float | str = "auto",
     envelope_centre: tuple[float, float] | str = "auto",
-    image_centre: tuple[float, float] | str = "centre",
+    image_centre: tuple[float, float] | str = "0,0",
     envelope_floor: float = 1e-2,
     adapt_power: float = fitting.ADAPT_POWER,
     criterion: str = "auto",
@@ -135,8 +135,9 @@ def run(
             it is calibrated; "evidence" maximises the Bayesian evidence, as
             PyAutoLabs does.
         chi2_target: target chi^2/N for the discrepancy criterion.
-        image_centre: where to centre the reconstruction. "centre" (default)
-            uses the phase centre; "auto" finds the brightest peak in a
+        image_centre: where to centre the reconstruction. "0,0" (default) is
+            the phase centre, and "centre" is a synonym for it;
+            "auto" finds the brightest peak in a
             wide-field dirty image and centres there; or an **(x, y)** offset
             in arcsec from the phase centre in image axes -- +x right and +y
             up, as read off summary.png. RA increases leftward, so dRA = -x;
@@ -223,26 +224,77 @@ def run(
             advice,
         )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
-    # Resolve the transformer *before* reporting memory: which backend runs
-    # changes the answer by two orders of magnitude, because the JAX one
-    # transforms the whole mapping matrix in a single batched nufft2d2 whose
-    # gather buffer is n_mesh x n_vis x nspread^2.
-    transformer_cls = fitting.resolve_transformer(
-        n_vis=uvd.n_samples,
-        transformer=transformer,
-        n_image_pixels=int(np.prod(geometry.shape_native)),
-        n_mesh_pixels=n_pix,
-    )
-    # before anything large is allocated: an OOM kill prints nothing useful,
-    # so the moment to speak is while --mesh and --fov are still adjustable.
-    # `auto` is resolved here, once, so that everything downstream -- the
+    n_image_pixels = int(np.prod(geometry.shape_native))
+    # Order matters here, and it is the opposite of what it used to be.
+    #
+    # The inversion is resolved FIRST, because the transformer choice depends
+    # on it: `auto` vetoes the JAX NUFFT when its mapping-matrix gather buffer
+    # will not fit, and on the sparse path no mapping matrix is ever
+    # transformed, so that veto is about a cost that will never be paid. On
+    # 9io9 it reads 1488 GB for a build that does not happen, against 1.0 GB
+    # for the single-image transforms that do.
+    #
+    # Both are resolved before the memory report, since which backend runs
+    # changes that answer by two orders of magnitude.
+    #
+    # `auto` is resolved once, here, so that everything downstream -- the
     # memory report, the guards, fit_parameters.json -- sees the concrete
     # choice rather than re-deriving it or recording "auto". The noise is the
     # post-recentring one, which is what the w-tilde kernel would be built on.
     inversion = fitting.resolve_inversion(
         inversion, n_vis=uvd.n_samples, point_sources=point_sources,
-        transformer_cls=transformer_cls, noise=uvd.noise,
+        noise=uvd.noise,
     )
+    transformer_cls = fitting.resolve_transformer(
+        n_vis=uvd.n_samples,
+        transformer=transformer,
+        n_image_pixels=n_image_pixels,
+        n_mesh_pixels=n_pix,
+        inversion=inversion,
+    )
+    # The scale check needs the transformer, so it comes after it rather than
+    # inside `resolve_inversion`. Under `auto` a mismatch is a reason to use
+    # dense, not to stop -- and the transformer is then re-resolved, because
+    # the dense path has a gather buffer to worry about again.
+    if inversion == "sparse":
+        try:
+            fitting.assert_adjoint_scale_consistent(transformer_cls)
+        except Exception as e:
+            logger.info("inversion sparse -> dense: %s", e)
+            inversion = "dense"
+            transformer_cls = fitting.resolve_transformer(
+                n_vis=uvd.n_samples, transformer=transformer,
+                n_image_pixels=n_image_pixels, n_mesh_pixels=n_pix,
+                inversion="dense",
+            )
+    if inversion == "sparse":
+        # The W~ reduction assumes sigma_re == sigma_im, and below
+        # `SPARSE_AUTO_MAX_ASYMMETRY` any measured difference is estimator
+        # scatter rather than a real one -- thermal noise has them equal by
+        # construction. So pool them, which is what `--image-centre` already
+        # does on every recentred fit and is the better estimate of both
+        # (twice the sample size, total variance unchanged).
+        #
+        # Doing this rather than refusing is what lets a plain
+        # `pyuvimage fit 9io9.npz --fov 8` take the sparse path at all: 9io9
+        # reads 15.6% unrecentred, Ruby 9.1%, and blocking on that made the
+        # fast path depend on whether the user happened to recentre -- which
+        # has nothing to do with the physics they care about.
+        from .uvdata import reim_asymmetry, with_pooled_noise
+
+        asymmetry = reim_asymmetry(uvd.noise)
+        if asymmetry > 0:
+            logger.info(
+                "pooling sigma_re and sigma_im in quadrature for the sparse "
+                "inversion (they differ by %.1f%%, which at this level is "
+                "scatter in the noise estimator rather than a real "
+                "difference): the w-tilde reduction assumes they are equal, "
+                "and pooling is the better estimate of both. Total variance "
+                "is unchanged, so chi^2 statistics are not affected. "
+                "--inversion dense leaves the noise map untouched.",
+                100 * asymmetry,
+            )
+            uvd = with_pooled_noise(uvd)
     if inversion == "sparse":
         # Not a correctness problem -- a performance cliff, and a total one.
         # Our point components are not autoarray linear objects; they are a
@@ -308,7 +360,7 @@ def run(
         n_chan=uvd.n_chan if mode == "cube" else None,
         prior_thin=prior_thin,
         inversion=inversion,
-        n_image_pixels=int(np.prod(geometry.shape_native)),
+        n_image_pixels=n_image_pixels,
     )
     # Resolve `auto` once, here, so that everything downstream -- the fits,
     # the point-source retune, `fit_parameters.json` -- sees the concrete
@@ -866,12 +918,34 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
         isinstance(image_centre, str) and image_centre == "centre"
     ):
         return uvd
-    if isinstance(image_centre, str):
-        if image_centre != "auto":
+    # "0,0" is the phase centre, so it must be exactly as much of a no-op as
+    # "centre" is. Not merely cosmetic: `shift_image_centre` pools sigma_re
+    # and sigma_im in quadrature, which is right when the phase ramp really
+    # does mix them and wrong when there is no ramp. Letting a zero offset
+    # through would quietly change the noise map on every default run -- and
+    # with it chi^2, and which path `--inversion auto` takes, since it
+    # declines sparse above 5% re/im asymmetry.
+    if not isinstance(image_centre, str) and (
+        float(image_centre[0]) == 0.0 and float(image_centre[1]) == 0.0
+    ):
+        return uvd
+    if isinstance(image_centre, str) and image_centre != "auto":
+        # `run()` may be called directly with the same spelling the CLI takes,
+        # and its own default is now the string "0,0", so a numeric pair has
+        # to parse here as well as in `cli._parse_centre`.
+        try:
+            x, y = (float(v) for v in image_centre.split(","))
+        except (ValueError, AttributeError):
             raise ValueError(
-                "image_centre must be 'centre', 'auto', or an (x, y) "
-                "offset in arcsec"
-            )
+                f"image_centre {image_centre!r} is not understood: give an "
+                "(x, y) offset in arcsec such as '0,0' (the phase centre, "
+                "the default) or '-2.0,1.5', or 'auto', or the synonym "
+                "'centre'"
+            ) from None
+        if x == 0.0 and y == 0.0:
+            return uvd
+        image_centre = (x, y)
+    if isinstance(image_centre, str):
         dish = dish_diameter or uvd.meta.get("dish_diameter_m")
         wide = fov * AUTO_CENTRE_FIELD_FACTOR
         if dish:

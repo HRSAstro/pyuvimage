@@ -852,14 +852,50 @@ def shift_image_centre(
         # The rotated noise is their quadrature mean, which preserves the
         # total variance exactly -- so chi^2 statistics are untouched -- and
         # is a *better* estimate of each, not a worse one: see below.
-        s_re, s_im = noise[c].real, noise[c].imag
-        s = np.sqrt(0.5 * (s_re**2 + s_im**2))
-        noise[c] = s + 1j * s
+        noise[c] = pooled_noise(noise[c])
     _report_reim_asymmetry(dataset.noise)
     return replace(
         dataset, data=data, noise=noise,
         meta=_with_centre(dataset.meta, y0, x0),
     )
+
+
+def pooled_noise(noise: np.ndarray) -> np.ndarray:
+    """sigma_re and sigma_im replaced by their quadrature mean.
+
+    Preserves the total variance exactly, so chi^2 statistics are untouched,
+    and is a *better* estimate of each than either alone: thermal noise has
+    sigma_re == sigma_im by construction, so any measured difference is scatter
+    in the estimator, and pooling doubles its sample size. See
+    `_report_reim_asymmetry`.
+
+    Used in two places -- by `shift_image_centre`, where a phase rotation mixes
+    the real and imaginary parts so the separate sigmas no longer describe the
+    rotated visibility, and by the sparse inversion, whose W~ reduction assumes
+    the two are equal.
+    """
+    a = np.asarray(noise)
+    s = np.sqrt(0.5 * (a.real**2 + a.imag**2))
+    return s + 1j * s
+
+
+def with_pooled_noise(
+    dataset: "UVData | MultiSpwUVData",
+) -> "UVData | MultiSpwUVData":
+    """A copy of `dataset` with sigma_re and sigma_im replaced by their pool.
+
+    Recurses over spectral windows, the way `shift_image_centre` does. A
+    multi-spw dataset is a *list* of `UVData` and has no `noise` field of its
+    own, so `dataclasses.replace(uvd, noise=...)` raises `TypeError` on one --
+    which is exactly what a plain `pyuvimage fit 9io9.npz --fov 8` did, 9io9
+    being four spectral windows.
+    """
+    if isinstance(dataset, MultiSpwUVData):
+        return MultiSpwUVData(
+            spws=[with_pooled_noise(s) for s in dataset.spws],
+            meta=dict(dataset.meta),
+        )
+    return replace(dataset, noise=pooled_noise(dataset.noise))
 
 
 #: Above this *median* re/im noise asymmetry, something other than estimator
