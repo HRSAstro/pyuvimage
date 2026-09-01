@@ -105,31 +105,66 @@ class _FakeFit:
         self.figure_of_merit = -0.5 * chi2
 
 
-def _fake_fit_at(n_data, floor_free, floor_positive, gain=0.5):
-    """`gain` drives chi^2 *and* the model, together.
+def _fake_solution(n_data, floor_free, floor_positive, gain=0.5):
+    """(chi^2, reconstruction) at one coefficient, on one solver.
 
-    A solver ignoring the prior returns the same answer at every coefficient,
-    which is what `gain=0.0` now means: flat chi^2 and a frozen model. A
-    healthy one moves both.
+    `gain` drives chi^2 *and* the model, together. A solver ignoring the prior
+    returns the same answer at every coefficient, which is what `gain=0.0`
+    means: flat chi^2 and a frozen model. A healthy one moves both.
     """
-    def fit_at(dataset, mesh_shape, reg_kind, coefficient, positive_only=True,
-               **kwargs):
-        floor = floor_positive if positive_only else floor_free
+    def solution(coefficient, positive):
+        floor = floor_positive if positive else floor_free
         c = float(coefficient)
         response = gain * c / (c + 1e3)
-        return _FakeFit(
-            n_data * (floor + response),
-            reconstruction=np.full(4, 1.0 + response),
+        return n_data * (floor + response), np.full(4, 1.0 + response)
+    return solution
+
+
+class _FakeSystem:
+    """A `LinearSystem` stand-in: every trial is the fake solution above.
+
+    The search and the probes in `fit_dataset` go through
+    `LinearSystem.trial` and never build a framework fit, so this is the seam
+    a controlled solver has to be inserted at. It records every trial so the
+    tests can see which coefficients were solved on which solver.
+    """
+
+    def __init__(self, solution):
+        self.solution = solution
+        self.seen: list[tuple[float, bool]] = []
+
+    def trial(self, regularization, positive):
+        c = float(regularization.coefficient)
+        self.seen.append((c, bool(positive)))
+        chi2, rec = self.solution(c, positive)
+        return fitting.Trial(
+            coefficient=c, positive=bool(positive), reconstruction=rec,
+            chi_squared=chi2, log_evidence=-0.5 * chi2,
+            regularization_matrix=np.eye(rec.size),
         )
+
+
+def _fake_fit_at(solution):
+    """The delivered fit, agreeing with the fake system it is solved on."""
+    def fit_at(dataset, mesh_shape, reg_kind, coefficient, positive_only=True,
+               **kwargs):
+        chi2, rec = solution(coefficient, positive_only)
+        return _FakeFit(chi2, reconstruction=rec)
     return fit_at
+
+
+def _install(monkeypatch, n_data, floor_free, floor_positive, gain=0.5):
+    """Put a controlled solver under both the search and the delivered fit."""
+    solution = _fake_solution(n_data, floor_free, floor_positive, gain)
+    system = _FakeSystem(solution)
+    monkeypatch.setattr(fitting, "build_linear_system", lambda *a, **k: system)
+    monkeypatch.setattr(fitting, "fit_at", _fake_fit_at(solution))
+    return system
 
 
 def _run(monkeypatch, dataset, geometry, floor_positive, **kwargs):
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(
-        fitting, "fit_at",
-        _fake_fit_at(n_data, floor_free=0.98, floor_positive=floor_positive),
-    )
+    _install(monkeypatch, n_data, floor_free=0.98, floor_positive=floor_positive)
     sf = fitting.fit_dataset(
         dataset, geometry, reg_kind="constant", positive_only=True, **kwargs
     )
@@ -159,22 +194,13 @@ def test_the_floor_is_measured_on_the_solver_in_use(monkeypatch, demo_geometry):
     it reports a floor of 0.98 N, the target looks reachable, and the search
     then chases it with a solver that cannot get there."""
     dataset, geometry = demo_geometry
-    seen = []
     n_data = 2 * len(np.asarray(dataset.data))
-    inner = _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.02)
-
-    def spy(dataset_, mesh_shape, reg_kind, coefficient, positive_only=True,
-            **kwargs):
-        seen.append((float(coefficient), bool(positive_only)))
-        return inner(dataset_, mesh_shape, reg_kind, coefficient,
-                     positive_only=positive_only, **kwargs)
-
-    monkeypatch.setattr(fitting, "fit_at", spy)
+    system = _install(monkeypatch, n_data, floor_free=0.98, floor_positive=1.02)
     fitting.fit_dataset(dataset, geometry, reg_kind="constant",
                         positive_only=True)
 
     weakest = 10.0 ** LOG_COEFFICIENT_BOUNDS[0]
-    probes = [pos for c, pos in seen if c == pytest.approx(weakest)]
+    probes = [pos for c, pos in system.seen if c == pytest.approx(weakest)]
     assert probes, "the weakest prior was never probed"
     assert any(probes), "the reachability probe never used the constrained solver"
 
@@ -269,10 +295,7 @@ def test_the_delivered_solver_is_recorded_not_the_one_requested(
     dataset, geometry = demo_geometry
     n_data = 2 * len(np.asarray(dataset.data))
     # a solver that ignores the prior entirely is what trips the guard
-    monkeypatch.setattr(
-        fitting, "fit_at",
-        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
-    )
+    _install(monkeypatch, n_data, floor_free=0.98, floor_positive=1.0, gain=0.0)
     sf = fitting.fit_dataset(
         dataset, geometry, reg_kind="constant", positive_only=True
     )
@@ -299,10 +322,7 @@ def test_enforce_positive_keeps_positivity_through_a_bad_solver(
     side."""
     dataset, geometry = demo_geometry
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(
-        fitting, "fit_at",
-        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
-    )
+    _install(monkeypatch, n_data, floor_free=0.98, floor_positive=1.0, gain=0.0)
     default = fitting.fit_dataset(
         dataset, geometry, reg_kind="constant", positive_only=True
     )
@@ -322,10 +342,7 @@ def test_enforce_positive_still_says_the_solver_looked_wrong(
 
     dataset, geometry = demo_geometry
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(
-        fitting, "fit_at",
-        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
-    )
+    _install(monkeypatch, n_data, floor_free=0.98, floor_positive=1.0, gain=0.0)
     with caplog.at_level(logging.WARNING, logger="pyuvimage"):
         fitting.fit_dataset(
             dataset, geometry, reg_kind="constant", positive_only=True,
@@ -484,8 +501,7 @@ def test_a_flat_chi2_alone_does_not_disable_positivity(
     dataset, geometry = demo_geometry
     n_data = 2 * len(np.asarray(dataset.data))
 
-    def fit_at(dataset_, mesh_shape, reg_kind, coefficient,
-               positive_only=True, **kwargs):
+    def solution(coefficient, positive):
         c = float(coefficient)
         # chi^2 moves 0.4% across the whole range -- Ruby's number, and below
         # the 1% the old test demanded
@@ -494,11 +510,12 @@ def test_a_flat_chi2_alone_does_not_disable_positivity(
         # rather than saturating: a Matern prior goes on smoothing as the
         # coefficient grows, so the response must not flatten out at the top
         # of the range where the bisection actually looks.
-        return _FakeFit(
-            chi2, reconstruction=np.full(4, 10.0 + np.log10(max(c, 1e-30)))
-        )
+        return chi2, np.full(4, 10.0 + np.log10(max(c, 1e-30)))
 
-    monkeypatch.setattr(fitting, "fit_at", fit_at)
+    monkeypatch.setattr(
+        fitting, "build_linear_system", lambda *a, **k: _FakeSystem(solution)
+    )
+    monkeypatch.setattr(fitting, "fit_at", _fake_fit_at(solution))
     with caplog.at_level(logging.WARNING, logger="pyuvimage"):
         sf = fitting.fit_dataset(
             dataset, geometry, reg_kind="constant", positive_only=True
@@ -518,10 +535,7 @@ def test_a_frozen_model_still_disables_positivity(
 
     dataset, geometry = demo_geometry
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(
-        fitting, "fit_at",
-        _fake_fit_at(n_data, floor_free=0.98, floor_positive=1.0, gain=0.0),
-    )
+    _install(monkeypatch, n_data, floor_free=0.98, floor_positive=1.0, gain=0.0)
     with caplog.at_level(logging.WARNING, logger="pyuvimage"):
         sf = fitting.fit_dataset(
             dataset, geometry, reg_kind="constant", positive_only=True

@@ -11,8 +11,10 @@ maximisation is available as an alternative criterion.
 
 from __future__ import annotations
 
+import functools
 import gc
 import hashlib
+import inspect
 import logging
 import math
 import time
@@ -25,6 +27,7 @@ import autogalaxy as ag
 
 from .beam import DirtyImager
 from .grids import ImageGeometry
+from .uvdata import REIM_ASYMMETRY_WARN
 
 logger = logging.getLogger("pyuvimage")
 
@@ -583,7 +586,25 @@ def current_memory_gb() -> float:
     the first mapping matrix existed. Comparing the *allocation* against total
     available memory ignores it and reports a comfortable margin that is not
     there: a fit estimated at 2.1 GB against 6.9 GB available was killed.
+
+    This is the *current* resident set where the platform exposes it
+    (`/proc/self/statm` on Linux), not the high-water mark. `ru_maxrss` is the
+    peak over the process's lifetime, and after the first-pass fit of an
+    adaptive prior has been freed -- which `fit_dataset` does deliberately,
+    with a `gc.collect()`, before the second pass allocates -- the peak still
+    reads as if it were held. That double-counted the released mapping matrix
+    against the budget and refused fits that would have run. `ru_maxrss` stays
+    as the fallback where `/proc` is not available.
     """
+    try:  # pragma: no cover - Linux
+        with open("/proc/self/statm") as f:
+            # fields: size resident shared text lib data dt, in pages
+            resident_pages = int(f.read().split()[1])
+        import os
+
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1e9
+    except Exception:
+        pass
     try:  # pragma: no cover - platform dependent
         import resource
 
@@ -1184,17 +1205,26 @@ def adjoint_image(transformer, visibilities):
     why ours still accepts it and why `assert_adjoint_scale_consistent`
     measures the result against the DFT rather than trusting any of this.
     """
-    import inspect
-
-    try:
-        accepts = "use_adjoint_scaling" in inspect.signature(
-            transformer.image_from).parameters
-    except (TypeError, ValueError):  # pragma: no cover - exotic callables
-        accepts = False
-    if accepts:
+    if _image_from_accepts_adjoint_scaling(type(transformer)):
         return transformer.image_from(
             visibilities=visibilities, use_adjoint_scaling=True)
     return transformer.image_from(visibilities=visibilities)
+
+
+@functools.lru_cache(maxsize=None)
+def _image_from_accepts_adjoint_scaling(transformer_cls) -> bool:
+    """Whether `transformer_cls.image_from` takes `use_adjoint_scaling`.
+
+    Resolved once per class: `adjoint_image` is called for every dirty image
+    the structure criterion makes, and `inspect.signature` is not free.
+    """
+    import inspect
+
+    try:
+        return "use_adjoint_scaling" in inspect.signature(
+            transformer_cls.image_from).parameters
+    except (TypeError, ValueError, AttributeError):  # pragma: no cover
+        return False
 
 
 def assert_adjoint_scale_consistent(
@@ -1258,11 +1288,27 @@ def assert_adjoint_scale_consistent(
     )
 
 
+#: Build the w-tilde kernel through JAX when autoarray offers it.
+#:
+#: The kernel build streams every visibility onto the (2Ny, 2Nx) grid and is
+#: the one sparse-path step whose cost scales with the data: on Ruby (148k
+#: visibilities) it is minutes on NumPy. autoarray's
+#: `psf_precision_operator_from(use_jax=...)` runs the same accumulation
+#: through jax.numpy, and the sparse path already requires JAX
+#: (`sparse_inversion_diagnosis`), so there is no environment in which the
+#: NumPy build is available and the JAX one is not. It was nevertheless being
+#: called with `use_jax=False`. The JAX build could not be timed here -- this
+#: container has no JAX -- so the speedup is to be measured on Ruby; if the
+#: JAX build raises for any reason, `with_sparse_operator` logs the error and
+#: falls back to the NumPy build, so the flag can never cost a fit.
+SPARSE_KERNEL_USE_JAX = True
+
+
 def with_sparse_operator(
     dataset,
-    uv_wavelengths,
-    noise,
-    geometry,
+    uv_wavelengths=None,
+    noise=None,
+    geometry=None,
     cache_dir=None,
     chunk_k: int | None = None,
     batch_size: int = SPARSE_BATCH_SIZE,
@@ -1273,10 +1319,44 @@ def with_sparse_operator(
     never on the data values or the source prior -- so it is the one expensive
     invariant of a run and is cached on disk, the way CASA caches its
     convolution functions in `cfcache`.
+
+    ``uv_wavelengths`` and ``noise`` are read from the dataset when not given.
+    They are only ever used to *name* the cache entry, while the kernel itself
+    is built from the dataset's own arrays -- so a caller who passes a pair
+    that is not what the dataset holds would cache a kernel under the wrong
+    key and reuse the wrong kernel next time. A shape mismatch is refused; a
+    value mismatch (a pooled noise map passed alongside an unpooled dataset,
+    say) is warned about, since the kernel that is built is still the right
+    one for this fit.
     """
     reason = sparse_inversion_diagnosis()
     if reason is not None:
         raise RuntimeError(reason)
+    if geometry is None:
+        raise TypeError("with_sparse_operator needs the ImageGeometry")
+    dataset_uv = np.asarray(dataset.uv_wavelengths, dtype=float)
+    dataset_noise = np.asarray(dataset.noise_map, dtype=complex)
+    if uv_wavelengths is None:
+        uv_wavelengths = dataset_uv
+    if noise is None:
+        noise = dataset_noise
+    for name, given, held in (
+        ("uv_wavelengths", np.asarray(uv_wavelengths), dataset_uv),
+        ("noise", np.asarray(noise), dataset_noise),
+    ):
+        if given.shape != held.shape:
+            raise ValueError(
+                f"{name} has shape {given.shape} but the dataset holds "
+                f"{held.shape}: the kernel would be cached under a key for "
+                "data this fit is not using"
+            )
+        if not np.allclose(given, held, rtol=1e-6, atol=0.0):
+            logger.warning(
+                "the %s passed to with_sparse_operator differs from the "
+                "dataset's own; the kernel is built from the dataset and is "
+                "correct for this fit, but it is cached under a key derived "
+                "from the values given", name,
+            )
     assert_adjoint_scale_consistent(type(dataset.transformer))
     warn_on_reim_asymmetry(noise)
     warn_on_single_precision()
@@ -1309,7 +1389,7 @@ def with_sparse_operator(
             "is the only step whose cost scales with the data)",
             len(np.asarray(uv_wavelengths)),
         )
-        kernel = np.asarray(dataset.psf_precision_operator_from(chunk_k=chunk_k))
+        kernel = np.asarray(_build_sparse_kernel(dataset, chunk_k))
         logger.info(
             "  kernel %s, %.2f MB, %.1f s", kernel.shape, kernel.nbytes / 1e6,
             time.time() - t,
@@ -1329,28 +1409,77 @@ def with_sparse_operator(
     return repair_sparse_dirty_image(sparse, dataset)
 
 
+def _build_sparse_kernel(dataset, chunk_k: int):
+    """One pass over the visibilities, through JAX where autoarray allows it.
+
+    `use_jax` is passed only when this autoarray's `psf_precision_operator_from`
+    accepts it (the signature is checked at call time, as with
+    `use_adjoint_scaling` elsewhere), and a failure inside the JAX build is
+    logged and retried on NumPy rather than allowed to stop the fit -- see
+    `SPARSE_KERNEL_USE_JAX`.
+    """
+    build = dataset.psf_precision_operator_from
+    try:
+        accepts_use_jax = "use_jax" in inspect.signature(build).parameters
+    except (TypeError, ValueError):  # pragma: no cover - exotic callables
+        accepts_use_jax = False
+    if SPARSE_KERNEL_USE_JAX and accepts_use_jax:
+        try:
+            return build(chunk_k=chunk_k, use_jax=True)
+        except Exception as e:  # pragma: no cover - needs JAX to reach
+            logger.warning(
+                "the JAX build of the w-tilde kernel failed (%s: %s); "
+                "building it on NumPy instead, which is slower but gives the "
+                "same kernel", type(e).__name__, e,
+            )
+    return build(chunk_k=chunk_k)
+
+
 #: Median re/im noise asymmetry above which the sparse path is worth a word.
-#: Ruby reads 9% unrecentred, which is estimator scatter rather than anything
-#: physical, but it is still a real inconsistency in the linear system.
-SPARSE_REIM_ASYMMETRY_WARN = 0.02
+#:
+#: This used to be a separate, much tighter line (2%) than the one `api.run`
+#: draws when it pools the two sigmas (`uvdata.REIM_ASYMMETRY_WARN`, 25%), so
+#: the same dataset could be told its noise was fine by one message and
+#: inconsistent by the next. Ruby unrecentred reads 9%: estimator scatter, not
+#: physics, and below what pooling is expected to absorb. One definition of
+#: "more than scatter" now, owned by `uvdata`; this name is kept for the
+#: callers and tests that import it.
+SPARSE_REIM_ASYMMETRY_WARN = REIM_ASYMMETRY_WARN
+
+
+def _reconstruction_of(result) -> np.ndarray:
+    """The mesh reconstruction of a framework fit or of a `Trial`."""
+    if hasattr(result, "reconstruction"):
+        return np.asarray(result.reconstruction, dtype=float)
+    return np.asarray(result.inversion.reconstruction, dtype=float)
 
 
 def _model_response(fit_fn, weak_coefficient, strong_coefficient):
     """Relative change in the reconstruction between two prior strengths.
 
-    None when either fit cannot be made or the models are not comparable --
-    an unknown response must never be read as "no response", or a solver
-    failure would masquerade as the pathology and switch positivity off.
+    ``fit_fn(coefficient)`` may return a framework fit or a `Trial` -- either
+    way the reconstruction is what is compared. None when either solve cannot
+    be made or the models are not comparable -- an unknown response must never
+    be read as "no response", or a solver failure would masquerade as the
+    pathology and switch positivity off.
     """
     models = []
     for coefficient in (weak_coefficient, strong_coefficient):
         try:
-            fit = fit_fn(coefficient)
-            models.append(np.asarray(fit.inversion.reconstruction, dtype=float))
-            del fit
+            result = fit_fn(coefficient)
+            models.append(_reconstruction_of(result))
+            del result
         except Exception:
             return None
-    weak, strong = models
+    return _relative_change(*models)
+
+
+def _relative_change(weak, strong):
+    """|strong - weak| / |weak|, or None where that is not a number."""
+    if weak is None or strong is None:
+        return None
+    weak = np.asarray(weak, dtype=float)
+    strong = np.asarray(strong, dtype=float)
     if weak.shape != strong.shape:
         return None
     scale = float(np.linalg.norm(weak))
@@ -1665,12 +1794,439 @@ def fit_at(
     )
 
 
-def _safe_evidence(fit: ag.FitInterferometer) -> float:
+# --------------------------------------------------------------------------
+# The coefficient-invariant linear system
+# --------------------------------------------------------------------------
+#
+# Everything the hyperparameter search varies enters the normal equations
+#
+#     (F + H) s = D
+#
+# through H alone. F = A_t^T N^-1 A_t and D = A_t^T N^-1 d depend on the data,
+# the noise, the uv coverage and the mesh -- not on the regularisation
+# coefficient, nor, for the kernel priors, on the correlation scale or the
+# envelope. The search nevertheless used to build a fresh `ag.FitInterferometer`
+# for every trial, and autoarray recomputes A_t = transform_mapping_matrix(A)
+# for every fit and F and D on every *access* (they are plain properties, not
+# cached ones). Profiled on `mock.make_sparse_test_dataset(n_vis=8000)` --
+# 8000 visibilities, 20x20 mesh, 40x40 image, TransformerDFT -- for
+# `fit_dataset(criterion="discrepancy", positive_only=True, fixed_scale=0.5)`,
+# 43.6 s in total:
+#
+#     transform_mapping_matrix     x28     30.4 s
+#     data_vector                  x82     37.0 s cumulative (it includes the above)
+#     curvature_matrix            x106      5.5 s
+#     the 27 unconstrained solves           0.07 s
+#     the one NNLS solve                    0.26 s
+#
+# A third of a second of linear algebra inside forty seconds of rebuilding
+# things that had not changed. So F and D are now built once per (dataset,
+# mesh), read off a single framework inversion, and every trial is a solve.
+#
+# Read them off the inversion rather than recomputing them here, for two
+# reasons. First, exactness: the framework's own F and D are what its
+# `reconstruction`, `fast_chi_squared` and `figure_of_merit` are built from, so
+# a trial solved against the same arrays with the same solver functions
+# reproduces the framework fit at that coefficient bitwise, which is what lets
+# `SingleFit` report chi^2 and the evidence without a second pass. Second, the
+# sparse path: `InversionInterferometerSparse` assembles F from sparse mapping
+# triplets and the w-tilde kernel and D from the kernel's dirty image, and
+# exposes both under the same names as the dense class. Touching
+# `operated_mapping_matrix` on it would trigger the dense n_vis x n_mesh build
+# the sparse path exists to avoid; `curvature_matrix` and `data_vector` do not.
+
+
+@dataclass
+class Trial:
+    """One solve of the linear system at one prior."""
+
+    coefficient: float
+    positive: bool
+    reconstruction: np.ndarray = field(repr=False)
+    chi_squared: float
+    log_evidence: float
+    #: H at this trial, kept so the evidence and the posterior covariance can
+    #: be formed without rebuilding it.
+    regularization_matrix: np.ndarray = field(repr=False)
+
+
+class LinearSystem:
+    """F, D and the constant terms of one (dataset, mesh), solved per prior.
+
+    Built from a framework inversion (`from_inversion`), which is asked for
+    `curvature_matrix` and `data_vector` exactly once. Every trial then costs
+    one solve of an n_mesh x n_mesh system and, for the evidence, two
+    Cholesky factorisations of the same size -- independent of the number of
+    visibilities.
+
+    chi^2 is the quadratic form autoarray's `fast_chi_squared` uses,
+
+        chi^2 = s^T F s - 2 s^T D + sum(d_re^2/sigma_re^2) + sum(d_im^2/sigma_im^2)
+
+    and the log evidence is `fit_util.log_evidence_from` term for term:
+
+        -0.5 * [chi^2 + s^T H s + log det(F + H) - log det(H) + sum log(2 pi sigma^2)]
+
+    with both log-determinants from a Cholesky factor of the *formed* matrix,
+    as `AbstractInversion._log_det_symmetric_from` does under the default
+    `Settings.log_det_method == "cholesky"`. The kernel priors know a cheaper
+    analytic log det(H) = n log(coefficient) - log det(C), but the framework
+    consults it only under the opt-in `"slogdet"` setting, and the two differ
+    at the round-off of a factorisation whose error grows with cond(C) -- so
+    the formed-matrix Cholesky is what is reproduced here, and the analytic
+    shortcuts in `envelope.py` stay what they are: correct for the day the
+    setting is switched on.
+
+    Positivity follows the framework too: under `Settings.use_edge_zeroed_pixels`
+    (on by default) the non-negative solve runs on the interior pixels only and
+    the mesh's edge pixels are held at zero, so a constrained reconstruction
+    has a zero border that the unconstrained one does not. `solve` applies the
+    same reduction with the same `zeroed_ids_to_keep`.
+    """
+
+    def __init__(
+        self,
+        F: np.ndarray,
+        D: np.ndarray,
+        data_term: float,
+        noise_normalization: float,
+        linear_obj,
+        settings,
+        keep: np.ndarray | None,
+        inversion=None,
+        dataset=None,
+    ):
+        self.F = np.asarray(F)
+        self.D = np.asarray(D)
+        self.data_term = float(data_term)
+        self.noise_normalization = float(noise_normalization)
+        self.linear_obj = linear_obj
+        self.settings = settings
+        self.keep = None if keep is None else np.asarray(keep)
+        #: the template inversion, for the model visibilities and the mapping
+        #: matrix; may be None for a system built from arrays alone
+        self.inversion = inversion
+        self.dataset = dataset
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_inversion(cls, inversion, noise_normalization: float, dataset=None):
+        """Read F, D and the constants off one framework inversion."""
+        from autoarray.inversion.mappers.abstract import Mapper
+
+        if len(inversion.linear_obj_list) != 1:
+            raise ValueError(
+                "LinearSystem expects a single linear object (the mesh); "
+                f"got {len(inversion.linear_obj_list)}"
+            )
+        settings = inversion.settings
+        keep = None
+        if settings.use_edge_zeroed_pixels and inversion.has(cls=Mapper):
+            keep = np.asarray(inversion.zeroed_ids_to_keep)
+        data = inversion.dataset.data.array
+        noise = inversion.dataset.noise_map.array
+        # the same expression `fast_chi_squared` evaluates, on the same arrays
+        data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
+            data.imag**2.0 / noise.imag**2.0
+        )
+        return cls(
+            F=inversion.curvature_matrix,
+            D=inversion.data_vector,
+            data_term=data_term,
+            noise_normalization=noise_normalization,
+            linear_obj=inversion.linear_obj_list[0],
+            settings=settings,
+            keep=keep,
+            inversion=inversion,
+            dataset=dataset,
+        )
+
+    @classmethod
+    def from_fit(cls, fit: ag.FitInterferometer):
+        """The system a delivered fit was solved on."""
+        return cls.from_inversion(
+            fit.inversion, fit.noise_normalization, dataset=fit.dataset
+        )
+
+    # ------------------------------------------------------------------
+    @property
+    def n_parameters(self) -> int:
+        return int(self.F.shape[0])
+
+    @property
+    def n_data(self) -> int:
+        """Real plus imaginary parts: two data points per visibility."""
+        return int(2 * self.D.shape[0]) if self.dataset is None else int(
+            2 * len(np.asarray(self.dataset.data))
+        )
+
+    def regularization_matrix(self, regularization) -> np.ndarray:
+        """H for a regularisation scheme, exactly as the inversion forms it.
+
+        `AbstractInversion.regularization_matrix` is the scipy `block_diag` of
+        each linear object's matrix; with one mesh that is a copy of the one
+        block, and the copy is kept so the values match to the bit.
+        """
+        from scipy.linalg import block_diag
+
+        return block_diag(
+            regularization.regularization_matrix_from(
+                linear_obj=self.linear_obj, xp=np
+            )
+        )
+
+    def solve(self, H: np.ndarray, positive: bool) -> np.ndarray:
+        """s = (F + H)^-1 D, unconstrained or non-negative.
+
+        The two solver functions are autoarray's own
+        (`inversion_util.reconstruction_positive_negative_from` and
+        `reconstruction_positive_only_from`), called on the same arrays the
+        framework would pass them, so a `Trial` and a framework fit at the same
+        prior are the same solve. Both raise on failure -- a `LinAlgError` for
+        a singular unconstrained system, an `InversionException` from the
+        non-negative solver -- and the caller decides what a failed trial means.
+        """
+        from autoarray.inversion.inversion import inversion_util
+
+        curvature_reg = np.add(self.F, H)
+        if not positive:
+            return inversion_util.reconstruction_positive_negative_from(
+                data_vector=self.D, curvature_reg_matrix=curvature_reg, xp=np
+            )
+        if self.keep is None:
+            return inversion_util.reconstruction_positive_only_from(
+                data_vector=self.D, curvature_reg_matrix=curvature_reg,
+                settings=self.settings, xp=np,
+            )
+        partial = inversion_util.reconstruction_positive_only_from(
+            data_vector=self.D[self.keep],
+            curvature_reg_matrix=curvature_reg[self.keep][:, self.keep],
+            settings=self.settings, xp=np,
+        )
+        reconstruction = np.zeros(self.D.shape[0])
+        reconstruction[self.keep] = partial
+        return reconstruction
+
+    def chi_squared(self, reconstruction: np.ndarray) -> float:
+        """`fast_chi_squared`, operation for operation."""
+        s = np.asarray(reconstruction)
+        term_1 = np.linalg.multi_dot([s.T, self.F, s])
+        term_2 = -2.0 * np.linalg.multi_dot([s.T, self.D])
+        return float(term_1 + term_2 + self.data_term)
+
+    def log_evidence(self, reconstruction: np.ndarray, H: np.ndarray) -> float:
+        """The framework's `figure_of_merit` for a regularised inversion.
+
+        Raises `numpy.linalg.LinAlgError` where the framework would: when
+        F + H or H is not positive definite. `_safe_evidence` turns that into
+        -inf with a log line, as it always has.
+        """
+        s = np.asarray(reconstruction)
+        chi2 = self.chi_squared(s)
+        regularization_term = np.matmul(s.T, np.matmul(H, s))
+        log_det_curvature_reg = _log_det_cholesky(np.add(self.F, H))
+        log_det_regularization = _log_det_cholesky(H)
+        return float(
+            -0.5 * (
+                chi2
+                + regularization_term
+                + log_det_curvature_reg
+                - log_det_regularization
+                + self.noise_normalization
+            )
+        )
+
+    def trial(self, regularization, positive: bool) -> Trial:
+        """Solve at one prior and score it."""
+        H = self.regularization_matrix(regularization)
+        s = self.solve(H, positive=positive)
+        chi2 = self.chi_squared(s)
+        try:
+            ev = self.log_evidence(s, H)
+        except Exception as e:  # LinAlgError etc.
+            logger.info(
+                "    (evidence evaluation failed: %s: %s)", type(e).__name__, e
+            )
+            ev = -np.inf
+        return Trial(
+            coefficient=float(regularization.coefficient),
+            positive=bool(positive),
+            reconstruction=s,
+            chi_squared=chi2,
+            log_evidence=ev,
+            regularization_matrix=H,
+        )
+
+    # ------------------------------------------------------------------
+    @property
+    def mapping_matrix(self) -> np.ndarray:
+        """Mesh -> image-pixel mapping, [n_image_pixels, n_mesh]."""
+        return np.asarray(self.linear_obj.mapping_matrix)
+
+    @property
+    def operated_mapping_matrix(self):
+        """A_t = transform(A) on the dense class; None on the sparse class.
+
+        Never ask the sparse inversion for it: the attribute exists there too,
+        inherited, and answering it would build the very matrix that path
+        exists to avoid.
+        """
+        inv = self.inversion
+        if inv is None or not _is_dense_inversion(inv):
+            return None
+        return inv.operated_mapping_matrix
+
+    def model_visibilities(self, reconstruction: np.ndarray) -> np.ndarray:
+        """The model's visibilities for a reconstruction.
+
+        Dense class: `A_t @ s` with the cached transformed mapping matrix,
+        which is what `mapped_reconstructed_operated_data` computes -- except
+        that autoarray rebuilds A_t to do it, one more full
+        `transform_mapping_matrix` per call. Sparse class: the transformer's
+        forward transform of the mapped image, as the sparse inversion itself
+        does; there is no A_t to cache and one NUFFT of one image is the cost
+        the path is designed around.
+        """
+        s = np.asarray(reconstruction)
+        A_t = self.operated_mapping_matrix
+        if A_t is not None:
+            return np.asarray(A_t @ s)
+        inv = self.inversion
+        if inv is None:
+            raise RuntimeError(
+                "model visibilities need the template inversion's transformer"
+            )
+        image = ag.Array2D(values=self.mapping_matrix @ s, mask=inv.mask)
+        return np.asarray(inv.transformer.visibilities_from(image=image))
+
+    def residual_visibilities(self, reconstruction: np.ndarray) -> np.ndarray:
+        if self.dataset is None:
+            raise RuntimeError("residuals need the dataset")
+        return np.asarray(self.dataset.data) - self.model_visibilities(
+            reconstruction
+        )
+
+
+def _log_det_cholesky(matrix: np.ndarray) -> float:
+    """2 sum log diag chol(M): `AbstractInversion._log_det_symmetric_from`
+    under the default `cholesky` method, byte for byte."""
+    return 2.0 * np.sum(np.log(np.diag(np.linalg.cholesky(matrix))))
+
+
+def _is_dense_inversion(inversion) -> bool:
+    """Whether `inversion` is the mapping-matrix class (safe to ask for A_t)."""
     try:
-        return float(fit.figure_of_merit)
+        from autoarray.inversion.inversion.interferometer.mapping import (
+            InversionInterferometerMapping,
+        )
+    except Exception:  # pragma: no cover - autoarray layout changed
+        return type(inversion).__name__ == "InversionInterferometerMapping"
+    return isinstance(inversion, InversionInterferometerMapping)
+
+
+_SYSTEM_ATTR = "_pyuvimage_linear_system"
+
+
+def build_linear_system(
+    dataset: ag.Interferometer, mesh_shape: tuple[int, int]
+) -> LinearSystem:
+    """F and D for one (dataset, mesh), from one throwaway framework fit.
+
+    The regularisation and its coefficient are irrelevant to what is read off
+    -- a constant scheme at unit strength is used because it needs no
+    covariance build -- and so is the solver setting. This is the one seam the
+    search goes through: every trial afterwards is `LinearSystem.trial`.
+    """
+    template = fit_at(dataset, mesh_shape, "constant", 1.0, positive_only=False)
+    return LinearSystem.from_fit(template)
+
+
+def attach_system(fit: ag.FitInterferometer, system: LinearSystem) -> None:
+    """Hand a delivered fit the system it was solved on, and seed its caches.
+
+    Two things happen. The system is stored on the fit so that `_chi_squared`,
+    `_safe_evidence`, `structure_ratio` and every `SingleFit` product read F
+    and D from it instead of asking autoarray to rebuild them. And the
+    coefficient-invariant caches of the fit's own inversion are seeded from the
+    system, so that anything downstream which does go through autoarray's
+    properties -- `pointsource` reads `operated_mapping_matrix` -- finds them
+    already built:
+
+    * dense class: `operated_mapping_matrix` is an autonerves cached property
+      backed by the instance `__dict__`, so the template's A_t is placed there
+      and the delivered fit never runs `transform_mapping_matrix` at all;
+    * sparse class: `curvature_matrix` honours `preloads.curvature_matrix`, so
+      F is preloaded through autoarray's own `PreloadsInterferometer`.
+
+    Both are refused unless the fit is on the same dataset and mesh as the
+    system, and both are optional -- without them the fit is merely slower.
+    """
+    fit.__dict__[_SYSTEM_ATTR] = system
+    try:
+        inv = fit.inversion
+    except Exception:  # pragma: no cover - a fit with no inversion
+        return
+    template = getattr(system, "inversion", None)
+    same_problem = (
+        getattr(system, "dataset", None) is not None
+        and getattr(fit, "dataset", None) is system.dataset
+        and template is not None
+        and type(inv) is type(template)
+        and len(inv.linear_obj_list) == 1
+        and int(inv.linear_obj_list[0].params) == system.n_parameters
+    )
+    if not same_problem:
+        return
+    if _is_dense_inversion(inv):
+        cached = template.__dict__.get("operated_mapping_matrix")
+        if cached is not None and "operated_mapping_matrix" not in inv.__dict__:
+            inv.__dict__["operated_mapping_matrix"] = cached
+        return
+    preloads_cls = getattr(__import__("autoarray"), "PreloadsInterferometer", None)
+    if preloads_cls is not None and getattr(inv, "_preloads", None) is None:
+        try:
+            inv._preloads = preloads_cls(curvature_matrix=system.F)
+        except Exception:  # pragma: no cover - autoarray layout changed
+            pass
+
+
+def system_for(fit: ag.FitInterferometer) -> LinearSystem:
+    """The `LinearSystem` behind a fit, built from it (once) if none was attached."""
+    system = getattr(fit, _SYSTEM_ATTR, None)
+    if system is None:
+        system = LinearSystem.from_fit(fit)
+        fit.__dict__[_SYSTEM_ATTR] = system
+    return system
+
+
+def _safe_evidence(fit: ag.FitInterferometer) -> float:
+    """The fit's log evidence, -inf where it cannot be evaluated.
+
+    Through the fit's `LinearSystem`, so that a fit whose F and D are already
+    known is not asked to rebuild them: autoarray's `figure_of_merit` on a fresh
+    `FitInterferometer` recomputes `curvature_matrix` twice and `data_vector`
+    once, and on the profiled mock that was 41.7 s over 53 calls -- as much as
+    the whole search should take.
+    """
+    try:
+        if not _looks_like_framework_fit(fit):
+            # a stand-in with no matrices to read: the fit's own answer
+            return float(fit.figure_of_merit)
+        system = system_for(fit)
+        H = np.asarray(fit.inversion.regularization_matrix)
+        return system.log_evidence(fit.inversion.reconstruction, H)
     except Exception as e:  # LinAlgError etc.
         logger.info("    (evidence evaluation failed: %s: %s)", type(e).__name__, e)
         return -np.inf
+
+
+def _looks_like_framework_fit(fit) -> bool:
+    """Whether `fit.inversion` is an autoarray inversion (a `LinearSystem` can
+    be read off it) rather than a stand-in."""
+    inv = getattr(fit, "inversion", None)
+    return inv is not None and hasattr(inv, "curvature_matrix") and hasattr(
+        inv, "linear_obj_list"
+    )
 
 
 @dataclass
@@ -1687,6 +2243,22 @@ class PriorScan:
     #: uses. With positivity on this is a floor the fit cannot go below, so
     #: the discrepancy target has to respect it (see `effective_chi2_target`).
     chi2_floor: float = float("nan")
+
+    @property
+    def effective_criterion(self) -> str:
+        """The criterion that actually chose the prior.
+
+        `criterion` records the history -- ``"structure->discrepancy (ratio
+        unreachable)"``, ``"discrepancy->evidence (unreachable target)"`` --
+        and the last name in that chain is the one whose rules the answer
+        obeys. `fit_dataset` gates its constrained re-bisection on this, not
+        on what was asked for: after `structure` handed back to `discrepancy`
+        the coefficient is a chi^2 choice and needs the same re-bisection any
+        chi^2 choice does, and after either fell back to `evidence` there is
+        no chi^2 target left to re-bisect against.
+        """
+        last = self.criterion.split("->")[-1]
+        return last.split(" ")[0].strip() or self.criterion
 
     def record(
         self,
@@ -1797,12 +2369,26 @@ def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
 
     On PJ0116 this separates a good fit (0.94) from an overfit one (0.73) while
     chi^2/N moves only 1.007 -> 1.036.
+
+    The residual visibilities come from the fit's `LinearSystem` rather than
+    from `fit.model_data`: on the dense class autoarray forms the model
+    visibilities by transforming the mapping matrix *again*, so every structure
+    evaluation used to cost a second full `transform_mapping_matrix`.
     """
     chi2 = _chi_squared(fit)
     if not np.isfinite(chi2) or chi2 <= 0 or not n_data:
         return float("nan")
     try:
-        resid = np.asarray(fit.dataset.data) - np.asarray(fit.model_data)
+        resid = system_for(fit).residual_visibilities(fit.inversion.reconstruction)
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.debug("structure ratio failed: %s", e)
+        return float("nan")
+    return _structure_ratio(resid, chi2, imager, n_data)
+
+
+def _structure_ratio(resid: np.ndarray, chi2: float, imager, n_data: int) -> float:
+    """`structure_ratio` from the residual visibilities and chi^2 themselves."""
+    try:
         rms = imager.rms
         if not np.isfinite(rms) or rms <= 0:
             return float("nan")
@@ -1823,8 +2409,17 @@ def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
 
 
 def _chi_squared(fit: ag.FitInterferometer) -> float:
+    """chi^2 of a fit, NaN where it cannot be evaluated.
+
+    The quadratic form of `fast_chi_squared`, evaluated on the fit's
+    `LinearSystem` so F and D are built at most once per fit -- autoarray's own
+    property rebuilds both on every access (53 calls, 41.7 s on the profiled
+    mock). A stand-in with no matrices to read is asked directly.
+    """
     try:
-        return float(fit.inversion.fast_chi_squared)
+        if not _looks_like_framework_fit(fit):
+            return float(fit.inversion.fast_chi_squared)
+        return system_for(fit).chi_squared(fit.inversion.reconstruction)
     except Exception:
         return float("nan")
 
@@ -1838,10 +2433,11 @@ def optimise_prior(
     fixed_scale: float | None = None,
     envelope: dict | None = None,
     optimise_envelope: bool = False,
-    adapt_image=None,
     chi2_target: float = 1.0,
     max_evaluations: int = 60,
     positive_only: bool = False,
+    system: LinearSystem | None = None,
+    n_data: int | None = None,
 ) -> tuple[dict, PriorScan]:
     """Optimise the source-prior hyperparameters.
 
@@ -1873,9 +2469,18 @@ def optimise_prior(
     is much faster and `fit_dataset` re-bisects afterwards) but its
     reachability probe uses it, because the constrained chi^2 floor is what
     the delivered fit actually has to live with.
+
+    Every trial is a solve of one `LinearSystem` -- built here from the
+    dataset and mesh unless ``system`` is passed in, which `fit_dataset` does
+    so that its probes, this search and the delivered fit all share the one F
+    and D. Nothing in the search depends on the number of visibilities once
+    that system exists.
     """
     mesh_shape = geometry.mesh_shape
-    n_data = 2 * len(np.asarray(dataset.data))
+    if n_data is None:
+        n_data = 2 * len(np.asarray(dataset.data))
+    if system is None:
+        system = build_linear_system(dataset, mesh_shape)
     # a kernel prior whose correlation length is pinned has only one free
     # hyperparameter, exactly like the non-kernel schemes
     is_kernel_scheme = reg_kind in KERNEL_REGULARIZATIONS
@@ -1916,6 +2521,18 @@ def optimise_prior(
     # fast unconstrained solve (the evidence is defined for it).
     search_positive = bool(positive_only) and criterion == "structure"
 
+    def recurse(**overrides):
+        """The same search under a different criterion, on the same system."""
+        kwargs = dict(
+            reg_kind=reg_kind, criterion=criterion, nu=nu,
+            fixed_scale=fixed_scale, envelope=envelope,
+            optimise_envelope=optimise_envelope, chi2_target=chi2_target,
+            max_evaluations=max_evaluations, positive_only=positive_only,
+            system=system, n_data=n_data,
+        )
+        kwargs.update(overrides)
+        return optimise_prior(dataset, geometry, **kwargs)
+
     def evaluate(
         log_params: np.ndarray, positive: bool | None = None
     ) -> tuple[float, float, float]:
@@ -1926,15 +2543,16 @@ def optimise_prior(
         if second == "envelope_fwhm":
             env = {**(envelope or {}), "fwhm": 10.0 ** float(log_params[1])}
         try:
-            fit = fit_at(
-                dataset, mesh_shape, reg_kind, coefficient,
-                positive_only=positive, reg_scale=scale, nu=nu,
-                envelope=env, adapt_image=adapt_image,
+            trial = system.trial(
+                make_regularization(reg_kind, coefficient, scale, nu, env),
+                positive=positive,
             )
-            ev = _safe_evidence(fit)
-            chi2 = _chi_squared(fit)
+            ev, chi2 = trial.log_evidence, trial.chi_squared
             ratio = (
-                structure_ratio(fit, imager, n_data)
+                _structure_ratio(
+                    system.residual_visibilities(trial.reconstruction),
+                    chi2, imager, n_data,
+                )
                 if imager is not None else float("nan")
             )
         except Exception as e:
@@ -2001,9 +2619,15 @@ def optimise_prior(
         # with the solver the delivered fit uses: positivity raises chi^2, so
         # probing unconstrained hides a constrained floor above the target,
         # which is exactly how PJ0116 ended up with no effective prior.
-        # the probe vector must match the number of free hyperparameters
+        #
+        # The probe vector must match the number of free hyperparameters --
+        # whichever the second one is. It used to be appended only for a free
+        # kernel scale, so `--reg gaussian --envelope-fwhm optimise` (second
+        # parameter: the envelope width) handed a one-element vector to an
+        # `evaluate` that reads `log_params[1]`, and died with an IndexError
+        # before the first trial.
         probe = [LOG_COEFFICIENT_BOUNDS[0]]
-        if kernel:
+        if two_d:
             probe.append(float(np.mean(log_scale_bounds)))
         _, chi2_weakest, ratio_weakest = evaluate(
             np.array(probe), positive=positive_only
@@ -2024,11 +2648,9 @@ def optimise_prior(
                 "not switched off.",
                 unit, floor / per, target / per,
             )
-            best, ev_scan = optimise_prior(
-                dataset, geometry, reg_kind=reg_kind, criterion="evidence",
-                nu=nu, fixed_scale=fixed_scale, envelope=envelope,
-                adapt_image=adapt_image, max_evaluations=max_evaluations,
-            )
+            # the evidence is defined for the unconstrained solution, and the
+            # evidence search never consults `positive_only`
+            best, ev_scan = recurse(criterion="evidence", positive_only=False)
             scan.trials.extend(ev_scan.trials)
             scan.criterion = f"{criterion}->evidence (unreachable target)"
             scan.best = best
@@ -2089,6 +2711,10 @@ def optimise_prior(
                 if hi - lo < 0.02:
                     break
             best_c = 0.5 * (lo + hi)
+            if not two_d:
+                # nothing ranks the result, so the evidence at the chosen
+                # point is not needed; the delivered fit is solved there anyway
+                return best_c, float("nan")
             _, ev = measure(p(best_c))
             return best_c, ev
 
@@ -2130,15 +2756,18 @@ def optimise_prior(
                 "be white at chi^2 = N. Falling back to --criterion "
                 "discrepancy.", target,
             )
-            best, chi_scan = optimise_prior(
-                dataset, geometry, reg_kind=reg_kind, criterion="discrepancy",
-                positive_only=positive_only, nu=nu, fixed_scale=fixed_scale,
-                envelope=envelope, adapt_image=adapt_image,
-                max_evaluations=max_evaluations, chi2_target=chi2_target,
-            )
+            best, chi_scan = recurse(criterion="discrepancy")
             scan.trials.extend(chi_scan.trials)
             scan.chi2_floor = chi_scan.chi2_floor
-            scan.criterion = "structure->discrepancy (ratio unreachable)"
+            # Keep the whole history. If chi^2 in turn gave up and went to
+            # the evidence, `fit_dataset` has to know: it must not re-bisect
+            # an evidence choice against a chi^2 target, and it must
+            # re-bisect a chi^2 choice even though `structure` was asked for
+            # (see `PriorScan.effective_criterion`).
+            if chi_scan.criterion == "discrepancy":
+                scan.criterion = "structure->discrepancy (ratio unreachable)"
+            else:
+                scan.criterion = f"structure->{chi_scan.criterion}"
             scan.best = best
             return best, scan
     else:
@@ -2233,7 +2862,17 @@ def _deblock(image: np.ndarray, oversample: int) -> np.ndarray:
 
 @dataclass
 class SingleFit:
-    """Everything downstream products need from one fit."""
+    """Everything downstream products need from one fit.
+
+    The heavy pieces are computed once and kept. `products.py` asks for the
+    posterior covariance, the model uncertainty, the prior systematic, the
+    evidence and chi^2 in turn, and each of those used to go back to autoarray
+    for F and (F + H)^-1 afresh: F six times over, the inverse two or three
+    times. `functools.cached_property` works on a plain (non-frozen, non-slots)
+    dataclass because it stores into the instance `__dict__`, which is what is
+    used here; `prior_systematic` takes an argument and keeps its own small
+    cache keyed on it.
+    """
 
     fit: ag.FitInterferometer
     geometry: ImageGeometry
@@ -2250,6 +2889,21 @@ class SingleFit:
         return float(self.prior["coefficient"])
 
     @property
+    def system(self) -> LinearSystem:
+        """F, D and the constants this fit was solved on (see `LinearSystem`)."""
+        return system_for(self.fit)
+
+    @functools.cached_property
+    def reconstruction(self) -> np.ndarray:
+        """The mesh solution, [Jy / image pixel], as the inversion solved it."""
+        return np.asarray(self.fit.inversion.reconstruction, dtype=float)
+
+    @functools.cached_property
+    def regularization_matrix(self) -> np.ndarray:
+        """H = coefficient x C^-1 at the delivered hyperparameters."""
+        return np.asarray(self.fit.inversion.regularization_matrix)
+
+    @property
     def model_mesh_image(self) -> np.ndarray:
         """Reconstruction on the source mesh, 2D [Jy / mesh pixel].
 
@@ -2257,13 +2911,13 @@ class SingleFit:
         mesh cell's value is replicated over oversample^2 image pixels by the
         mapper), so the per-mesh-pixel flux carries that factor.
         """
-        recon = np.asarray(self.fit.inversion.reconstruction)
+        recon = self.reconstruction
         k2 = (
             self.geometry.shape_native[0] // self.geometry.mesh_shape[0]
         ) ** 2
         return recon.reshape(self.geometry.mesh_shape) * k2
 
-    @property
+    @functools.cached_property
     def model_image(self) -> np.ndarray:
         """The model image on the product grid, exactly as the fit formed it.
 
@@ -2284,7 +2938,7 @@ class SingleFit:
             ).native
         )
 
-    @property
+    @functools.cached_property
     def posterior_covariance(self) -> np.ndarray:
         """Posterior covariance of the reconstruction, (F + H)^-1.
 
@@ -2297,9 +2951,9 @@ class SingleFit:
         include the systematic error from the prior itself being wrong, which
         on a poorly-sampled field is usually the larger effect.
         """
-        return np.linalg.inv(np.asarray(self.fit.inversion.curvature_reg_matrix))
+        return np.linalg.inv(np.add(self.system.F, self.regularization_matrix))
 
-    @property
+    @functools.cached_property
     def sampling_covariance(self) -> np.ndarray:
         """Covariance of the *estimator*: (F+H)^-1 F (F+H)^-1.
 
@@ -2310,7 +2964,7 @@ class SingleFit:
         to 0.4%.
         """
         cov = self.posterior_covariance
-        return cov @ np.asarray(self.fit.inversion.curvature_matrix) @ cov
+        return cov @ self.system.F @ cov
 
     def _propagate(self, cov: np.ndarray) -> np.ndarray:
         """sqrt(diag(M C M^T)) on the image grid, for a parameter covariance."""
@@ -2328,7 +2982,7 @@ class SingleFit:
             ).native
         )
 
-    @property
+    @functools.cached_property
     def model_uncertainty_sampling(self) -> np.ndarray:
         """1-sigma scatter of the model image over noise realisations.
 
@@ -2338,7 +2992,7 @@ class SingleFit:
         """
         return self._propagate(self.sampling_covariance)
 
-    @property
+    @functools.cached_property
     def model_uncertainty(self) -> np.ndarray:
         """Per-pixel 1-sigma uncertainty of the model image [Jy/pixel].
 
@@ -2364,15 +3018,21 @@ class SingleFit:
         None if the rescaled system is not positive definite (weakening the
         prior far enough makes F alone singular wherever the mesh has pixels
         the uv coverage does not constrain).
+
+        The re-solve uses the solver the delivered fit used. It used to be
+        unconstrained regardless, so on a positive-only fit the "systematic"
+        this feeds compared a non-negative model against two signed ones and
+        counted the positivity constraint itself -- a difference that has
+        nothing to do with the prior's strength -- as prior systematic.
         """
-        inv = self.fit.inversion
-        F = np.asarray(inv.curvature_matrix)
-        H = np.asarray(inv.regularization_matrix)
-        D = np.asarray(inv.data_vector)
         try:
-            values = np.linalg.solve(F + float(factor) * H, D)
-        except np.linalg.LinAlgError:
+            values = self.system.solve(
+                float(factor) * self.regularization_matrix,
+                positive=bool(self.positive_only),
+            )
+        except Exception:  # LinAlgError, InversionException
             return None
+        inv = self.fit.inversion
         slim = None
         for obj, _ in inv.reconstruction_dict.items():
             M = np.asarray(obj.mapping_matrix)
@@ -2398,6 +3058,10 @@ class SingleFit:
         This does not capture the prior *family* being wrong -- nothing
         cheap does.
         """
+        cache = self.__dict__.setdefault("_prior_systematic_cache", {})
+        key = float(spread_dex)
+        if key in cache:
+            return cache[key]
         base = self.model_image
         worst = np.zeros_like(base)
         for factor in (10.0**spread_dex, 10.0**-spread_dex):
@@ -2405,6 +3069,7 @@ class SingleFit:
             if alt is None:
                 continue
             worst = np.maximum(worst, np.abs(alt - base))
+        cache[key] = worst
         return worst
 
     def model_uncertainty_total(
@@ -2491,19 +3156,24 @@ class SingleFit:
             var += float(v @ cov[sl, :][:, sl] @ v)
         return float(np.sqrt(max(var, 0.0)))
 
-    @property
+    @functools.cached_property
     def model_visibilities(self) -> np.ndarray:
-        return np.asarray(self.fit.model_data)
+        """The model's visibilities, from the cached transformed mapping matrix.
+
+        `fit.model_data` computes the same numbers but transforms the mapping
+        matrix again to do it (see `LinearSystem.model_visibilities`).
+        """
+        return self.system.model_visibilities(self.reconstruction)
 
     @property
     def residual_visibilities(self) -> np.ndarray:
         return np.asarray(self.fit.dataset.data) - self.model_visibilities
 
-    @property
+    @functools.cached_property
     def log_evidence(self) -> float:
         return _safe_evidence(self.fit)
 
-    @property
+    @functools.cached_property
     def chi_squared(self) -> float:
         return _chi_squared(self.fit)
 
@@ -2521,10 +3191,16 @@ def fit_dataset(
     envelope: dict | None = None,
     optimise_envelope: bool = False,
     chi2_target: float = 1.0,
-    adapt_image=None,
     warn_on_chi2: bool = True,
+    system: LinearSystem | None = None,
 ) -> SingleFit:
-    """Fit one dataset, optimising the source prior unless `prior` is given.
+    """Fit one Interferometer dataset (one channel, or the MFS stack).
+
+    ``prior`` fixes the source-prior hyperparameters (keys ``coefficient``
+    and, for kernel schemes, ``scale`` in arcsec); if ``None`` they are
+    optimised. The adaptive priors (`ADAPTIVE_REGULARIZATIONS`) run two
+    stages: a first pass with a plain Matern prior whose model becomes the
+    brightness map the second pass's prior follows.
 
     `warn_on_chi2=False` suppresses the "does not reproduce the data" warning
     for a fit that is an intermediate stage rather than the answer. The demo
@@ -2532,25 +3208,33 @@ def fit_dataset(
     mesh-only pass sits at chi^2/N ~ 2.9 and told the user three times that
     the products should not be trusted -- before the point fit that brings it
     to 1.000. The caller that knows more is the one that should speak.
-    """
-    """Fit one Interferometer dataset (one channel, or the MFS stack).
 
-    ``prior`` fixes the source-prior hyperparameters (keys ``coefficient``
-    and, for kernel schemes, ``scale`` in arcsec); if ``None`` they are
-    optimised.  ``reg_kind="adapt"`` runs two stages: a first pass with
-    constant regularisation whose model becomes the brightness map that the
-    second pass's adaptive regularisation follows.
+    ``system`` is the coefficient-invariant `LinearSystem` for this dataset
+    and mesh. Built here when not given; the adaptive first pass hands its own
+    to the second so F and D are built once per fit, not once per stage.
     """
     mesh_shape = geometry.mesh_shape
+    n_data = 2 * len(np.asarray(dataset.data))
 
+    # F and D once. Everything below -- the probes, the search, the
+    # constrained re-bisection -- is a solve on this; only the delivered fit
+    # is a framework `FitInterferometer`, and it is seeded from this too.
+    needs_search = prior is None
     envelope = dict(envelope or {})
-    if reg_kind in ADAPTIVE_REGULARIZATIONS and envelope.get("brightness") is None:
+    needs_first_pass = (
+        reg_kind in ADAPTIVE_REGULARIZATIONS and envelope.get("brightness") is None
+    )
+    if system is None and (needs_search or needs_first_pass):
+        system = build_linear_system(dataset, mesh_shape)
+
+    if needs_first_pass:
         logger.info("%s prior: first pass (plain Matern)...", reg_kind)
         first = fit_dataset(
             dataset, geometry, reg_kind="matern", prior=None,
             positive_only=positive_only, criterion=criterion, nu=nu,
             fixed_scale=fixed_scale, chi2_target=chi2_target,
-            enforce_positive=enforce_positive,
+            enforce_positive=enforce_positive, warn_on_chi2=warn_on_chi2,
+            system=system,
         )
         envelope["brightness"] = np.clip(first.model_mesh_image.ravel(), 0.0, None)
         # Drop the first-pass fit before the second one allocates. It holds an
@@ -2560,11 +3244,48 @@ def fit_dataset(
         # Keeping it alive roughly doubles the peak, which is what OOM-killed
         # 9io9 twice at the exact moment the second pass started, on a fit
         # whose single-inversion estimate (5.3 GB) fitted comfortably.
+        # (The shared `system` keeps one A_t alive across both passes now, so
+        # the second pass's fit shares rather than duplicates it.)
         del first
         gc.collect()
         logger.info(
             "%s prior: second pass (tracks the first-pass model)", reg_kind,
         )
+
+    def regularization_for(coefficient: float, prior_: dict | None = None):
+        """The prior at one coefficient, with the other hyperparameters fixed."""
+        p = prior_ or {}
+        scale = p.get(
+            "scale", fixed_scale if reg_kind in KERNEL_REGULARIZATIONS else None
+        )
+        env = envelope
+        if "envelope_fwhm" in p:
+            env = {**envelope, "fwhm": float(p["envelope_fwhm"])}
+        return make_regularization(
+            reg_kind, coefficient, scale, p.get("nu", nu), env
+        )
+
+    def _probe_model(coefficient, positive, prior_=None):
+        """The reconstruction itself, which is what the prior acts on."""
+        try:
+            return system.trial(
+                regularization_for(coefficient, prior_), positive=positive
+            )
+        except Exception:
+            return None
+
+    def search(positive: bool):
+        return optimise_prior(
+            dataset, geometry, reg_kind=reg_kind, criterion=criterion,
+            nu=nu, fixed_scale=fixed_scale, envelope=envelope,
+            optimise_envelope=optimise_envelope,
+            chi2_target=chi2_target, positive_only=positive,
+            system=system, n_data=n_data,
+        )
+
+    scan = None
+    if needs_search:
+        prior, scan = search(positive_only)
 
     # ---- positivity sanity check -------------------------------------
     # The non-negative solver is not always reliable: on some datasets it
@@ -2572,36 +3293,22 @@ def fit_dataset(
     # coefficients spanning eight orders of magnitude) and fits far worse than
     # the unconstrained solve. Silently shipping that would make every prior
     # look identical, so check once and fall back if it happens.
-    if positive_only and prior is None:
-        probe_scale = fixed_scale if reg_kind in KERNEL_REGULARIZATIONS else None
-        probe_kwargs = dict(
-            reg_scale=probe_scale, nu=nu, envelope=envelope,
-            adapt_image=adapt_image,
+    #
+    # Probed at the coefficient the search chose. It used to be probed at a
+    # fixed coefficient of 1.0, which is the log-midpoint of the shipped
+    # bounds and otherwise arbitrary: the coefficient's units follow the
+    # data's, and 1.0 can sit six decades from where the fit will actually
+    # run, where "fits far worse than the unconstrained solve" says nothing
+    # about the solver the delivered model will use.
+    if positive_only and needs_search:
+        chosen = float(prior["coefficient"])
+        free_t = _probe_model(chosen, False, prior)
+        constrained_t = _probe_model(chosen, True, prior)
+        free = free_t.chi_squared if free_t is not None else np.nan
+        constrained = (
+            constrained_t.chi_squared if constrained_t is not None else np.nan
         )
-
-        def _probe(coefficient, positive):
-            try:
-                return _chi_squared(fit_at(
-                    dataset, mesh_shape, reg_kind, coefficient,
-                    positive_only=positive, **probe_kwargs))
-            except Exception:
-                return np.nan
-
-        def _probe_model(coefficient, positive):
-            """The reconstruction itself, which is what the prior acts on."""
-            try:
-                fit = fit_at(
-                    dataset, mesh_shape, reg_kind, coefficient,
-                    positive_only=positive, **probe_kwargs)
-                model = np.asarray(fit.inversion.reconstruction, dtype=float)
-                del fit  # the fit holds the transformed mapping matrix
-                return model
-            except Exception:
-                return None
-
-        free = _probe(1.0, False)
-        constrained = _probe(1.0, True)
-        n_vis = len(np.asarray(dataset.data))
+        n_vis = n_data // 2
         reason = None
         if (
             np.isfinite(free) and np.isfinite(constrained)
@@ -2629,23 +3336,16 @@ def fit_dataset(
             # solution, so measure that. A solver that is genuinely ignoring
             # the prior returns the same model at both ends; a working one
             # cannot.
-            weak_m = _probe_model(1e-3, True)
-            strong_m = _probe_model(1e9, True)
-            if (
-                weak_m is not None and strong_m is not None
-                and weak_m.shape == strong_m.shape
-            ):
-                scale = float(np.linalg.norm(weak_m))
-                change = (
-                    float(np.linalg.norm(strong_m - weak_m)) / scale
-                    if scale > 0 else 0.0
+            change = _model_response(
+                lambda c: system.trial(regularization_for(c, prior), positive=True),
+                1e-3, 1e9,
+            )
+            if change is not None and change < POSITIVITY_PRIOR_RESPONSE:
+                reason = (
+                    f"the reconstruction changes by only {100 * change:.2g}% "
+                    f"between regularisation strengths twelve decades "
+                    f"apart, so it is ignoring the prior entirely"
                 )
-                if change < POSITIVITY_PRIOR_RESPONSE:
-                    reason = (
-                        f"the reconstruction changes by only {100 * change:.2g}% "
-                        f"between regularisation strengths twelve decades "
-                        f"apart, so it is ignoring the prior entirely"
-                    )
         if reason is not None and enforce_positive:
             logger.warning(
                 "the non-negative solver looks unreliable on this data: %s. "
@@ -2661,15 +3361,12 @@ def fit_dataset(
                 "(--enforce-positive) to keep it regardless.", reason,
             )
             positive_only = False
+            if criterion != "evidence":
+                # the search consulted the constrained solver -- for its
+                # reachability floor, or throughout under `structure` -- so
+                # its answer was conditional on a solver that is now off
+                prior, scan = search(False)
 
-    scan = None
-    if prior is None:
-        prior, scan = optimise_prior(
-            dataset, geometry, reg_kind=reg_kind, criterion=criterion,
-            nu=nu, fixed_scale=fixed_scale, envelope=envelope,
-            optimise_envelope=optimise_envelope, adapt_image=adapt_image,
-            chi2_target=chi2_target, positive_only=positive_only,
-        )
     if "envelope_fwhm" in prior:
         envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
     prior = dict(prior)
@@ -2677,25 +3374,31 @@ def fit_dataset(
         prior.setdefault("nu", nu)
 
     def _fit(coefficient: float) -> ag.FitInterferometer:
-        return fit_at(
+        """The delivered fit: a real framework fit at one coefficient."""
+        fit = fit_at(
             dataset, mesh_shape, reg_kind, coefficient,
             positive_only=positive_only, reg_scale=prior.get("scale"),
-            nu=prior.get("nu", nu), envelope=envelope, adapt_image=adapt_image,
+            nu=prior.get("nu", nu), envelope=envelope,
         )
-
-    fit = _fit(prior["coefficient"])
+        if system is not None:
+            attach_system(fit, system)
+        return fit
 
     # The hyperparameter search uses the fast unconstrained solver, but the
     # final fit may impose positivity, which raises chi^2. When that shifts
     # the fit off the noise level, re-bisect the coefficient with the solver
     # actually in use so the delivered model really does fit to the noise.
+    #
+    # Gated on the criterion that actually chose the prior, not the one asked
+    # for: `structure` hands back to `discrepancy` when its ratio is out of
+    # reach, and that chi^2 choice needs this re-bisection like any other --
+    # it used to be skipped because `criterion` still read "structure". And a
+    # search that gave up on chi^2 and fell back to the evidence must not
+    # have its answer re-bisected against the target it gave up on.
     if (
-        scan is not None and criterion == "discrepancy" and positive_only
-        # a search that gave up on chi^2 and fell back to the evidence must
-        # not then have its answer re-bisected against the target it gave up on
-        and "->evidence" not in scan.criterion
+        scan is not None and positive_only
+        and scan.effective_criterion == "discrepancy"
     ):
-        n_data = 2 * len(np.asarray(dataset.data))
         # The search probed the weakest prior on this same solver, so we know
         # what chi^2 the constrained fit can actually reach. If that floor is
         # above the target, bisecting towards the target walks the
@@ -2710,7 +3413,8 @@ def fit_dataset(
                 "coefficient is chosen against %.4g rather than %.4g.",
                 scan.chi2_floor / n_data, target / n_data, chi2_target,
             )
-        chi2 = _chi_squared(fit)
+        first_trial = _probe_model(prior["coefficient"], True, prior)
+        chi2 = first_trial.chi_squared if first_trial is not None else np.nan
         # A few per cent, not the 50%% this used to allow: chi^2 is nearly
         # flat in the coefficient near the floor, so a loose gate lets a
         # badly over- or under-smoothed model through as "close enough".
@@ -2723,30 +3427,36 @@ def fit_dataset(
                 chi2 / n_data if np.isfinite(chi2) else np.nan,
             )
             # Bisect using only constrained evaluations, tracked separately
-            # from the (unconstrained) hyperparameter search trials.
-            tried: list[tuple[float, float]] = [(prior["coefficient"], chi2)]
+            # from the (unconstrained) hyperparameter search trials. Each
+            # entry keeps its reconstruction, so the solver check below
+            # judges the models already solved rather than solving them again.
+            tried: list[tuple[float, float, np.ndarray | None]] = [(
+                prior["coefficient"], chi2,
+                None if first_trial is None else first_trial.reconstruction,
+            )]
+
+            def constrained(coefficient):
+                t = _probe_model(coefficient, True, prior)
+                c = t.chi_squared if t is not None else np.nan
+                tried.append((
+                    coefficient, c, None if t is None else t.reconstruction
+                ))
+                logger.info(
+                    "  coefficient=%.4g (positive)  chi2/N=%.4g",
+                    coefficient, c / n_data if np.isfinite(c) else np.nan,
+                )
+                return t, c
+
             lo, hi = LOG_COEFFICIENT_BOUNDS[0], np.log10(prior["coefficient"])
             while chi2 < target and hi < MAX_LOG_COEFFICIENT:
                 hi = min(hi + 3.0, MAX_LOG_COEFFICIENT)
-                trial = _fit(10.0**hi)
-                chi2 = _chi_squared(trial)
-                tried.append((10.0**hi, chi2))
-                logger.info(
-                    "  coefficient=%.4g (positive)  chi2/N=%.4g",
-                    10.0**hi, chi2 / n_data if np.isfinite(chi2) else np.nan,
-                )
+                _, chi2 = constrained(10.0**hi)
             for _ in range(9):
                 mid = 0.5 * (lo + hi)
-                trial = _fit(10.0**mid)
-                c = _chi_squared(trial)
-                tried.append((10.0**mid, c))
+                t, c = constrained(10.0**mid)
                 scan.record(
                     {**prior, "coefficient": 10.0**mid},
-                    _safe_evidence(trial), c,
-                )
-                logger.info(
-                    "  coefficient=%.4g (positive)  chi2/N=%.4g",
-                    10.0**mid, c / n_data if np.isfinite(c) else np.nan,
+                    t.log_evidence if t is not None else -np.inf, c,
                 )
                 if not np.isfinite(c) or c < target:
                     lo = mid
@@ -2755,18 +3465,20 @@ def fit_dataset(
                 if hi - lo < 0.02:
                     break
             usable = [
-                (co, c) for co, c in tried if np.isfinite(c) and c > 0
+                (co, c) for co, c, _ in tried if np.isfinite(c) and c > 0
             ]
             if usable:
                 prior["coefficient"] = float(
                     min(usable, key=lambda t: abs(np.log10(t[1] / target)))[0]
                 )
+                chosen_chi2 = dict(usable)[prior["coefficient"]]
             else:
                 prior["coefficient"] = 10.0 ** (0.5 * (lo + hi))
-            fit = _fit(prior["coefficient"])
+                t = _probe_model(prior["coefficient"], True, prior)
+                chosen_chi2 = t.chi_squared if t is not None else np.nan
             logger.info(
                 "  chosen coefficient=%.4g (chi2/N=%.4g)",
-                prior["coefficient"], _chi_squared(fit) / n_data,
+                prior["coefficient"], chosen_chi2 / n_data,
             )
             scan.best = dict(prior)
 
@@ -2785,13 +3497,14 @@ def fit_dataset(
             # tried[0] is the coefficient the *unconstrained* search chose, so
             # it sits apart from the rest; judge on the constrained trials.
             finite = [
-                (co, c) for co, c in tried[1:] if np.isfinite(c) and c > 0
+                (co, c, s) for co, c, s in tried[1:]
+                if np.isfinite(c) and c > 0 and s is not None
             ]
             if len(finite) >= 3 and not enforce_positive:
-                decades = np.ptp(np.log10([co for co, _ in finite]))
-                lo_co = min(co for co, _ in finite)
-                hi_co = max(co for co, _ in finite)
-                change = _model_response(_fit, lo_co, hi_co)
+                decades = np.ptp(np.log10([co for co, _, _ in finite]))
+                weakest = min(finite, key=lambda t: t[0])
+                strongest = max(finite, key=lambda t: t[0])
+                change = _relative_change(weakest[2], strongest[2])
                 if (
                     decades > 3.0 and change is not None
                     and change < POSITIVITY_PRIOR_RESPONSE
@@ -2805,27 +3518,22 @@ def fit_dataset(
                         100 * change, decades,
                     )
                     positive_only = False
-                    prior, scan = optimise_prior(
-                        dataset, geometry, reg_kind=reg_kind,
-                        criterion=criterion, nu=nu, fixed_scale=fixed_scale,
-                        envelope=envelope, optimise_envelope=optimise_envelope,
-                        adapt_image=adapt_image, chi2_target=chi2_target,
-                    )
+                    prior, scan = search(False)
                     if reg_kind in KERNEL_REGULARIZATIONS:
                         prior.setdefault("nu", nu)
-                    fit = _fit(prior["coefficient"])
+
+    fit = _fit(prior["coefficient"])
 
     chi2_final = _chi_squared(fit)
-    n_data_final = 2 * len(np.asarray(dataset.data))
     if np.isfinite(chi2_final) and warn_on_chi2:
-        ratio = chi2_final / (chi2_target * n_data_final)
+        ratio = chi2_final / (chi2_target * n_data)
         if ratio > CHI2_UNREACHABLE_FACTOR:
             logger.warning(
                 "chi^2/N = %.3g against a target of %.3g: the model does not "
                 "reproduce the data and its products should not be trusted. "
                 "Usual causes are emission outside --fov, a mesh too coarse "
                 "for the S/N, or an underestimated noise map.",
-                chi2_final / n_data_final, chi2_target,
+                chi2_final / n_data, chi2_target,
             )
 
     return SingleFit(

@@ -91,8 +91,54 @@ def clear_covariance_cache() -> None:
     _COV_CACHE.clear()
 
 
+class _OwnCovarianceShortcuts:
+    """The evidence shortcuts autoarray offers kernel priors, from *this*
+    kernel's covariance.
+
+    `MaternKernel` ships two opt-in short cuts that the inversion consults
+    only under non-default settings -- `log_det_regularization_matrix_term_from`
+    under ``Settings.log_det_method == "slogdet"`` and
+    `regularization_term_from` under ``regularization_term_method ==
+    "cho_solve"`` -- and both rebuild a *plain* Matern covariance from
+    ``scale`` and ``nu`` to do it. Every prior in this module is a Matern
+    kernel with something else multiplied in (an envelope, a brightness
+    weighting, a varying correlation length), so inheriting those would report
+    the log-determinant and the quadratic form of a covariance the prior does
+    not use. Under today's default settings neither is consulted, and
+    `fitting.LinearSystem` deliberately reproduces the default formed-matrix
+    Cholesky rather than these; they exist so that the day either setting is
+    switched on, the evidence stays the evidence of the prior that was fitted.
+
+    Subclasses provide `_covariance(linear_obj, xp)`: the jittered covariance
+    whose inverse `regularization_matrix_from` returns times the coefficient.
+    """
+
+    def _covariance(self, linear_obj, xp=np):  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    def log_det_regularization_matrix_term_from(self, linear_obj, xp=np) -> float:
+        """log det H = pixels * log(coefficient) - log det C."""
+        c = self._covariance(linear_obj, xp=xp)
+        log_det_cov = 2.0 * xp.sum(xp.log(xp.diag(xp.linalg.cholesky(c))))
+        return float(c.shape[0] * np.log(self.coefficient) - log_det_cov)
+
+    def regularization_term_from(self, linear_obj, reconstruction, xp=np) -> float:
+        """s^T H s = coefficient * s^T C^-1 s, through a Cholesky solve of C."""
+        from autoarray.inversion.regularization.matern_kernel import (
+            quadratic_form_via_cholesky,
+        )
+
+        return self.coefficient * quadratic_form_via_cholesky(
+            self._covariance(linear_obj, xp=xp), reconstruction, xp=xp
+        )
+
+
 class CachedMaternKernel(MaternKernel):
-    """`MaternKernel` whose covariance inverse is cached (see above)."""
+    """`MaternKernel` whose covariance inverse is cached (see above).
+
+    A plain Matern kernel, so the shortcuts it inherits from upstream describe
+    its own covariance and are left alone.
+    """
 
     def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
         if xp is not np:  # JAX path: leave upstream behaviour untouched
@@ -105,7 +151,7 @@ class CachedMaternKernel(MaternKernel):
         return self.coefficient * inv
 
 
-class GaussianEnvelopeMatern(MaternKernel):
+class GaussianEnvelopeMatern(_OwnCovarianceShortcuts, MaternKernel):
     """Matern GP prior modulated by a Gaussian envelope on the prior width."""
 
     def __init__(
@@ -186,13 +232,6 @@ class GaussianEnvelopeMatern(MaternKernel):
         )
         return self.coefficient * inv
 
-    def log_det_regularization_matrix_term_from(self, linear_obj, xp=np) -> float:
-        """log det H = pixels * log(coefficient) - log det C."""
-        c = self._covariance(linear_obj, xp=xp)
-        sign, log_det_cov = np.linalg.slogdet(np.asarray(c))
-        pixels = c.shape[0]
-        return float(pixels * np.log(self.coefficient) - log_det_cov)
-
 
 def peak_offset_arcsec(
     dirty_image: np.ndarray, pixel_scale: float
@@ -253,7 +292,7 @@ def estimate_envelope(
     return centre, float(fwhm)
 
 
-class AdaptiveMatern(MaternKernel):
+class AdaptiveMatern(_OwnCovarianceShortcuts, MaternKernel):
     """Matern GP prior whose width follows a first-pass brightness map.
 
     The analogue, for a pixelized source, of the adaptive treatment PyAutoLens
@@ -300,14 +339,26 @@ class AdaptiveMatern(MaternKernel):
         w = self.brightness ** self.power
         return self.floor + (1.0 - self.floor) * w
 
-    def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
-        pts = linear_obj.source_plane_mesh_grid.array
+    def _weights_for(self, pts) -> np.ndarray:
         w = self.adaptive_weights()
         if w.size != pts.shape[0]:
             raise ValueError(
                 f"brightness map has {w.size} pixels but the mesh has "
                 f"{pts.shape[0]}"
             )
+        return w
+
+    def _covariance(self, linear_obj, xp=np) -> np.ndarray:
+        pts = linear_obj.source_plane_mesh_grid.array
+        return matern_cov_matrix_from(
+            scale=self.scale, nu=self.nu, pixel_points=pts,
+            weights=self._weights_for(pts), jitter=self.jitter_value,
+            jitter_relative=True, xp=xp,
+        )
+
+    def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
+        pts = linear_obj.source_plane_mesh_grid.array
+        w = self._weights_for(pts)
         inv = cached_inverse_covariance(
             pixel_points=pts, scale=self.scale, nu=self.nu, weights=w,
             jitter=self.jitter_value, jitter_relative=True,
@@ -316,7 +367,7 @@ class AdaptiveMatern(MaternKernel):
         return self.coefficient * inv
 
 
-class GibbsMatern(MaternKernel):
+class GibbsMatern(_OwnCovarianceShortcuts, MaternKernel):
     """Non-stationary GP prior: the *correlation length* varies with brightness.
 
     `AdaptiveMatern` varies the prior's amplitude but keeps one global
@@ -366,14 +417,24 @@ class GibbsMatern(MaternKernel):
             1.0 - self.brightness**self.power
         )
 
-    def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
-        pts = np.asarray(linear_obj.source_plane_mesh_grid.array)
+    def _length_scales_for(self, pts) -> np.ndarray:
         ell = self.length_scales()
         if ell.size != pts.shape[0]:
             raise ValueError(
                 f"brightness map has {ell.size} pixels but the mesh has "
                 f"{pts.shape[0]}"
             )
+        return ell
+
+    def _covariance(self, linear_obj, xp=np) -> np.ndarray:
+        pts = np.asarray(linear_obj.source_plane_mesh_grid.array)
+        return _gibbs_covariance(
+            pts, self._length_scales_for(pts), self.weights, self.jitter_value
+        )
+
+    def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
+        pts = np.asarray(linear_obj.source_plane_mesh_grid.array)
+        ell = self._length_scales_for(pts)
         inv = _cached_gibbs_inverse(
             pts, ell, self.weights, self.jitter_value,
             key=(hash(ell.tobytes()),
@@ -382,11 +443,8 @@ class GibbsMatern(MaternKernel):
         return self.coefficient * inv
 
 
-def _cached_gibbs_inverse(pts, ell, weights, jitter, key):
-    ckey = _cache_key(pts, "gibbs", *key, float(jitter))
-    hit = _COV_CACHE.get(ckey)
-    if hit is not None:
-        return hit
+def _gibbs_covariance(pts, ell, weights, jitter) -> np.ndarray:
+    """The jittered Gibbs covariance `GibbsMatern` inverts."""
     l2 = ell**2
     s = l2[:, None] + l2[None, :]
     sq = np.sum(pts * pts, axis=1)
@@ -394,7 +452,15 @@ def _cached_gibbs_inverse(pts, ell, weights, jitter, key):
     cov = (2.0 * ell[:, None] * ell[None, :] / s) * np.exp(-d2 / s)
     if weights is not None:
         cov = cov * (weights[:, None] * weights[None, :])
-    inv = inv_via_cholesky(apply_jitter(cov, jitter=jitter, jitter_relative=True))
+    return apply_jitter(cov, jitter=jitter, jitter_relative=True)
+
+
+def _cached_gibbs_inverse(pts, ell, weights, jitter, key):
+    ckey = _cache_key(pts, "gibbs", *key, float(jitter))
+    hit = _COV_CACHE.get(ckey)
+    if hit is not None:
+        return hit
+    inv = inv_via_cholesky(_gibbs_covariance(pts, ell, weights, jitter))
     if len(_COV_CACHE) >= _COV_CACHE_MAX:
         _COV_CACHE.pop(next(iter(_COV_CACHE)))
     _COV_CACHE[ckey] = inv

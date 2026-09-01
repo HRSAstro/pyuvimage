@@ -466,23 +466,38 @@ def test_equal_sigmas_pass_quietly(caplog):
 
 
 def test_unequal_sigmas_are_reported_with_their_size(caplog):
-    """Ruby unrecentred reads 9%. The number belongs in the message: it bounds
-    how well the two paths can be expected to agree.
+    """The number belongs in the message: it bounds how well the two paths can
+    be expected to agree.
 
     This warning is now for direct callers of `with_sparse_operator` -- scripts
     and tests. `api.run` pools the noise before the kernel is built, so a fit
     through the CLI cannot reach the kernel build with unequal sigmas, and the
     message names pooling rather than `--image-centre`, which used to be the
     only route to it.
+
+    The line it warns above is `uvdata.REIM_ASYMMETRY_WARN`, the same one
+    `api.run` draws when it pools -- there used to be a second, 2% line here,
+    so the same dataset was told its noise was fine by one message and
+    inconsistent by the next. Ruby unrecentred reads 9%: estimator scatter,
+    below the shared line, and no longer a warning.
     """
     import logging
 
-    noise = np.full(64, 0.10 + 0.11j)
+    from pyuvimage import uvdata
+
+    assert fitting.SPARSE_REIM_ASYMMETRY_WARN == uvdata.REIM_ASYMMETRY_WARN
+
+    with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
+        ruby = fitting.warn_on_reim_asymmetry(np.full(64, 0.10 + 0.11j))
+    assert ruby == pytest.approx(0.0952, rel=1e-2)
+    assert caplog.records == [], "9% is scatter, not a warning"
+
+    noise = np.full(64, 0.10 + 0.14j)
     with caplog.at_level(logging.WARNING, logger="pyuvimage.fitting"):
         asym = fitting.warn_on_reim_asymmetry(noise)
-    assert asym == pytest.approx(0.0952, rel=1e-2)
+    assert asym > uvdata.REIM_ASYMMETRY_WARN
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "9.5%" in text
+    assert f"{100 * asym:.1f}%" in text
     assert "pooling" in text.lower()
     assert "--inversion dense" in text
 
