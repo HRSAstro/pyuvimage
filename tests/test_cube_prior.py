@@ -181,3 +181,77 @@ def test_a_long_cube_is_subsampled_rather_than_unrenderable(tmp_path):
                      tmp_path / "s.png", np.linspace(100e9, 101e9, n))
     assert fake.rows == MAX_SUMMARY_ROWS
     assert "evenly spaced" in fake.note
+
+
+# --------------------------------------------------------------------------
+# Point sources in a cube (1 Sep 2026)
+# --------------------------------------------------------------------------
+#
+# Until this the MFS pass fitted the points and the channels were fitted with
+# none: the point sat in every channel's residual (chi^2/N of 8-10 against an
+# MFS of 1.0) while the MFS flux was stapled onto plane 0 of model.fits only.
+# Now the MFS pass decides where the points are and every channel fits its own
+# amplitude there.
+
+
+@pytest.fixture(scope="module")
+def cube_with_point():
+    from pyuvimage.pointsource import point_visibilities, sky_to_grid
+
+    freqs = F0 * (1.0 + 1e-3 * np.arange(3))
+    uv_max = MESH / (2.0 * (FOV / 206265.0))
+    uvw = mock.random_uv_coverage(500, uv_max * 299792458.0 / F0, F0, seed=11)
+    geom = resolve_geometry(
+        FOV,
+        float(np.max(np.hypot(uvw[:, 0], uvw[:, 1])) * freqs.max() / 299792458.0),
+        mesh_shape=(MESH, MESH),
+    )
+    truth = mock.exponential_image(
+        geom.shape_native, geom.pixel_scale, flux_jy=0.05, r_eff_arcsec=0.4
+    )
+    uvd = mock.simulate(truth, geom.pixel_scale, uvw, freqs, sigma_jy=3e-4, seed=12)
+    # a 20 mJy point off-centre in every channel. The spectral slope is kept
+    # small: the MFS pass fits one amplitude across the band, and a slope
+    # that moves the flux by many sigma per channel would (rightly) make the
+    # MFS point fit look like a bad model rather than a point source.
+    d_ra, d_dec = 0.7, -0.5
+    y, x = sky_to_grid(d_ra, d_dec)
+    fluxes = 0.020 * (1.0 + 0.01 * np.arange(len(freqs)))
+    for c in range(len(freqs)):
+        uvd.data[c] += fluxes[c] * point_visibilities(uvd.uv_wavelengths(c), y, x)
+    return uvd, (d_ra, d_dec), fluxes
+
+
+def test_points_are_carried_into_every_channel(cube_with_point, tmp_path):
+    from astropy.io import fits
+
+    uvd, (d_ra, d_dec), fluxes = cube_with_point
+    res = _run(uvd, tmp_path, point_sources=[(-d_ra, d_dec)],  # image (x, y)
+               cube_prior="mfs")
+    n_chan = uvd.n_chan
+    assert len(res.products) == n_chan
+    for c, p in enumerate(res.products):
+        assert p.points, f"channel {c} has no point component"
+        assert len(p.points) == 1
+        assert p.points[0].flux == pytest.approx(fluxes[c], rel=0.15), c
+        # same position in every plane: the MFS decided it
+        assert p.points[0].d_ra == pytest.approx(res.products[0].points[0].d_ra)
+    # the per-channel chi^2 is honest now that the point is modelled
+    per_datum = res.parameters["fit_quality"]["channel_chi2_per_datum"]
+    assert len(per_datum) == n_chan
+    assert all(v < 1.5 for v in per_datum), per_datum
+    # the record describes what was fitted: n_data of the MFS pass, and the
+    # transformer that actually ran
+    assert res.parameters["fit_quality"]["n_data"] == 2 * uvd.n_samples
+    assert res.parameters["solver"]["transformer"] != "auto"
+    # the point flux is in every plane of model.fits, not just the first
+    with fits.open(tmp_path / "model.fits") as hdul:
+        cube = np.asarray(hdul[0].data, float)
+        assert hdul[0].header["NPOINTS"] == 1
+    peaks = cube.reshape(n_chan, -1).max(axis=1)
+    assert peaks.min() > 0.5 * peaks.max(), peaks
+    import json
+    rec = json.loads((tmp_path / "point_sources.json").read_text())
+    assert len(rec["channels"]) == n_chan
+    assert rec["channels"][1]["points"][0]["flux_jy"] == pytest.approx(
+        res.products[1].points[0].flux)

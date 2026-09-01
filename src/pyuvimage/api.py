@@ -18,13 +18,14 @@ from pathlib import Path
 import numpy as np
 
 from . import beam as beam_mod
-from . import envelope, fitting, primary_beam
+from . import envelope as envelope_mod
+from . import fitting, primary_beam
 from .grids import (
     ImageGeometry,
     nyquist_pixel_scale_arcsec,
     resolve_geometry,
 )
-from .products import ProductSet, upsample_model, write_products
+from .products import ProductSet, write_products
 from .uvdata import MultiSpwUVData, UVData, read_dataset
 
 logger = logging.getLogger("pyuvimage")
@@ -243,7 +244,6 @@ def run(
     # post-recentring one, which is what the w-tilde kernel would be built on.
     inversion = fitting.resolve_inversion(
         inversion, n_vis=uvd.n_samples, point_sources=point_sources,
-        noise=uvd.noise,
     )
     transformer_cls = fitting.resolve_transformer(
         n_vis=uvd.n_samples,
@@ -365,20 +365,26 @@ def run(
     # Resolve `auto` once, here, so that everything downstream -- the fits,
     # the point-source retune, `fit_parameters.json` -- sees the concrete
     # choice rather than re-deriving it or recording "auto".
+    # Judged on the data each *fit* sees, not the whole dataset: with
+    # `cube_prior="channel"` the prior pass and every channel fit see
+    # n_samples / n_chan points, so an 8-channel cube at 10 data per pixel
+    # per channel was being judged as 80 -- exactly the regime
+    # `resolve_criterion` says the structure ratio is uncalibrated in.
+    n_data_fit = 2 * (uvd.n_samples // prior_thin)
     criterion = fitting.resolve_criterion(
-        criterion, n_data=2 * uvd.n_samples, n_mesh_pixels=n_pix
+        criterion, n_data=n_data_fit, n_mesh_pixels=n_pix
     )
     # the real sample count: flags remove samples, and for ragged multi-spw
     # data n_vis * n_chan is not even a meaningful product
     n_data_all = 2 * uvd.n_samples
-    if n_pix > n_data_all:
+    if n_pix > n_data_fit:
         logger.warning(
             "the model has more pixels (%d) than data points (%d): the "
             "reconstruction is under-constrained and its faint structure is "
             "set mainly by the source prior, not the data. Residuals can look "
             "smaller than the noise even at chi^2/N = 1. Consider a smaller "
             "--fov or a coarser --pixel-scale if the source allows it.",
-            n_pix, n_data_all,
+            n_pix, n_data_fit,
         )
 
     dish = dish_diameter or uvd.meta.get("dish_diameter_m")
@@ -437,10 +443,12 @@ def run(
         and (reg_scale == "auto" or reg in fitting.ENVELOPE_REGULARIZATIONS)
     )
     beam_size = None
+    # One dirty imager for the MFS dataset. Each construction is a full
+    # adjoint transform for the dirty beam, and this function used to build
+    # four of them (beam fit, envelope estimate, point-source fit, products).
+    imager = beam_mod.DirtyImager(mfs_dataset)
     if needs_beam:
-        b = beam_mod.fit_beam(
-            beam_mod.DirtyImager(mfs_dataset).dirty_beam, geometry.pixel_scale
-        )
+        b = beam_mod.fit_beam(imager.dirty_beam, geometry.pixel_scale)
         beam_size = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
     if reg in fitting.KERNEL_REGULARIZATIONS:
         if reg_scale == "auto":
@@ -457,10 +465,7 @@ def run(
         if reg == "gibbs":
             envelope["ell_floor"] = fitting.GIBBS_ELL_FLOOR
     if reg in fitting.ENVELOPE_REGULARIZATIONS:
-        from .envelope import estimate_envelope
-
-        imager = beam_mod.DirtyImager(mfs_dataset)
-        auto_centre, auto_fwhm = estimate_envelope(
+        auto_centre, auto_fwhm = envelope_mod.estimate_envelope(
             imager.dirty_image(np.asarray(mfs_dataset.data)),
             pixel_scale=geometry.pixel_scale,
             rms=imager.rms,
@@ -468,6 +473,15 @@ def run(
             max_fwhm=geometry.fov_arcsec / 2.0,
         )
         optimise_env = envelope_fwhm == "optimise"
+        if optimise_env and coefficient != "auto":
+            # a numeric coefficient used to make `_fixed_prior` return a full
+            # prior, and `fit_dataset` then skipped the search that the
+            # envelope width needed -- "optimise" was silently ignored
+            logger.info(
+                "--envelope-fwhm optimise with a fixed coefficient: the "
+                "coefficient is held at %.4g and only the envelope width is "
+                "searched", float(coefficient),
+            )
         fwhm = (
             auto_fwhm if envelope_fwhm in ("auto", "optimise")
             else float(envelope_fwhm)
@@ -486,13 +500,18 @@ def run(
             fwhm, centre[0], centre[1], envelope_floor,
         )
 
-    fixed_prior = _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale)
+    optimise_env = bool(
+        reg in fitting.ENVELOPE_REGULARIZATIONS and envelope_fwhm == "optimise"
+    )
+    fixed_prior = _fixed_prior(
+        reg, coefficient, reg_scale, nu, beam_scale, optimise_envelope=optimise_env,
+    )
     mfs_fit = fitting.fit_dataset(
         mfs_dataset, geometry, reg_kind=reg, prior=fixed_prior,
         positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion,
         nu=nu, fixed_scale=beam_scale, envelope=envelope,
-        optimise_envelope=locals().get("optimise_env", False),
+        optimise_envelope=optimise_env,
         chi2_target=chi2_target,
         # With point components to come, a high chi^2 here is expected rather
         # than alarming -- an unmodelled compact source is the commonest
@@ -552,7 +571,7 @@ def run(
                 fit_obj.fit.inversion, mfs_dataset, geometry,
                 positions=positions, significance=point_significance,
                 max_points=max_points,
-                dirty_imager=beam_mod.DirtyImager(mfs_dataset),
+                dirty_imager=imager,
                 beam_fwhm=beam_size,
                 retune=bool(point_retune) and criterion == "discrepancy",
                 chi2_target=chi2_target,
@@ -684,16 +703,39 @@ def run(
         products.append(
             _products_for(mfs_fit, mfs_dataset, geometry, uvd,
                           uvd.central_frequency, pb_correction, dish, pb_factor,
-                          oversample, uncertainty_map)
+                          oversample, uncertainty_map, imager=imager)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
         _report_dynamic_range(products[0], n_data_all, criterion)
     else:
-        frozen = mfs_fit.prior
+        frozen = dict(mfs_fit.prior)
+        # Points carried into the cube: the MFS pass decides *where* they
+        # are, each channel fits its own amplitude at those fixed positions.
+        # Until 1 Sep 2026 the channels were fitted with no point components
+        # at all and the MFS points were stapled onto plane 0 only -- so a
+        # point sat in every channel's residual (chi^2/N 8-10 against an MFS
+        # of 1.0 on the mock) while `model.fits` plane 0 carried its flux.
+        cube_points = None
+        if point_solution is not None and point_solution.points:
+            cube_points = [(p.d_ra, p.d_dec) for p in point_solution.points]
+            # `PointAugmentedFit.prior` delegates to the mesh-only fit, so the
+            # retune the point fit applied to the coefficient was lost here.
+            factor = float(getattr(point_solution, "regularization_factor", 1.0))
+            if factor != 1.0 and "coefficient" in frozen:
+                frozen["coefficient"] = float(frozen["coefficient"]) * factor
+            logger.info(
+                "cube mode: %d point source(s) carried into every channel at "
+                "the MFS positions; amplitudes are fitted per channel",
+                len(cube_points),
+            )
         logger.info(
             "cube mode: source prior frozen from the MFS fit (%s)",
             ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
         )
+        # What the MFS guard actually ran with, not what was asked for: the
+        # non-negative solver can be disabled mid-fit, and the channels must
+        # follow that decision or `fit_parameters.json` misdescribes them.
+        positive_only = bool(getattr(mfs_fit, "positive_only", positive_only))
         # The MFS dataset and fit are the largest objects in the run -- their
         # mapping matrix spans every channel's visibilities -- and from here
         # on only `frozen`, `scan` and a few scalars are needed. Holding them
@@ -718,6 +760,7 @@ def run(
         mfs_fit = _fit_summary(mfs_fit)
         mfs_dataset = None
         gc.collect()
+        channel_chi2: list[float] = []
         for c in range(uvd.n_chan):
             ch = uvd.select(channel=c)
             uv_c, d_c, n_c = ch.flattened()
@@ -742,9 +785,30 @@ def run(
                 positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion, nu=nu,
                 envelope=envelope,
+                chi2_target=chi2_target,
+                # one summary line per channel below; the per-fit warning
+                # against a target the channels never chose was noise
+                warn_on_chi2=False,
             )
-            logger.info(
-                "channel %d/%d: chi2=%.5g", c + 1, uvd.n_chan, sf.chi_squared
+            if cube_points:
+                from .pointsource import PointAugmentedFit, fit_point_sources
+
+                sol_c = fit_point_sources(
+                    sf.fit.inversion, ds_c, geometry, positions=cube_points,
+                    refine=False, retune=False, beam_fwhm=beam_size,
+                    chi2_target=chi2_target,
+                )
+                if sol_c.points:
+                    sf = PointAugmentedFit(sf, sol_c)
+            n_data_c = 2 * len(d_c)
+            channel_chi2.append(float(sf.chi_squared) / n_data_c)
+            logger.log(
+                logging.WARNING
+                if sf.chi_squared / n_data_c > 1.3 * chi2_target else logging.INFO,
+                "channel %d/%d: chi2/N = %.3f%s", c + 1, uvd.n_chan,
+                sf.chi_squared / n_data_c,
+                "" if not cube_points else
+                f", point flux {sum(p.flux for p in sf.points):.4g} Jy",
             )
             products.append(
                 _products_for(sf, ds_c, geometry, uvd, float(ch.frequencies[0]),
@@ -753,13 +817,21 @@ def run(
             )
         freqs = uvd.frequencies
 
-    if point_solution is not None:
-        products[0].points = point_solution.points
     parameters = _parameter_record(
         uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
-        transformer, oversample, dish, pb_factor, pb_correction, mfs_fit, scan,
+        # what actually ran, not what was asked for: `fit_parameters.json`
+        # used to say "auto" here while recording the resolved inversion
+        transformer_cls.__name__, oversample, dish, pb_factor, pb_correction,
+        mfs_fit, scan,
         envelope=envelope, point_solution=point_solution,
         prior_thin=prior_thin, inversion=inversion,
+        # the data the recorded chi^2 was measured on -- the (possibly
+        # thinned) MFS fit, not the whole dataset. In cube mode the two
+        # differed by a factor n_chan and `fit_quality` read 0.25 while every
+        # channel sat at 8.
+        n_data_fitted=n_data,
+        channel_chi2_per_datum=channel_chi2 if mode == "cube" else None,
+        transformer_requested=transformer,
     )
     written = {}
     if write:
@@ -774,10 +846,17 @@ def run(
     )
 
 
-def _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale=None) -> dict | None:
-    """Assemble a fully specified prior, or None if anything must be fitted."""
+def _fixed_prior(
+    reg, coefficient, reg_scale, nu, beam_scale=None, optimise_envelope=False,
+) -> dict | None:
+    """Assemble a fully specified prior, or None if anything must be fitted.
+
+    "Anything" includes the envelope width: with ``--envelope-fwhm optimise``
+    the prior is not fully specified however the coefficient was given, and
+    returning a dict here made `fit_dataset` skip the search entirely.
+    """
     kernel = reg in fitting.KERNEL_REGULARIZATIONS
-    if coefficient == "auto":
+    if coefficient == "auto" or optimise_envelope:
         return None
     prior = {"coefficient": float(coefficient)}
     if kernel:
@@ -818,6 +897,7 @@ def _parameter_record(
     uvd, geometry, mode, reg, criterion, chi2_target, positive_only,
     transformer, oversample, dish, pb_factor, pb_correction, fit, scan,
     envelope=None, point_solution=None, prior_thin=1, inversion="dense",
+    n_data_fitted=None, channel_chi2_per_datum=None, transformer_requested=None,
 ) -> dict:
     """Every parameter that defined this run, for the record and for reuse."""
     return {
@@ -871,6 +951,8 @@ def _parameter_record(
                 if fit is not None else positive_only
             ),
             "transformer": transformer,
+            **({"transformer_requested": transformer_requested}
+               if transformer_requested not in (None, transformer) else {}),
             "inversion": inversion,
             "jax": fitting.jax_available(),
         },
@@ -885,8 +967,11 @@ def _parameter_record(
         ),
         "fit_quality": {
             "chi_squared": fit.chi_squared,
-            "n_data": int(2 * uvd.n_samples),
+            "n_data": int(n_data_fitted if n_data_fitted is not None
+                          else 2 * uvd.n_samples),
             "log_evidence": fit.log_evidence,
+            **({"channel_chi2_per_datum": channel_chi2_per_datum}
+               if channel_chi2_per_datum is not None else {}),
         },
     }
 
@@ -963,7 +1048,7 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
             uv, d, n, wide, n_pixels=AUTO_CENTRE_PIXELS,
             transformer=transformer,
         )
-        centre = envelope.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
+        centre = envelope_mod.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
         peak = float(np.nanmax(img))
         d_ra, d_dec = grid_to_sky(*centre)
         logger.info(
@@ -1145,8 +1230,10 @@ def _products_for(
     pb_factor: float,
     oversample: int,
     uncertainty_map: bool = True,
+    imager: "beam_mod.DirtyImager | None" = None,
 ) -> ProductSet:
-    imager = beam_mod.DirtyImager(dataset)
+    if imager is None or imager.dataset is not dataset:
+        imager = beam_mod.DirtyImager(dataset)
     data = np.asarray(dataset.data)
     model_vis = sf.model_visibilities
     resid_vis = data - model_vis

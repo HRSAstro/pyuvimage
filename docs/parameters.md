@@ -13,7 +13,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--reg` | **adaptive** | `adaptive`: two-stage, the prior's *amplitude* follows a first-pass model as `b^power` — the default, best extended model and no central artefact. `gibbs`: non-stationary, the prior's *correlation length* shortens where the source is bright — sharpest on a single compact feature, but leaves a central residual on extended sources. `matern`/`exponential`: stationary Gaussian-process prior, `H = coefficient x C^-1` with `C` a Matern/exponential covariance between mesh pixels. `gaussian`: matern modulated by a Gaussian envelope on the prior width — **recommended when visibilities are sparse**. `constant`: nearest-neighbour gradient (rank-deficient — its evidence is ill-behaved). |
 | `--adapt-power` | **2** | Exponent in the `adaptive`/`gibbs` brightness weighting. |
 | `--envelope-fwhm` | **auto** | For `--reg gaussian`: FWHM [arcsec] of the envelope. `auto` sizes it from the extent of significant emission in the dirty image (at least 3 beams, at most `fov/2`); `optimise` fits it as a free hyperparameter alongside the coefficient. |
-| `--envelope-centre` | **auto** | `auto` places the envelope at the **dirty-image peak** — not the phase centre, since the source need not sit there — or `centre`, or `"dy,dx"` in arcsec. |
+| `--envelope-centre` | **auto** | `auto` places the envelope at the **dirty-image peak** — not the phase centre, since the source need not sit there — or `centre`, or `"x,y"` in arcsec from the phase centre (image axes, +x right, +y up — the same convention as `--image-centre` and `--point`). |
 | `--envelope-floor` | **0.01** | Prior width far from the envelope relative to its peak. Smaller suppresses distant structure more strongly. |
 | `--lambda` | **auto** | Prior strength (the regularisation coefficient). Optimised; searched over `LogUniform(1e-6, 1e6)`, matching PyAutoLabs' shipped prior. |
 | `--scale` | **auto** = beam | Correlation length **in arcsec**. `auto` sets it to the synthesised beam size `sqrt(bmaj x bmin)` — structure finer than the beam is not constrained by the data. `optimise` fits it instead. |
@@ -43,6 +43,8 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--point-significance` | **5** | Keep auto-detected points above this significance. |
 | `--max-points` | **5** | Most auto-detected components to keep. |
 | `--no-point-retune` | off (retune **on**) | Keep the mesh-only regularisation instead of re-imposing `chi^2 = N` with the points present. |
+
+In `--mode cube` the MFS pass decides *where* the points are and every channel then fits its own amplitude at those fixed positions, so a point's spectrum comes out per plane (`point_sources.json` lists it under `channels`; the FITS header's `PTFLUX` is the mean over planes). Positions are not re-refined per channel.
 
 **Uncertainty**
 

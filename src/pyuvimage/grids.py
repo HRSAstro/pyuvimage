@@ -118,6 +118,14 @@ def resolve_geometry(
         mesh_shape = (n, n)
     else:
         mesh_shape = (int(mesh_shape[0]), int(mesh_shape[1]))
+        if mesh_shape[0] != mesh_shape[1]:
+            # everything below -- the image grid, the mesh pixel scale, the
+            # square mask -- is derived from mesh_shape[0] alone, so a
+            # non-square mesh would be silently fitted as a square one
+            raise ValueError(
+                f"mesh_shape must be square, got {mesh_shape}: the field of "
+                "view is square and the image grid is derived from one side"
+            )
     # Recompute the actual mesh scale so mesh exactly tiles the FOV.
     mesh_scale = fov_arcsec / mesh_shape[0]
 

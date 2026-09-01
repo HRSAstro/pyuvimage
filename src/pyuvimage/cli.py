@@ -16,13 +16,6 @@ import numpy as np
 
 
 
-def _all_sigma(uvd):
-    """Median-able view of a dataset's sigma, single- or multi-spw."""
-    import numpy as _np
-
-    return _np.concatenate([_np.asarray(s.noise).real.ravel() for s in uvd.spws])
-
-
 def _parse_pair(text: str, flag: str) -> tuple[float, float]:
     parts = [
         q for q in text.replace("(", "").replace(")", "").split(",") if q.strip()
@@ -36,6 +29,15 @@ def _parse_pair(text: str, flag: str) -> tuple[float, float]:
         return (float(parts[0]), float(parts[1]))
     except ValueError:
         raise SystemExit(f"{flag}: {text!r} is not a pair of numbers in arcsec")
+
+
+def _grid_from_image(xy: tuple[float, float]) -> tuple[float, float]:
+    """Image (x, y) arcsec -> the grid (y, x) pair `api.run` takes for the
+    envelope centre, through the same two conversions every other position
+    uses."""
+    from .pointsource import image_to_sky, sky_to_grid
+
+    return sky_to_grid(*image_to_sky(*xy))
 
 
 def _parse_centre(text):
@@ -84,7 +86,7 @@ def _hint_negative_centre(argv: list[str]) -> None:
     it before argparse does.
     """
     for i, a in enumerate(argv):
-        if a in ("--image-centre", "--point") and i + 1 < len(argv):
+        if a in ("--image-centre", "--point", "--envelope-centre") and i + 1 < len(argv):
             nxt = argv[i + 1]
             if nxt.startswith("-") and "," in nxt:
                 raise SystemExit(
@@ -196,7 +198,9 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument(
         "--envelope-centre", default="auto",
         help='for --reg gaussian: "auto" (the dirty-image peak), "centre" '
-        '(the phase centre), or "dy,dx" in arcsec',
+        '(the phase centre), or "x,y" in arcsec from the phase centre -- '
+        'image axes, +x right and +y up, the same as --image-centre and '
+        '--point',
     )
     p_fit.add_argument(
         "--envelope-floor", type=float, default=1e-2,
@@ -369,9 +373,9 @@ def main(argv: list[str] | None = None) -> int:
 
         uvd = read_dataset(args.npz)
         if args.noise != "keep":
-            before = float(np.median(_all_sigma(uvd)))
+            before = float(np.median(np.asarray(uvd.noise).real))
             uvd = recompute_noise(uvd, args.noise, args.noise_chunk)
-            after = float(np.median(_all_sigma(uvd)))
+            after = float(np.median(np.asarray(uvd.noise).real))
             print(
                 "noise re-estimated (%s): median sigma %.4g -> %.4g Jy "
                 "(x%.3f); stored in the dataset, so fits do not repeat it"
@@ -418,10 +422,17 @@ def main(argv: list[str] | None = None) -> int:
                 if args.envelope_fwhm in ("auto", "optimise")
                 else float(args.envelope_fwhm)
             ),
+            # Every position on the command line is image "x,y"; the API's
+            # envelope centre is grid (y, x), so convert here the way
+            # --image-centre and --point are converted. Until 1 Sep 2026
+            # this flag alone took "dy,dx", so a position copied from
+            # --point had its axes swapped.
             envelope_centre=(
                 args.envelope_centre
                 if args.envelope_centre in ("auto", "centre")
-                else tuple(float(v) for v in args.envelope_centre.split(","))
+                else _grid_from_image(
+                    _parse_pair(args.envelope_centre, "--envelope-centre")
+                )
             ),
             envelope_floor=args.envelope_floor,
             **({} if args.adapt_power is None

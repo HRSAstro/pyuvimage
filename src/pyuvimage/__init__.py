@@ -17,11 +17,24 @@ from ._jax_guard import disable_broken_jax, enable_double_precision  # noqa: E40
 enable_double_precision()
 disable_broken_jax()
 
-from .api import RunResult, run  # noqa: E402
 from .grids import ImageGeometry, nyquist_pixel_scale_arcsec, resolve_geometry  # noqa: E402
 from .uvdata import UVData  # noqa: E402
 
 __version__ = "0.1.0"
+
+
+def __getattr__(name):
+    """`run` and `RunResult` load on first use.
+
+    `api` pulls in autogalaxy, scipy.signal/optimize and astropy -- 1.3-2 s
+    measured -- and `pyuvimage import` / `pyuvimage convert` need none of it.
+    The eager import here made every CLI command pay for the fit's imports.
+    """
+    if name in ("run", "RunResult"):
+        from . import api
+
+        return getattr(api, name)
+    raise AttributeError(f"module 'pyuvimage' has no attribute {name!r}")
 
 __all__ = [
     "run",

@@ -97,15 +97,17 @@ def build_header(
         # a WCS that mislabels the data.
         if not np.allclose(steps, steps[0], rtol=1e-6, atol=0.0):
             h["CDELT3"] = float(np.median(steps))
-            h["FREQIRR"] = (
-                True, "channel spacing is irregular; see FRQnnnn / .json"
-            )
+            h["FREQIRR"] = (True, "irregular spacing; see FRQnnnn")
             for i, freq in enumerate(f):
                 if i < 999:
                     h[f"FRQ{i:04d}"] = (float(freq), f"plane {i + 1} freq [Hz]")
             # logged once per run by write_products, not once per file
     elif frequencies_hz is not None:
-        h["RESTFRQ"] = float(np.mean(frequencies_hz))
+        # The observing frequency. Until 1 Sep 2026 this was written as
+        # RESTFRQ, which in FITS/CASA is the *spectral-line rest* frequency
+        # -- a different quantity, and one a line tool would misuse.
+        h["OBSFREQ"] = (float(np.mean(frequencies_hz)),
+                        "mean observing frequency [Hz]")
     if beam is not None:
         h["BMAJ"] = beam.bmaj_arcsec / 3600.0
         h["BMIN"] = beam.bmin_arcsec / 3600.0
@@ -188,7 +190,6 @@ def write_products(
     out.mkdir(parents=True, exist_ok=True)
     is_cube = len(products) > 1
     freqs = np.asarray(frequencies_hz, dtype=float)
-    beam0 = products[0].beam
     med_beam = BeamFit(
         bmaj_arcsec=float(np.median([p.beam.bmaj_arcsec for p in products])),
         bmin_arcsec=float(np.median([p.beam.bmin_arcsec for p in products])),
@@ -197,7 +198,18 @@ def write_products(
     rms_all = float(np.median([p.rms for p in products]))
 
     def stack(attr: str, orient=True) -> np.ndarray:
+        """Planes of one product across channels.
+
+        A plane a channel could not produce (`_products_for` catches a failed
+        uncertainty into None) becomes NaN rather than a crash at write time:
+        one bad channel used to lose every product of the run here, after all
+        the fitting was done.
+        """
         planes = [getattr(p, attr) for p in products]
+        shape = next((np.shape(x) for x in planes if x is not None), None)
+        if shape is None:
+            return None
+        planes = [np.full(shape, np.nan) if x is None else x for x in planes]
         planes = [to_fits_orientation(x) if orient else x for x in planes]
         return np.stack(planes) if is_cube else planes[0]
 
@@ -227,9 +239,16 @@ def write_products(
     pts = products[0].points or []
     if pts:
         extra_common["NPOINTS"] = (len(pts), "analytic point components")
-        extra_common["PTFLUX"] = (
+        if is_cube:
+            # positions are shared across the cube, fluxes are per channel;
+            # the header carries the mean and point_sources.json the planes
+            fluxes = [sum(p.flux for p in (q.points or [])) for q in products]
+            extra_common["PTFLUX"] = (
+                float(np.mean(fluxes)), "mean total point flux over planes [Jy]"
+            )
+        extra_common.setdefault("PTFLUX", (
             float(sum(p.flux for p in pts)), "total point flux [Jy]"
-        )
+        ))
 
     # All image products share one grid (the Nyquist-oversampled image grid)
     # so they overlay pixel-for-pixel.
@@ -250,8 +269,16 @@ def write_products(
     w("model_reconvolved.fits", stack("reconvolved"),
       hdr(n_img, geometry.pixel_scale, "Jy/beam", beam=med_beam,
           extra={"RMS": (rms_all, "image-plane rms noise [Jy/beam]")}))
-    if products[0].uncertainty is not None:
-        terms = products[0].uncertainty_terms or {}
+    if any(p.uncertainty is not None for p in products):
+        missing = [i for i, p in enumerate(products) if p.uncertainty is None]
+        if missing:
+            logger.warning(
+                "no uncertainty map for channel(s) %s; those planes of "
+                "uncertainty.fits and snr.fits are NaN", missing,
+            )
+        terms = next(
+            (p.uncertainty_terms for p in products if p.uncertainty_terms), {}
+        ) or {}
         unc_extra = {
             "ERRTYPE": ("total", "statistical + prior systematic"),
             "ERRSTAT": (terms.get("statistical_median", 0.0),
@@ -268,6 +295,8 @@ def write_products(
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = [
                 np.where(p.uncertainty > 0, p.model_image / p.uncertainty, 0.0)
+                if p.uncertainty is not None
+                else np.full(np.shape(p.model_image), np.nan)
                 for p in products
             ]
         snr_stack = (np.stack([to_fits_orientation(s_) for s_ in snr])
@@ -287,8 +316,15 @@ def write_products(
     import json
 
     if pts:
-        (out / "point_sources.json").write_text(json.dumps(
-            {"points": [p.as_dict() for p in pts]}, indent=2))
+        record = {"points": [p.as_dict() for p in pts]}
+        if is_cube:
+            # one entry per plane: fixed positions, per-channel amplitudes
+            record["channels"] = [
+                {"frequency_hz": float(f),
+                 "points": [p.as_dict() for p in (q.points or [])]}
+                for f, q in zip(freqs, products)
+            ]
+        (out / "point_sources.json").write_text(json.dumps(record, indent=2))
     if is_cube:
         even = bool(
             len(freqs) < 3
