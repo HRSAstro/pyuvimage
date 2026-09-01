@@ -8,23 +8,43 @@ It writes a single ``.npz`` file that ``pyuvimage fit`` reads directly (or
 convert it to a dataset directory with ``pyuvimage convert mydata.npz
 mydata/``).
 
-This file is deliberately self-contained (numpy + casatools only) so it can
-be copied anywhere and run under CASA's own python.
+This file needs only numpy, casatools and ``pyuvimage/noise.py`` (itself
+numpy-only), so it runs under CASA's own python. If pyuvimage is not
+installed there, copy ``noise.py`` next to this script: it is picked up from
+the same directory.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import numpy as np
 
-PARALLEL_HANDS = {5: "RR", 8: "LL", 9: "XX", 12: "YY", 1: "I"}
+try:
+    from pyuvimage.noise import MIN_DIFFS, adjacent_pairs, baseline_sigma_from_pairs
+except ImportError:  # pragma: no cover - CASA's python without pyuvimage
+    # `pyuvimage/__init__` pulls in astropy, which CASA may not have; noise.py
+    # on its own needs nothing but numpy, so load it by path instead.
+    import importlib.util
 
-# Fewer differences than this and a *per-baseline* sigma is mostly noise
-# itself, so that baseline takes the pooled value instead. It never stops
-# those differences joining the pool.
-MIN_DIFFS = 4
+    _spec = importlib.util.spec_from_file_location(
+        "pyuvimage_noise",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "noise.py"),
+    )
+    if _spec is None or _spec.loader is None:
+        raise ImportError(
+            "casa_export.py needs pyuvimage/noise.py: install pyuvimage in "
+            "CASA's python, or copy noise.py next to this script"
+        )
+    _noise = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_noise)
+    MIN_DIFFS = _noise.MIN_DIFFS
+    adjacent_pairs = _noise.adjacent_pairs
+    baseline_sigma_from_pairs = _noise.baseline_sigma_from_pairs
+
+PARALLEL_HANDS = {5: "RR", 8: "LL", 9: "XX", 12: "YY", 1: "I"}
 
 
 def _cell(tb, column, row):
@@ -148,54 +168,29 @@ def _export_one(ms_path, field, spw, data_column):
     # A difference is only meaningful between samples adjacent in time. Across
     # a calibrator visit -- 30-40% of a typical ALMA execution -- the earth has
     # turned a long baseline through several klambda, so the difference
-    # measures the source, not the noise. Three median steps, matching
-    # pyuvimage.noise.auto_max_gap.
-    unique_t = np.unique(np.asarray(time, dtype=float))
-    if unique_t.size >= 3:
-        steps = np.diff(unique_t)
-        steps = steps[np.isfinite(steps) & (steps > 0)]
-        max_gap = 3.0 * float(np.median(steps)) if steps.size else np.inf
-    else:
-        max_gap = np.inf
-
-    baseline = ant1.astype(np.int64) * 100000 + ant2.astype(np.int64)
-    sigma = np.zeros(vis.shape, dtype=complex)
+    # measures the source, not the noise. `adjacent_pairs` applies the same
+    # three-median-steps guard as pyuvimage.noise.auto_max_gap; this script
+    # used to carry its own copy of the whole group-sort-difference loop, and
+    # the two drifted apart in exactly the details that matter (which pairs
+    # count, what MIN_DIFFS gates).
+    #
+    # MIN_DIFFS decides only whether *a baseline's own* sigma can be trusted;
+    # its differences still join the pool. Skipping the pool as well was a
+    # real bug: PJ0116 at 245 GHz has four timestamps, so every baseline had
+    # two differences, every baseline was skipped, the pool came out empty,
+    # and the code fell through to the MAD of the visibilities -- which
+    # measures the *source*, not the noise. It returned 5.111 mJy where the
+    # pooled differences give 3.696 mJy, a 1.38x overestimate, and the
+    # discrepancy principle duly stopped at chi2/N = 1 while the true chi2/N
+    # was 0.52, leaving the whole source in the residual map.
     usable_cell = ~flags & np.isfinite(vis.real) & np.isfinite(vis.imag)
-    diffs_re, diffs_im = [], []
-    for b in np.unique(baseline):
-        rows = np.where(baseline == b)[0]
-        rows = rows[np.argsort(time[rows])]
-        if rows.size < 2:
-            sigma[:, rows] = np.nan
-            continue
-        diff = np.diff(vis[:, rows], axis=1)
-        ok = usable_cell[:, rows]
-        good = ok[:, 1:] & ok[:, :-1]   # both endpoints usable
-        good = good & (np.diff(time[rows]) <= max_gap)[None, :]
-        # Contribute to the global pool FIRST, whatever the per-baseline count.
-        # MIN_DIFFS decides only whether *this baseline's own* sigma can be
-        # trusted; the differences themselves are still perfectly good noise
-        # samples for the pooled estimate. Skipping the append as well was a
-        # real bug: PJ0116 at 245 GHz has four timestamps, so every baseline
-        # had two differences, every baseline was skipped, the pool came out
-        # empty, and the code fell through to the MAD of the visibilities --
-        # which measures the *source*, not the noise. It returned 5.111 mJy
-        # where the pooled differences give 3.696 mJy, a 1.38x overestimate,
-        # and the discrepancy principle duly stopped at chi2/N = 1 while the
-        # true chi2/N was 0.52, leaving the whole source in the residual map.
-        if good.any():
-            diffs_re.append(diff.real[good])
-            diffs_im.append(diff.imag[good])
-        if good.sum() < MIN_DIFFS:
-            sigma[:, rows] = np.nan   # filled from the pooled estimate below
-            continue
-        s_re = np.std(diff.real[good]) / np.sqrt(2.0)
-        s_im = np.std(diff.imag[good]) / np.sqrt(2.0)
-        sigma[:, rows] = s_re + 1j * s_im
-    if diffs_re and np.concatenate(diffs_re).size >= MIN_DIFFS:
-        g = np.std(np.concatenate(diffs_re)) / np.sqrt(2.0) + 1j * (
-            np.std(np.concatenate(diffs_im)) / np.sqrt(2.0)
-        )
+    pairs = adjacent_pairs(ant1, ant2, time)
+    est = baseline_sigma_from_pairs(np.where(usable_cell, vis, np.nan), pairs)
+    per_row = (est.sigma_re + 1j * est.sigma_im)[pairs.row_baseline]
+    sigma = np.broadcast_to(per_row[None, :], vis.shape).copy()
+    have_pool = est.pool_count >= MIN_DIFFS
+    if have_pool:
+        g = est.pool_re + 1j * est.pool_im
     else:
         # Nothing to difference at all -- a single integration, say. The
         # robust scatter of the visibilities is an *upper limit*: it contains
@@ -279,13 +274,35 @@ def _export_one(ms_path, field, spw, data_column):
     return arrays, meta
 
 
-def _resolve_spws(ms_path, spw):
-    """"all" -> every DATA_DESC_ID present; a list stays a list."""
-    from casatools import table as table_tool
+def parse_spw_text(text):
+    """"0" -> [0]; "0,2" -> [0, 2]; "0-3" -> [0, 1, 2, 3]; "0-1,4" -> [0, 1, 4].
 
+    `_resolve_spws` used to expand a range by replacing "-" with "," -- so
+    "0-3" exported windows 0 and 3 and silently skipped 1 and 2 -- while the
+    command line had its own, correct, parser. There is now one, used by both.
+    """
+    ids = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part[1:]:      # a leading minus falls through to int()
+            lo, hi = part.split("-", 1)
+            ids.extend(range(int(lo), int(hi) + 1))
+        else:
+            ids.append(int(part))
+    if not ids:
+        raise ValueError("no spectral window in %r" % (text,))
+    return sorted(set(ids))
+
+
+def _resolve_spws(ms_path, spw):
+    """"all" -> every DATA_DESC_ID present; ids, lists and ranges -> a list."""
     if isinstance(spw, str):
         if spw.strip().lower() != "all":
-            return [int(x) for x in spw.replace("-", ",").split(",") if x != ""]
+            return parse_spw_text(spw)
+        from casatools import table as table_tool
+
         tb = table_tool()
         tb.open(ms_path)
         ids = sorted({int(v) for v in tb.getcol("DATA_DESC_ID")})
@@ -350,15 +367,8 @@ if __name__ == "__main__":
         sys.exit(1)
     spw_arg = argv[3] if len(argv) > 3 else "0"
     if spw_arg.strip().lower() != "all":
-        ids = []
-        for part in spw_arg.split(","):
-            part = part.strip()
-            if "-" in part[1:]:
-                lo, hi = part.split("-", 1)
-                ids.extend(range(int(lo), int(hi) + 1))
-            elif part:
-                ids.append(int(part))
-        spw_arg = ids[0] if len(ids) == 1 else sorted(set(ids))
+        ids = parse_spw_text(spw_arg)
+        spw_arg = ids[0] if len(ids) == 1 else ids
     export(
         argv[0], argv[1],
         field=int(argv[2]) if len(argv) > 2 else 0,

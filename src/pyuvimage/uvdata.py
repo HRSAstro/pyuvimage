@@ -135,10 +135,7 @@ class UVData:
     @property
     def fractional_bandwidth(self) -> float:
         """(nu_max - nu_min) / nu_centre. Zero for a single channel."""
-        f = np.asarray(self.frequencies, dtype=float)
-        lo, hi = float(np.min(f)), float(np.max(f))
-        mid = 0.5 * (lo + hi)
-        return (hi - lo) / mid if mid > 0 else 0.0
+        return _fractional_bandwidth(self.frequencies)
 
     def uv_wavelengths(self, channel: int) -> np.ndarray:
         """(n_vis, 2) u,v in wavelengths for one channel, in the sky frame.
@@ -164,13 +161,7 @@ class UVData:
         data constrain -- slow, and prior-dominated where it is not constrained.
         Flagged samples are excluded, since they contribute no information.
         """
-        scale = np.max(self.frequencies) / C_M_S
-        lengths = np.hypot(self.uvw[:, 0], self.uvw[:, 1]) * scale
-        if self.flags is not None:
-            keep = ~np.all(self.flags, axis=0)
-            if keep.any():
-                lengths = lengths[keep]
-        return float(np.percentile(lengths, percentile))
+        return float(np.percentile(_unflagged_baseline_lengths(self), percentile))
 
     def validate(self) -> None:
         n_chan, n_vis = self.data.shape
@@ -203,13 +194,19 @@ class UVData:
         if channel is None:
             return self
         sl = slice(channel, channel + 1)
-        return UVData(
-            uvw=self.uvw,
+        # `replace`, not a fresh `UVData(...)`: the constructor call listed the
+        # fields by hand and silently dropped antenna1/antenna2/time and
+        # weight_sigma, so a single channel pulled out of a cube could not
+        # have its noise re-estimated. Anything per-row is shared; anything
+        # per-channel is sliced.
+        return replace(
+            self,
             frequencies=self.frequencies[sl],
             data=self.data[sl],
             noise=self.noise[sl],
             flags=None if self.flags is None else self.flags[sl],
             meta=dict(self.meta),
+            weight_sigma=None if self.weight_sigma is None else self.weight_sigma[sl],
         )
 
     def flattened(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -219,21 +216,30 @@ class UVData:
         channel averaging, so there is no bandwidth-smearing approximation.
 
         Returns (uv_wavelengths (n, 2), data (n,) complex, noise (n,) complex).
+
+        The order is channel-major -- every unflagged row of channel 0, then
+        of channel 1, ... -- and downstream code relies on it (the sparse
+        path's multi-spw split test compares sample by sample), so it is
+        fixed. The arrays are built by broadcasting the (n_vis, 2) metres
+        against the (n_chan,) scale and masking once, which is the same
+        ordering a per-channel loop produced and about twice as fast at 64
+        channels; the values are bit-identical, since each is the same single
+        multiplication.
         """
-        uv_list, d_list, n_list = [], [], []
-        for c in range(self.n_chan):
-            keep = (
-                np.ones(self.n_vis, dtype=bool)
-                if self.flags is None
-                else ~self.flags[c]
-            )
-            uv_list.append(self.uv_wavelengths(c)[keep])
-            d_list.append(self.data[c][keep])
-            n_list.append(self.noise[c][keep])
+        scale = np.asarray(self.frequencies, dtype=float) / C_M_S
+        uv = self.uvw[None, :, :2] * scale[:, None, None]      # (n_chan, n_vis, 2)
+        uv[..., 1] *= V_SIGN
+        uv = uv.reshape(-1, 2)
+        if self.flags is None:
+            return uv, self.data.flatten(), self.noise.flatten()
+        # a flat index gather, not `uv[keep]` with the 2-D mask on the 3-D
+        # array: that goes through numpy's slow path and took 0.9 s where
+        # this takes 0.06 s on 64 x 1.7e5 cells
+        idx = np.flatnonzero(~self.flags.ravel())
         return (
-            np.concatenate(uv_list, axis=0),
-            np.concatenate(d_list, axis=0),
-            np.concatenate(n_list, axis=0),
+            np.take(uv, idx, axis=0),
+            np.take(self.data.ravel(), idx),
+            np.take(self.noise.ravel(), idx),
         )
 
     # ------------------------------------------------------------------- I/O
@@ -308,12 +314,18 @@ class UVData:
     @classmethod
     def _read_npz(cls, path: Path) -> "UVData":
         """Read the single-file export produced by casa_export.py."""
-        z = np.load(path, allow_pickle=False)
-        if "n_spw" in z:
-            raise ValueError(
-                f"{path} holds several spectral windows; read it with "
-                "pyuvimage.uvdata.read_dataset()"
-            )
+        with np.load(path, allow_pickle=False) as z:
+            if "n_spw" in z:
+                raise ValueError(
+                    f"{path} holds several spectral windows; read it with "
+                    "pyuvimage.uvdata.read_dataset()"
+                )
+            return cls._from_npz(z)
+
+    @classmethod
+    def _from_npz(cls, z) -> "UVData":
+        """Build from an open single-spw npz (`read_dataset` opens it once and
+        dispatches on its keys; this is the single-spw branch)."""
         flags = z["flags"].astype(bool) if "flags" in z else None
         if flags is not None and not np.any(flags):
             flags = None
@@ -394,6 +406,25 @@ class UVData:
 
 
 # ---------------------------------------------------------------- helpers
+def _fractional_bandwidth(frequencies) -> float:
+    f = np.asarray(frequencies, dtype=float)
+    lo, hi = float(np.min(f)), float(np.max(f))
+    mid = 0.5 * (lo + hi)
+    return (hi - lo) / mid if mid > 0 else 0.0
+
+
+def _unflagged_baseline_lengths(uvd: "UVData") -> np.ndarray:
+    """Baseline lengths in wavelengths at the spw's own maximum frequency,
+    for rows that are not flagged in every channel."""
+    scale = np.max(uvd.frequencies) / C_M_S
+    lengths = np.hypot(uvd.uvw[:, 0], uvd.uvw[:, 1]) * scale
+    if uvd.flags is not None:
+        keep = ~np.all(uvd.flags, axis=0)
+        if keep.any():
+            lengths = lengths[keep]
+    return lengths
+
+
 def _count_independent_hands(vis_c: np.ndarray) -> int:
     """Number of distinct correlations in a (n_corr, ...) visibility array.
 
@@ -537,26 +568,23 @@ class MultiSpwUVData:
     @property
     def fractional_bandwidth(self) -> float:
         """(nu_max - nu_min) / nu_centre over the combined band."""
-        f = self.frequencies
-        lo, hi = float(np.min(f)), float(np.max(f))
-        mid = 0.5 * (lo + hi)
-        return (hi - lo) / mid if mid > 0 else 0.0
+        return _fractional_bandwidth(self.frequencies)
 
     @property
     def max_baseline_wavelengths(self) -> float:
         return float(max(s.max_baseline_wavelengths for s in self.spws))
 
     def baseline_percentile_wavelengths(self, percentile: float = 95.0) -> float:
-        """As `UVData.baseline_percentile_wavelengths`, pooled over all spws."""
-        scale = max(np.max(s.frequencies) for s in self.spws) / C_M_S
-        parts = []
-        for s in self.spws:
-            lengths = np.hypot(s.uvw[:, 0], s.uvw[:, 1]) * scale
-            if s.flags is not None:
-                keep = ~np.all(s.flags, axis=0)
-                if keep.any():
-                    lengths = lengths[keep]
-            parts.append(lengths)
+        """As `UVData.baseline_percentile_wavelengths`, pooled over all spws.
+
+        Each window's lengths are in wavelengths at *its own* maximum
+        frequency, as `max_baseline_wavelengths` already did. This used to
+        scale every window by the global maximum, which stretched a low
+        window's baselines to where they never were -- with spws at 100 and
+        200 GHz the 95th percentile came out too long by up to 2x, and the
+        mesh with it.
+        """
+        parts = [_unflagged_baseline_lengths(s) for s in self.spws]
         return float(np.percentile(np.concatenate(parts), percentile))
 
     @property
@@ -650,14 +678,13 @@ def _npz_optional(z, prefix: str = ""):
     }
 
 
-def _read_multi_npz(path: Path) -> "MultiSpwUVData":
-    """Read a multi-spw .npz written by casa_export.py.
+def _read_multi_npz(z) -> "MultiSpwUVData":
+    """Read a multi-spw .npz written by casa_export.py, from the open file.
 
     Windows are stored side by side under `spw000_*`, `spw001_*` keys rather
     than stacked, because they are ragged: different channel counts and
     different row counts.
     """
-    z = np.load(path, allow_pickle=False)
     meta = json.loads(str(z["meta"])) if "meta" in z else {}
     per_spw = meta.get("per_spw_meta") or []
     spws = []
@@ -691,9 +718,10 @@ def read_dataset(path: str | Path) -> "UVData | MultiSpwUVData":
     """
     path = Path(path)
     if path.is_file() and path.suffix == ".npz":
+        # opened once: the layout is decided and the arrays read from the same
+        # handle, rather than peeking at the keys and then reopening the file
         with np.load(path, allow_pickle=False) as z:
-            multi = "n_spw" in z
-        return _read_multi_npz(path) if multi else UVData.read(path)
+            return _read_multi_npz(z) if "n_spw" in z else UVData._from_npz(z)
     if path.is_dir() and not (path / _FILES["data"]).exists():
         if any(d.is_dir() for d in path.glob("spw*")):
             return MultiSpwUVData.read(path)
@@ -731,9 +759,14 @@ def recompute_noise(
         )
 
     if isinstance(dataset, MultiSpwUVData):
+        spws = [recompute_noise(s, mode, chunk_seconds) for s in dataset.spws]
+        # The top-level meta is what `fit_parameters.json` records (api.run
+        # reads `uvd.meta["noise_estimate"]`), and it used to keep the *old*
+        # mode while every window's meta carried the new one -- so a
+        # `pyuvimage convert --noise scaled` of a multi-spw export was written
+        # down as "difference".
         return MultiSpwUVData(
-            spws=[recompute_noise(s, mode, chunk_seconds) for s in dataset.spws],
-            meta=dict(dataset.meta),
+            spws=spws, meta=_noise_meta(dataset.meta, mode, chunk_seconds),
         )
 
     if not dataset.can_reestimate_noise:
@@ -785,22 +818,27 @@ def recompute_noise(
         fill = float(np.median(good)) if good.size else 1.0
         sigma = np.where(bad, fill * (1 + 1j), sigma)
 
-    meta = dict(dataset.meta)
-    meta["noise_estimate"] = mode
+    return replace(dataset, noise=sigma, meta=_noise_meta(dataset.meta, mode, chunk))
+
+
+def _noise_meta(meta: dict, mode: str, chunk_seconds: float | None) -> dict:
+    """The meta entries that describe how the noise map was made.
+
+    `noise_chunk_seconds` is meaningful only for `difference`, so for the other
+    modes it is set to None rather than left over from a previous estimate --
+    the same convention the importer uses.
+    """
+    from . import noise as noise_mod
+
+    out = dict(meta)
+    out["noise_estimate"] = mode
     if mode == "difference":
-        meta["noise_chunk_seconds"] = float(chunk)
-    return UVData(
-        uvw=dataset.uvw,
-        frequencies=dataset.frequencies,
-        data=dataset.data,
-        noise=sigma,
-        flags=dataset.flags,
-        meta=meta,
-        antenna1=dataset.antenna1,
-        antenna2=dataset.antenna2,
-        time=dataset.time,
-        weight_sigma=dataset.weight_sigma,
-    )
+        out["noise_chunk_seconds"] = float(
+            noise_mod.DEFAULT_CHUNK_SECONDS if chunk_seconds is None else chunk_seconds
+        )
+    else:
+        out["noise_chunk_seconds"] = None
+    return out
 
 
 ARCSEC_RAD = np.pi / 180.0 / 3600.0
@@ -831,28 +869,34 @@ def shift_image_centre(
     would silently be wrong by exactly the amount shifted.
     """
     y0, x0 = float(centre_arcsec[0]), float(centre_arcsec[1])
+    if y0 == 0.0 and x0 == 0.0:
+        # a no-op for both layouts, and before recursing: pooling the noise
+        # of every window for a shift of nothing would change the noise map
+        # (and with it chi^2) on a run that asked for the phase centre
+        return dataset
     if isinstance(dataset, MultiSpwUVData):
         return MultiSpwUVData(
             spws=[shift_image_centre(s, centre_arcsec) for s in dataset.spws],
             meta=_with_centre(dataset.meta, y0, x0),
         )
-    if y0 == 0.0 and x0 == 0.0:
-        return dataset
 
-    data = np.array(dataset.data, dtype=complex)
-    noise = np.array(dataset.noise, dtype=complex)
-    for c in range(dataset.n_chan):
-        uv = dataset.uv_wavelengths(c)
-        phase = np.exp(
-            2j * np.pi * (uv[:, 0] * x0 + uv[:, 1] * y0) * ARCSEC_RAD
-        )
-        data[c] = data[c] * phase
-        # A phase rotation mixes the real and imaginary parts, so separate
-        # sigma_re and sigma_im no longer describe the rotated visibility.
-        # The rotated noise is their quadrature mean, which preserves the
-        # total variance exactly -- so chi^2 statistics are untouched -- and
-        # is a *better* estimate of each, not a worse one: see below.
-        noise[c] = pooled_noise(noise[c])
+    # The ramp for every channel at once: the angle is the (n_vis,) metre
+    # projection u x0 + v y0 times each channel's nu/c -- an outer product,
+    # so one (n_chan, n_vis) real array holds it, and the complex phase is
+    # multiplied into the data in the same buffer. The per-channel loop this
+    # replaces copied the data and the noise in full before touching them.
+    uvw = np.asarray(dataset.uvw, dtype=float)
+    metres = (uvw[:, 0] * x0 + V_SIGN * uvw[:, 1] * y0) * (2.0 * np.pi * ARCSEC_RAD)
+    scale = np.asarray(dataset.frequencies, dtype=float) / C_M_S
+    phase = np.exp(1j * (scale[:, None] * metres[None, :]))
+    np.multiply(dataset.data, phase, out=phase)
+    data = phase
+    # A phase rotation mixes the real and imaginary parts, so separate
+    # sigma_re and sigma_im no longer describe the rotated visibility. The
+    # rotated noise is their quadrature mean, which preserves the total
+    # variance exactly -- so chi^2 statistics are untouched -- and is a
+    # *better* estimate of each, not a worse one: see `pooled_noise`.
+    noise = pooled_noise(dataset.noise)
     _report_reim_asymmetry(dataset.noise)
     return replace(
         dataset, data=data, noise=noise,
@@ -953,13 +997,26 @@ def reim_asymmetry(noise: np.ndarray) -> float:
     reporting below because the sparse inversion needs the number, not a log
     line: its `W~` reduction assumes the two are equal.
     """
+    value = _reim_asymmetry_or_nan(noise)
+    return 0.0 if not np.isfinite(value) else value
+
+
+def _reim_asymmetry_or_nan(noise: np.ndarray) -> float:
+    """`reim_asymmetry`, but NaN when there is nothing usable to measure --
+    the reporter needs to tell "they agree" from "there is nothing there"."""
     a = np.asarray(noise)
     re, im = np.abs(a.real), np.abs(a.imag)
     ok = np.isfinite(re) & np.isfinite(im) & (re > 0) & (im > 0)
     if not np.any(ok):
-        return 0.0
+        return float("nan")
     asym = np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))
     return float(np.nanmedian(asym))
+
+
+#: The re/im diagnostic is a median, which is stable to well under a per cent
+#: on this many samples; above it the noise map is strided down to it so that
+#: a report costs the same on 1e7 cells as on 1e5.
+REIM_DIAGNOSTIC_SAMPLES = 100_000
 
 
 def _report_reim_asymmetry(noise: np.ndarray) -> None:
@@ -975,14 +1032,19 @@ def _report_reim_asymmetry(noise: np.ndarray) -> None:
     rotation, it is the better estimate of both -- twice the sample size. Only
     a *systematic* difference would mean something, hence the median rather
     than the maximum: one bad baseline should not raise an alarm.
+
+    The number is `reim_asymmetry`'s -- this used to re-implement it. On a
+    large map it is taken on a stride through the flattened array (every
+    k-th cell, which samples channels and rows alike), so the report is
+    identical for anything up to `REIM_DIAGNOSTIC_SAMPLES` cells and a
+    statistically indistinguishable estimate above.
     """
-    a = np.asarray(noise)
-    re, im = np.abs(a.real), np.abs(a.imag)
-    ok = np.isfinite(re) & np.isfinite(im) & (re > 0) & (im > 0)
-    if not np.any(ok):
+    a = np.asarray(noise).ravel()
+    if a.size > REIM_DIAGNOSTIC_SAMPLES:
+        a = a[:: int(np.ceil(a.size / REIM_DIAGNOSTIC_SAMPLES))]
+    median = _reim_asymmetry_or_nan(a)
+    if not np.isfinite(median):
         return
-    asym = np.abs(re[ok] - im[ok]) / (0.5 * (re[ok] + im[ok]))
-    median = float(np.nanmedian(asym))
     logger.info(
         "  sigma_re and sigma_im differ by %.1f%% (median); recentring pools "
         "them in quadrature, which preserves the total variance and halves "

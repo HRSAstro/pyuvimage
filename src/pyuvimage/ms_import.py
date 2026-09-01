@@ -286,6 +286,16 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
     # transpose to (n_chan, n_vis)
     vis = np.ascontiguousarray(stokes_i.T)
     flags = np.ascontiguousarray(chan_flag.T)
+    # Flagged cells are stored as 0.0 -- but they must be *invisible* to the
+    # noise estimators, so every one of them below sees this masked copy, as
+    # `uvdata.recompute_noise` and casa_export.py already did. Estimating on
+    # the zeros was a real bug with two faces. A fully flagged edge channel
+    # contributes differences of exactly zero, which pull the pooled sigma
+    # down: on the fake-table harness with the two edge channels flagged the
+    # estimate came out at 0.69x the truth. And a cell flagged in one
+    # integration but not the next differences the source against zero, so
+    # with a bright source 10% sporadic flags inflated it 27x.
+    vis_for_noise = np.where(flags, np.nan, vis)
 
     # ----------------------------------------------------------------- noise
     #
@@ -306,6 +316,14 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         sigma_rel_2d = np.where(wsum > 0, 1.0 / np.sqrt(wsum), np.nan)
     sigma_rel = np.ascontiguousarray(sigma_rel_2d.T)   # (n_chan, n_vis)
 
+    # The whole-track estimate, computed exactly once. The chunked estimator,
+    # the hybrid one and the baseline-length diagnostic each need it, and each
+    # used to recompute it internally -- three passes over the data for one
+    # number. They now take it as `whole_track_sigma`.
+    whole_track = noise_mod.sigma_from_time_differences(
+        vis_for_noise, antenna1=ant1, antenna2=ant2, time=time
+    )
+
     # Time-differencing, resolved into blocks of the track where there are
     # enough integrations to support it and collapsing to one sigma per
     # baseline where there are not -- `sigma_in_time_chunks` falls back on its
@@ -313,13 +331,12 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
     # whole-track estimate.
     if float(noise_chunk_seconds) > 0:
         differenced = noise_mod.sigma_in_time_chunks(
-            vis, antenna1=ant1, antenna2=ant2, time=time,
+            vis_for_noise, antenna1=ant1, antenna2=ant2, time=time,
             chunk_seconds=float(noise_chunk_seconds),
+            whole_track_sigma=whole_track,
         )
     else:
-        differenced = noise_mod.sigma_from_time_differences(
-            vis, antenna1=ant1, antenna2=ant2, time=time
-        )
+        differenced = whole_track
     med_diff = float(np.median(differenced.real))
 
     # Does the noise level change over the track? `difference` returns one
@@ -327,7 +344,7 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
     # set -- airmass, Tsys -- it delivers the quadratic mean everywhere and
     # over-weights the noisiest data. The fit cannot see that, so say it.
     var_ratio, blocks = noise_mod.noise_time_variation(
-        vis, antenna1=ant1, antenna2=ant2, time=time
+        vis_for_noise, antenna1=ant1, antenna2=ant2, time=time
     )
     if np.isfinite(var_ratio) and var_ratio > 1.25:
         logger.warning(
@@ -368,7 +385,8 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
     # is worse than its Tsys suggests.
     b_len = np.hypot(uvw[:, 0], uvw[:, 1])
     b_ratio, b_short, b_long = noise_mod.baseline_weight_disagreement(
-        vis, sigma_rel, ant1, ant2, time, b_len
+        vis_for_noise, sigma_rel, ant1, ant2, time, b_len,
+        whole_track_sigma=whole_track,
     )
     if np.isfinite(b_ratio):
         logger.info(
@@ -401,7 +419,8 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         noise[bad] = med_diff * (1 + 1j)
     elif noise_estimate == "hybrid":
         noise = noise_mod.hybrid_sigma(
-            vis, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
+            vis_for_noise, sigma_rel, antenna1=ant1, antenna2=ant2, time=time,
+            whole_track_sigma=whole_track,
         )
         bad = (
             ~np.isfinite(noise.real) | (noise.real <= 0)
@@ -414,7 +433,7 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         )
     elif noise_estimate == "scaled":
         noise = noise_mod.scale_relative_sigma(
-            vis, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
+            vis_for_noise, sigma_rel, antenna1=ant1, antenna2=ant2, time=time
         )
         bad = (
             ~np.isfinite(noise.real) | (noise.real <= 0)
@@ -461,4 +480,14 @@ def _import_from_open_ms(ms_path, main, table, data_column, field, spw,
         noise=noise,
         flags=flags if np.any(flags) else None,
         meta=meta,
+        # The re-estimation ingredients, exactly as casa_export.py stores them.
+        # Without these `recompute_noise` refused an imported dataset as
+        # "written by an older export" -- the importer was the older export.
+        # `weight_sigma` is the column's *relative* sigma, 1/sqrt(sum w) over
+        # the hands actually averaged, NaN where every hand was flagged; its
+        # scale is not trusted, its shape is what --noise hybrid/scaled use.
+        antenna1=np.asarray(ant1, dtype=np.int64),
+        antenna2=np.asarray(ant2, dtype=np.int64),
+        time=np.asarray(time, dtype=np.float64),
+        weight_sigma=sigma_rel + 1j * sigma_rel,
     )
