@@ -903,6 +903,49 @@ def with_pooled_noise(
 REIM_ASYMMETRY_WARN = 0.25
 
 
+def describe_pooling(asymmetry: float) -> tuple[int | None, str]:
+    """What the sparse path should say about pooling this noise map.
+
+    Returns `(level, message)` for `logger.log`, or `(None, "")` when there is
+    nothing to say because the two sigmas already agree exactly.
+
+    Split out from `api.run` so the wording and the threshold can be tested
+    without running a fit -- the sparse path needs JAX, so an end-to-end test
+    of this message would skip on most machines, which is precisely where a
+    warning that quietly stopped appearing would go unnoticed.
+
+    The asymmetry decides the *level*, never the path. Above
+    `REIM_ASYMMETRY_WARN` the difference is more than the estimator's own
+    scatter usually explains, and pooling then weights the real and imaginary
+    parts equally when the noise map says otherwise -- worth a warning, and
+    worth naming `--inversion dense`, which makes no such assumption. Below it
+    the difference is scatter and pooling is the better estimate of both.
+    """
+    if asymmetry <= 0:
+        return None, ""
+    if asymmetry > REIM_ASYMMETRY_WARN:
+        return logging.WARNING, (
+            f"sigma_re and sigma_im differ by {100 * asymmetry:.1f}%, more "
+            "than scatter in the noise estimator usually explains. The "
+            "w-tilde reduction assumes they are equal, so this fit pools them "
+            "in quadrature and weights the real and imaginary parts equally "
+            "-- which is not what your noise map says. Total variance is "
+            "preserved, so chi^2 statistics stay valid, but if the difference "
+            "is real the sparse and dense paths will not agree exactly. Rerun "
+            "with --inversion dense, which makes no such assumption, if the "
+            "two sigmas are meant to differ."
+        )
+    return logging.INFO, (
+        f"pooling sigma_re and sigma_im in quadrature for the sparse "
+        f"inversion (they differ by {100 * asymmetry:.1f}%, which at this "
+        "level is scatter in the noise estimator rather than a real "
+        "difference): the w-tilde reduction assumes they are equal, and "
+        "pooling is the better estimate of both. Total variance is unchanged, "
+        "so chi^2 statistics are not affected. --inversion dense leaves the "
+        "noise map untouched."
+    )
+
+
 def reim_asymmetry(noise: np.ndarray) -> float:
     """Median fractional disagreement between sigma_re and sigma_im.
 

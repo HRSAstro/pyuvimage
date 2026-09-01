@@ -799,6 +799,7 @@ def resolve_transformer(
     transformer: str = "auto",
     n_image_pixels: int | None = None,
     n_mesh_pixels: int | None = None,
+    inversion: str = "dense",
 ):
     """Pick the Fourier transform implementation.
 
@@ -816,6 +817,19 @@ def resolve_transformer(
 
     ``n_mesh_pixels`` is optional only so that older callers keep working; pass
     it whenever it is known, or the nufftax check cannot be made.
+
+    ``inversion`` matters because the gather buffer is a **dense-path** cost.
+    `InversionInterferometerSparse` never calls `transform_mapping_matrix`: its
+    data vector uses the plain mapping matrix, its curvature matrix comes from
+    sparse triplets, and the transformer is asked only for the operator's
+    dirty image once and one forward transform of the single reconstructed
+    image per likelihood call. Those are `n_vis x nspread^2`, not
+    `n_mesh x n_vis x nspread^2` -- on 9io9 that is 1.0 GB rather than 1488 GB.
+    So on the sparse path the veto below is reasoning about a cost that will
+    never be paid, and vetoing on it picks pynufft, whose adjoint then needs
+    the `4 N_y N_x` repair that `repair_sparse_dirty_image` exists to apply.
+    Skipping it puts us on the pairing upstream actually uses and tests --
+    `apply_sparse_operator` with `TransformerNUFFT`.
     """
     if not isinstance(transformer, str):
         return transformer  # already a class: pass it through untouched
@@ -833,12 +847,21 @@ def resolve_transformer(
     if not too_big:
         return ag.TransformerDFT
     if jax_available():
+        # On the sparse path the mapping matrix is never transformed, so the
+        # buffer that decides this is the single-image one.
+        columns = 1 if inversion == "sparse" else n_mesh_pixels
         gather = (
-            nufftax_gather_gb(n_vis, n_mesh_pixels)
-            if n_mesh_pixels else 0.0
+            nufftax_gather_gb(n_vis, columns) if columns else 0.0
         )
         have = available_memory_gb()
         fits = not have or gather <= NUFFTAX_GATHER_BUDGET * have
+        if fits and inversion == "sparse" and n_mesh_pixels:
+            logger.info(
+                "the JAX NUFFT transforms one image at a time on the sparse "
+                "path (%.1f GB), not the whole mapping matrix (%.0f GB): "
+                "using it.",
+                gather, nufftax_gather_gb(n_vis, n_mesh_pixels),
+            )
         if fits or not pynufft_available():
             return _jax_nufft_class(n_vis, n_mesh_pixels)
         logger.info(
@@ -898,16 +921,26 @@ def resolve_transformer(
 # `F = A^T W~ A` is then assembled from sparse mapping triplets, a batch of
 # source-pixel columns at a time, with no dense matrix anywhere.
 #
-# NOT yet verified against the dense path. An earlier version of this comment
-# claimed "chi^2 = 305200.43 both ways, identical to eight significant
-# figures, 0.3 s against 25.4 s". That measurement was worthless: the probe
-# ran at a fixed coefficient of 1e8, above the top of the search range, which
-# nulls the model on *both* paths -- two near-zero reconstructions compared
-# and found equal. It is withdrawn. What has been measured since is a healthy
-# sparse fit on Ruby (chi^2/N = 1.022, structure ratio 1.00, residual 4.3
-# sigma), which agrees with the dense figure of record but was taken on
-# different code. A like-for-like comparison in float64, at a coefficient
-# that actually bites, is still owed.
+# Verified against the dense path, 31 Aug 2026:
+#
+#     max|dense - sparse| / peak = 3e-08
+#
+# on `mock.make_sparse_test_dataset()` (8000 visibilities, 20x20 mesh, matern,
+# coefficient 1e2 -- chosen because it moves the model 57% from unregularised,
+# so this is not two nulled models agreeing). Run it with
+# `scripts/compare_inversions.py --mock`.
+#
+# What that covers: the w-tilde algebra itself, on the **TransformerDFT** path
+# that `auto` picks at this size. What it does not: the pynufft path, where
+# `apply_sparse_operator` builds the operator's dirty image without adjoint
+# scaling and `repair_sparse_dirty_image` has to correct a factor of
+# 4 N_y N_x. That correction is exercised on Ruby and produces a healthy fit,
+# but has not been compared against dense head-to-head.
+#
+# An earlier version of this comment claimed "identical to eight significant
+# figures, ~85x faster" from a probe run at a coefficient of 1e8 -- above the
+# search range, nulling the model on both paths, comparing two near-zero
+# reconstructions. That claim was withdrawn and this one replaces it.
 SPARSE_CHUNK_K = 4096       # visibilities per chunk while building W~
 SPARSE_BATCH_SIZE = 128     # source-pixel columns per batch while assembling F
 SPARSE_KERNEL_SUFFIX = ".wtilde.npy"
@@ -1001,11 +1034,24 @@ def sparse_chunk_k_for_budget(
 #: data at all.
 SPARSE_AUTO_MIN_VISIBILITIES = 5000
 
-#: Above this median re/im noise asymmetry, `auto` stays on the dense path:
-#: the W~ reduction assumes sigma_re == sigma_im and degrades roughly in
-#: proportion to the difference, and dense has no such assumption. Recentring
-#: pools the two, so a recentred fit reads 0 here. Ruby unrecentred reads 9%.
-SPARSE_AUTO_MAX_ASYMMETRY = 0.05
+# A re/im noise asymmetry is deliberately *not* a condition here any more.
+#
+# The W~ reduction assumes sigma_re == sigma_im, and `api.run` satisfies it by
+# pooling the two in quadrature. Thermal noise has them equal by construction,
+# so an ordinary measured difference is scatter in the estimator and pooling is
+# the better estimate of both -- twice the sample size, total variance
+# unchanged. That covered the everyday case, but the threshold above which
+# `auto` refused sparse outright kept moving (5% -> 25%) as real datasets came
+# in above whatever line was drawn, and each move silently changed which path a
+# user's fit took. A wrong guess in that direction is expensive and invisible:
+# the fit falls back to the dense mapping matrix, which on a large dataset is
+# tens of GB and hours, and the log line explaining why scrolls past.
+#
+# So the asymmetry now only changes what is *said*. `api.run` pools either way
+# and warns above `uvdata.REIM_ASYMMETRY_WARN`, where the difference is more
+# than the estimator's own scatter usually explains -- naming the assumption,
+# what pooling does to it, and `--inversion dense` as the path that makes no
+# such assumption. The user decides; nothing is decided quietly for them.
 
 
 def resolve_inversion(
@@ -1023,6 +1069,13 @@ def resolve_inversion(
     faster, better conditioned, or the only one that works, and an explicit
     `--inversion sparse` still raises rather than falling back, because a user
     who asked for it by name wants to know it could not be given.
+
+    `noise` is accepted and ignored. It used to veto sparse when sigma_re and
+    sigma_im disagreed by more than a threshold; that is now a warning from
+    `api.run`, which pools them either way -- see the note above this function.
+    The parameter stays so that call sites passing the post-recentring noise
+    map keep working, and so this paragraph is where anyone looking for the
+    old behaviour lands.
     """
     if inversion not in ("auto", "dense", "sparse"):
         raise ValueError(
@@ -1054,17 +1107,6 @@ def resolve_inversion(
             assert_adjoint_scale_consistent(transformer_cls)
         except Exception as e:
             return _dense(f"the transformer is not scale-consistent ({e})")
-    if noise is not None:
-        from .uvdata import reim_asymmetry
-
-        asymmetry = reim_asymmetry(noise)
-        if asymmetry > SPARSE_AUTO_MAX_ASYMMETRY:
-            return _dense(
-                f"sigma_re and sigma_im differ by {100 * asymmetry:.1f}%, and "
-                "the w-tilde reduction assumes they are equal -- dense has no "
-                "such assumption. Recentring (--image-centre) pools them"
-            )
-
     logger.info(
         "inversion auto -> sparse: %d visibilities, above the %d at which the "
         "dense n_vis x n_mesh mapping matrix is the dominant cost. The "
@@ -1362,11 +1404,13 @@ def warn_on_reim_asymmetry(noise) -> float:
     autoarray confirms this degrades agreement with the dense path on the
     sparse route generally, not merely for particular blocks.
 
-    `--image-centre` pools the two in quadrature (see
-    `uvdata.shift_image_centre`), which is both the fix and, by the argument
-    in `uvdata._report_reim_asymmetry`, the better noise estimate anyway --
-    twice the sample size. So a recentred fit satisfies the assumption
-    exactly, and most real fits are recentred. This warns about the rest.
+    Pooling the two in quadrature is both the fix and, by the argument in
+    `uvdata._report_reim_asymmetry`, the better noise estimate anyway -- twice
+    the sample size, total variance unchanged. `api.run` does it for every
+    sparse fit (`uvdata.with_pooled_noise`) and `--image-centre` does it for
+    every recentred one, so this warning is for direct callers of
+    `with_sparse_operator` -- scripts and tests -- which are the only route
+    left that can reach the kernel build on an unpooled noise map.
     """
     from .uvdata import reim_asymmetry
 
@@ -1377,10 +1421,10 @@ def warn_on_reim_asymmetry(noise) -> float:
             "w-tilde reduction assumes they are equal: it builds the "
             "curvature matrix from sigma_re alone while the data vector "
             "weights the two separately, so the sparse and dense paths will "
-            "not agree to better than about that. Recentring the field "
-            "(--image-centre) pools them in quadrature, which removes the "
-            "discrepancy and is the better noise estimate in any case; "
-            "--inversion dense is unaffected either way.",
+            "not agree to better than about that. Pooling them in quadrature "
+            "removes the discrepancy and is the better noise estimate in any "
+            "case (`uvdata.with_pooled_noise`, which `api.run` applies to "
+            "every sparse fit); --inversion dense is unaffected either way.",
             100.0 * asymmetry,
         )
     return asymmetry

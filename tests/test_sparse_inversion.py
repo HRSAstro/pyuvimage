@@ -467,7 +467,14 @@ def test_equal_sigmas_pass_quietly(caplog):
 
 def test_unequal_sigmas_are_reported_with_their_size(caplog):
     """Ruby unrecentred reads 9%. The number belongs in the message: it bounds
-    how well the two paths can be expected to agree."""
+    how well the two paths can be expected to agree.
+
+    This warning is now for direct callers of `with_sparse_operator` -- scripts
+    and tests. `api.run` pools the noise before the kernel is built, so a fit
+    through the CLI cannot reach the kernel build with unequal sigmas, and the
+    message names pooling rather than `--image-centre`, which used to be the
+    only route to it.
+    """
     import logging
 
     noise = np.full(64, 0.10 + 0.11j)
@@ -476,7 +483,8 @@ def test_unequal_sigmas_are_reported_with_their_size(caplog):
     assert asym == pytest.approx(0.0952, rel=1e-2)
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "9.5%" in text
-    assert "--image-centre" in text
+    assert "pooling" in text.lower()
+    assert "--inversion dense" in text
 
 
 def test_a_recentred_dataset_satisfies_the_assumption_exactly():
@@ -656,17 +664,24 @@ def test_auto_falls_back_when_sparse_is_unavailable(monkeypatch, caplog):
     assert "needs JAX" in "\n".join(r.getMessage() for r in caplog.records)
 
 
-def test_auto_avoids_sparse_on_unequal_sigmas(monkeypatch):
-    """The W~ reduction assumes sigma_re == sigma_im and degrades roughly in
-    proportion to the difference; dense has no such assumption. Ruby reads 9%
-    unrecentred and 0% recentred."""
+def test_the_sigmas_never_decide_the_path(monkeypatch):
+    """A re/im asymmetry is a warning now, not a fallback.
+
+    Two thresholds were tried -- 5%, then 25% -- and real data arrived above
+    each: Ruby reads 9.1% unrecentred, 9io9 15.6%. Each move silently changed
+    which path a fit took, and a wrong guess costs a large dataset the dense
+    mapping matrix, tens of GB and hours, for a difference the user is better
+    placed to judge. `api.run` pools either way and says how far apart they
+    were; nothing here refuses.
+    """
     monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
-    unequal = np.full(64, 0.10 + 0.11j)
-    equal = np.full(64, 0.10 + 0.10j)
-    assert fitting.resolve_inversion(
-        "auto", n_vis=10**6, noise=unequal) == "dense"
-    assert fitting.resolve_inversion(
-        "auto", n_vis=10**6, noise=equal) == "sparse"
+    for sigma_im in (0.10, 0.109, 0.117, 0.20, 0.40):
+        noise = np.full(64, 0.10 + 1j * sigma_im)
+        assert fitting.resolve_inversion(
+            "auto", n_vis=10**6, noise=noise) == "sparse", (
+            f"sigma_im={sigma_im} sent auto to dense; the asymmetry is meant "
+            "to change only what is logged"
+        )
 
 
 def test_auto_falls_back_on_a_scale_inconsistent_transformer(monkeypatch):
@@ -696,3 +711,166 @@ def test_an_explicit_choice_is_returned_untouched(choice, monkeypatch):
 def test_an_unknown_inversion_is_still_rejected():
     with pytest.raises(ValueError, match="unknown inversion"):
         fitting.resolve_inversion("wtilde", n_vis=10)
+
+
+# --------------------------------------------------------------------------
+# The gather-buffer veto is a dense-path cost
+# --------------------------------------------------------------------------
+#
+# `resolve_transformer` rejects the JAX NUFFT when its batched
+# `transform_mapping_matrix` gather buffer (n_mesh x n_vis x nspread^2) will
+# not fit. On the sparse path that call never happens: the data vector uses the
+# plain mapping matrix, the curvature matrix comes from sparse triplets, and
+# the transformer is asked only for one dirty image and one forward transform
+# of the reconstructed image per likelihood call.
+#
+# Measured on 9io9 (164,262 visibilities, 1444 mesh pixels): the mapping-matrix
+# buffer is 1488 GB and the single-image one is 1.03 GB. Vetoing on the former
+# picked pynufft -- whose adjoint then needs the 4*N_y*N_x repair -- for a
+# build that was never going to run.
+
+def test_the_veto_still_applies_on_the_dense_path(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(fitting, "jax_available", lambda: True)
+    monkeypatch.setattr(fitting, "pynufft_available", lambda: True)
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 12.1)
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        cls = fitting.resolve_transformer(
+            n_vis=164262, transformer="auto",
+            n_image_pixels=116 * 116, n_mesh_pixels=1444, inversion="dense",
+        )
+    assert cls is fitting.pynufft_transformer_class()
+    assert "gather buffer" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_the_veto_does_not_apply_on_the_sparse_path(monkeypatch, caplog):
+    """9io9's numbers exactly: 1488 GB for a build that never happens."""
+    import logging
+
+    monkeypatch.setattr(fitting, "jax_available", lambda: True)
+    monkeypatch.setattr(fitting, "pynufft_available", lambda: True)
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 12.1)
+    sentinel = object()
+    monkeypatch.setattr(fitting, "_jax_nufft_class", lambda *a, **k: sentinel)
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        cls = fitting.resolve_transformer(
+            n_vis=164262, transformer="auto",
+            n_image_pixels=116 * 116, n_mesh_pixels=1444, inversion="sparse",
+        )
+    assert cls is sentinel, "the sparse path was vetoed on a cost it never pays"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "one image at a time" in text
+
+
+def test_the_single_image_buffer_is_what_sparse_actually_pays():
+    """The arithmetic the change rests on, so a kernel-width change is caught."""
+    mapping = fitting.nufftax_gather_gb(164262, 1444)
+    single = fitting.nufftax_gather_gb(164262, 1)
+    assert mapping > 1000
+    assert single < 2
+    assert mapping / single == pytest.approx(1444, rel=1e-6)
+
+
+def test_an_explicit_transformer_is_unaffected_by_the_inversion():
+    """`--transformer pynufft` means pynufft whatever the inversion."""
+    for inversion in ("dense", "sparse"):
+        assert fitting.resolve_transformer(
+            n_vis=10**6, transformer="dft", inversion=inversion
+        ) is __import__("autogalaxy").TransformerDFT
+
+
+# --------------------------------------------------------------------------
+# Unequal sigmas: pool rather than refuse
+# --------------------------------------------------------------------------
+#
+# The W~ reduction assumes sigma_re == sigma_im. Thermal noise has them equal
+# by construction, so a measured difference is scatter in the estimator, and
+# pooling in quadrature is the better estimate of both -- twice the sample
+# size, total variance unchanged. `--image-centre` already does this on every
+# recentred fit.
+#
+# Refusing sparse on any asymmetry made the fast path depend on whether the
+# user happened to recentre, which has nothing to do with the physics.
+# Measured unrecentred: Ruby 9.1%, 9io9 15.6% -- both scatter, both pushed onto
+# the dense path by the old 5% threshold. `pyuvimage fit 9io9.npz --fov 8`
+# could not reach the sparse inversion at all.
+#
+# The threshold is gone entirely now, not just moved. Two were tried and real
+# data arrived above each, and every move silently changed which path a fit
+# took; the asymmetry decides the log *level* and nothing else. The tests
+# below are on `describe_pooling`, which returns that level and the wording,
+# so they run without JAX -- an end-to-end check of a warning would skip on
+# every machine without it, which is exactly where a message that stopped
+# appearing would go unnoticed.
+
+def test_ordinary_estimator_scatter_is_reported_quietly(monkeypatch):
+    """9io9's 15.6% and Ruby's 9.1% are scatter: pool, mention it, move on."""
+    import logging
+
+    from pyuvimage.uvdata import describe_pooling, reim_asymmetry
+
+    for sigma_im in (0.109, 0.117):  # ~9% and ~16% asymmetry against 0.10
+        noise = np.full(64, 0.10 + 1j * sigma_im)
+        asymmetry = reim_asymmetry(noise)
+        assert 0.05 < asymmetry < 0.25, (
+            "this fixture is meant to sit in the scatter regime"
+        )
+        level, message = describe_pooling(asymmetry)
+        assert level == logging.INFO
+        assert "scatter in the noise estimator" in message
+
+
+def test_a_difference_too_large_to_be_scatter_warns_but_still_fits(monkeypatch):
+    """The change this test exists for: warn, do not fall back.
+
+    Above the line, pooling weights the real and imaginary parts equally when
+    the noise map says they should not be -- a real caveat on the result, and
+    one the user can act on. It is not a reason to spend the dense path's
+    memory on their behalf without asking, so the message has to carry both
+    halves: what pooling did, and which flag avoids it.
+    """
+    import logging
+
+    from pyuvimage.uvdata import describe_pooling
+
+    level, message = describe_pooling(0.67)
+    assert level == logging.WARNING
+    assert "--inversion dense" in message
+    assert "chi^2 statistics stay valid" in message
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    assert fitting.resolve_inversion(
+        "auto", n_vis=10**6, noise=np.full(64, 0.10 + 0.20j)) == "sparse"
+
+
+def test_equal_sigmas_say_nothing_at_all():
+    """Nothing to pool, so no line in the log about pooling."""
+    from pyuvimage.uvdata import describe_pooling
+
+    level, message = describe_pooling(0.0)
+    assert level is None and message == ""
+
+
+def test_the_warning_line_is_the_one_uvdata_already_draws():
+    """One definition of "more than scatter", used by both messages."""
+    import logging
+
+    from pyuvimage import uvdata
+
+    just_below = uvdata.REIM_ASYMMETRY_WARN - 1e-6
+    just_above = uvdata.REIM_ASYMMETRY_WARN + 1e-6
+    assert uvdata.describe_pooling(just_below)[0] == logging.INFO
+    assert uvdata.describe_pooling(just_above)[0] == logging.WARNING
+
+
+def test_pooling_preserves_total_variance():
+    """The property that keeps chi^2 statistics untouched."""
+    from pyuvimage.uvdata import pooled_noise
+
+    noise = np.full(64, 0.10 + 0.13j)
+    pooled = pooled_noise(noise)
+    before = noise.real**2 + noise.imag**2
+    after = pooled.real**2 + pooled.imag**2
+    np.testing.assert_allclose(after, before)
+    np.testing.assert_allclose(pooled.real, pooled.imag)

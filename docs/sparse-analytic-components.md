@@ -55,11 +55,23 @@ sparse-vs-dense agreement generally, not just for these new blocks. `W̃` is
 accumulated from `noise_map_real` alone while the data vector weights the real
 and imaginary parts separately, so `F` and `D` end up on different weightings.
 
-`--image-centre` pools the two in quadrature (`uvdata.shift_image_centre`),
-which removes the discrepancy and is independently the better estimate — twice
-the sample size — so a recentred fit satisfies the assumption exactly. Ruby
-unrecentred reads 9%. `fitting.warn_on_reim_asymmetry` measures it and warns
-above 2% before a sparse fit.
+`api.run` pools the two in quadrature before every sparse fit
+(`uvdata.with_pooled_noise`), which removes the discrepancy and is
+independently the better estimate — twice the sample size, total variance
+unchanged — so the assumption is satisfied exactly by the time the kernel is
+built. `--image-centre` does the same on every recentred fit, for the same
+reason: a phase rotation mixes the real and imaginary parts.
+
+How far apart they were changes only what is said. Below
+`uvdata.REIM_ASYMMETRY_WARN` (25%) it is scatter in the estimator and the
+pooling is logged; above it the difference may be real, pooling then weights
+the two parts equally when the noise map says otherwise, and
+`uvdata.describe_pooling` returns a warning naming `--inversion dense` as the
+path that makes no such assumption. It is deliberately not a fallback:
+refusing sparse sends a large dataset onto the dense mapping matrix — tens of
+GB and hours — over a judgement the user is better placed to make, and the two
+thresholds tried before this (5%, then 25%) each had real data arrive above
+them. Measured unrecentred: Ruby 9%, 9io9 15.6%.
 
 ## What has to change here
 

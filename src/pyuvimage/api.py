@@ -268,32 +268,32 @@ def run(
                 inversion="dense",
             )
     if inversion == "sparse":
-        # The W~ reduction assumes sigma_re == sigma_im, and below
-        # `SPARSE_AUTO_MAX_ASYMMETRY` any measured difference is estimator
-        # scatter rather than a real one -- thermal noise has them equal by
-        # construction. So pool them, which is what `--image-centre` already
-        # does on every recentred fit and is the better estimate of both
-        # (twice the sample size, total variance unchanged).
+        # The W~ reduction assumes sigma_re == sigma_im, so the sparse path
+        # pools the two in quadrature -- the same thing `--image-centre`
+        # already does on every recentred fit, since a phase rotation mixes
+        # the real and imaginary parts. Pooling preserves the total variance
+        # exactly, so chi^2 statistics are untouched.
         #
-        # Doing this rather than refusing is what lets a plain
-        # `pyuvimage fit 9io9.npz --fov 8` take the sparse path at all: 9io9
-        # reads 15.6% unrecentred, Ruby 9.1%, and blocking on that made the
-        # fast path depend on whether the user happened to recentre -- which
-        # has nothing to do with the physics they care about.
-        from .uvdata import reim_asymmetry, with_pooled_noise
+        # How far apart they are changes what is *said*, not which path runs.
+        # Thermal noise has the two equal by construction, so an ordinary
+        # difference is scatter in the estimator and pooling is the better
+        # estimate of both (twice the sample size). A large one might not be,
+        # and then pooling weights the real and imaginary parts equally when
+        # the noise map says they should not be -- so that gets a warning
+        # naming `--inversion dense`, which makes no such assumption.
+        #
+        # It is a warning rather than a fallback because the fallback was the
+        # more expensive mistake. Refusing sparse silently sends a large
+        # dataset onto the dense mapping matrix -- tens of GB and hours -- for
+        # a difference the user is better placed to judge than a threshold is,
+        # and the threshold kept moving as real data came in above it (5% ->
+        # 25%; Ruby reads 9.1% unrecentred, 9io9 15.6%). Say it plainly and
+        # leave the choice where it belongs.
+        from .uvdata import describe_pooling, reim_asymmetry, with_pooled_noise
 
-        asymmetry = reim_asymmetry(uvd.noise)
-        if asymmetry > 0:
-            logger.info(
-                "pooling sigma_re and sigma_im in quadrature for the sparse "
-                "inversion (they differ by %.1f%%, which at this level is "
-                "scatter in the noise estimator rather than a real "
-                "difference): the w-tilde reduction assumes they are equal, "
-                "and pooling is the better estimate of both. Total variance "
-                "is unchanged, so chi^2 statistics are not affected. "
-                "--inversion dense leaves the noise map untouched.",
-                100 * asymmetry,
-            )
+        level, message = describe_pooling(reim_asymmetry(uvd.noise))
+        if level is not None:
+            logger.log(level, message)
             uvd = with_pooled_noise(uvd)
     if inversion == "sparse":
         # Not a correctness problem -- a performance cliff, and a total one.
