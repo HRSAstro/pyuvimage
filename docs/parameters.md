@@ -29,8 +29,8 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--pixel-scale` | **auto** | Model-mesh scale. `auto` = `0.5/b_95`, Nyquist of the baseline 95% of unflagged samples fall within — what the bulk of the data actually supports. `nyquist` = `0.5/b_max`, Nyquist of the *longest* baseline: finer, several times slower, and more mesh than a sparse long-baseline tail can constrain. `fine` = half that again. Or a value in arcsec. Products are written on a grid `oversample` times finer, so they are always finer than the mesh. |
 | `--noise-chunk` (on `pyuvimage import` and `convert`) | **600** | How finely `--noise difference` resolves the noise in time, in seconds. Blocks with too few integrations fall back to one sigma per baseline automatically; `0` forces that everywhere. See [noise.md](noise.md). |
 | `--mesh` | derived | Mesh pixels per side; overrides `--pixel-scale`. |
-| `--image-centre` | **centre** | Where to centre the reconstruction. `centre` = the phase centre. `auto` = the brightest peak in a wide-field dirty image. Or `x,y` in arcsec from the phase centre in **image axes** — +x right and +y up, as you read it off `summary.png`. RA increases leftward, so `x = -dRA`; products are written in dRA/dDec. Same convention as `--point`. A negative x needs the `=` form: `--image-centre="-2.3,0.3"`. Cost goes as `--fov` squared, so recentring on a source a few arcsec off the phase centre is far cheaper than growing the field to reach it — 8″ → 3″ on one real dataset was 32 GB → 4.4 GB *at finer resolution*. The visibilities are rotated by an exact phase ramp and `CRVAL` follows, so the astrometry is unchanged. |
-| `--transformer` | **auto** | `auto` picks the direct DFT while it is affordable, then a NUFFT — `pynufft` on any dataset where the JAX one would not fit in memory (which is most of them; see below), otherwise nufftax. `dft`, `nufft`, `pynufft` force one. The DFT allocates `n_pixels × n_vis`, so on 164k visibilities over a 116×116 image it needs 16.5 GB and a NUFFT needs 20 ms — `pip install pynufft` is the fix and needs no JAX. |
+| `--image-centre` | **0,0** | Where to centre the reconstruction, as an offset in arcsec from the phase centre. `0,0` is the phase centre and is the default; `centre` is a synonym kept for older scripts. `auto` = the brightest peak in a wide-field dirty image. Or `x,y` in arcsec from the phase centre in **image axes** — +x right and +y up, as you read it off `summary.png`. RA increases leftward, so `x = -dRA`; products are written in dRA/dDec. Same convention as `--point`. A negative x needs the `=` form: `--image-centre="-2.3,0.3"`. Cost goes as `--fov` squared, so recentring on a source a few arcsec off the phase centre is far cheaper than growing the field to reach it — 8″ → 3″ on one real dataset was 32 GB → 4.4 GB *at finer resolution*. The visibilities are rotated by an exact phase ramp and `CRVAL` follows, so the astrometry is unchanged. |
+| `--transformer` | **auto** | `auto` picks the direct DFT while it is affordable, then a NUFFT. On the **dense** path it prefers `pynufft` wherever the JAX one's mapping-matrix gather buffer would not fit, which is most real datasets (see below). On the **sparse** path that buffer never exists — no mapping matrix is transformed — so the JAX NUFFT is used, which is also the pairing upstream tests. On 9io9 the difference is 1488 GB of imagined cost against 1.0 GB of real cost. `dft`, `nufft`, `pynufft` force one. The DFT allocates `n_pixels × n_vis`, so on 164k visibilities over a 116×116 image it needs 16.5 GB and a NUFFT needs 20 ms — `pip install pynufft` is the fix and needs no JAX. |
 | (oversample) | **2** | Image grid / model mesh ratio. Products are written on a grid twice as fine as the model mesh. It must be >1: see "the grid trap" in `design-notes.md`. |
 | `mask_shape` | **square** | Reconstruction region. A circular mask leaves the mesh's corner pixels covering no image pixels, so no data constrains them and the prior alone sets their value — worth ~29% of the source flux in spurious corner blobs on one test. |
 
@@ -252,18 +252,27 @@ padded FFT batch is. Above it, `--mesh` is the only lever that matters.
 
 ### What has and has not been verified
 
-Measured, on Ruby 200 GHz continuum (fov 3, mesh 26, recentred, `--reg
-adaptive`): `chi^2/N` = 1.022, structure ratio 1.00, largest residual 4.3σ,
-33 s end to end with the kernel served from cache. That is a healthy fit and
-it agrees with the dense figure of record — but the dense figure was taken on
-an earlier code version, so this is not a controlled comparison.
+**Verified (31 Aug 2026).** On `mock.make_sparse_test_dataset()` — 8000
+visibilities, 20×20 mesh, matern, coefficient 1e2 — the two paths agree to
 
-Not measured: sparse against dense, same code, same data, in float64, at a
-coefficient that actually affects the model. Until that exists, `--inversion
-sparse` is experimental. An earlier claim in these docs of "identical `chi^2`
-to eight significant figures, ~85x faster" has been **withdrawn**: it came
-from a probe run at a coefficient above the top of the search range, which
-nulls the model on both paths, so it compared two near-zero reconstructions.
+```
+max|dense − sparse| / peak = 3e-08
+```
+
+Reproduce it with `python scripts/compare_inversions.py --mock`. The
+coefficient is chosen by the script to move the model ~57% from the
+unregularised solve, so this is emphatically not two nulled models agreeing —
+which is how an earlier claim of "identical to eight significant figures,
+~85× faster" came about. That claim was withdrawn; this one replaces it.
+
+**Still open: the pynufft path.** The mock is small enough that `auto` picks
+`TransformerDFT`, whose adjoint needs no scaling. Every dataset large enough
+to matter picks `TransformerPyNUFFT` instead, where the operator's dirty image
+comes back a factor `4·N_y·N_x` low and `repair_sparse_dirty_image` corrects
+it. That correction is exercised on Ruby and yields a healthy fit (`chi^2/N` =
+1.022, structure ratio 1.00, residual 4.3σ), but has not been compared against
+dense head-to-head. `scripts/compare_inversions.py <dataset> --fov ...` does
+exactly that on real data.
 
 **A scale trap, now guarded.** `apply_sparse_operator` builds the data vector
 through `transformer.image_from(..., use_adjoint_scaling=True)`, while `W̃` is

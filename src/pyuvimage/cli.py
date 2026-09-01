@@ -293,10 +293,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
     p_fit.add_argument(
-        "--image-centre", default="centre", metavar="centre|auto|x,y",
-        help='where to centre the reconstruction: "centre" (the phase '
-        'centre, default), "auto" (the brightest peak in a wide-field dirty '
-        'image), or an offset in arcsec from the phase centre as "x,y" in '
+        "--image-centre", default="0,0", metavar="x,y|auto",
+        help='where to centre the reconstruction, as an offset in arcsec '
+        'from the phase centre: "0,0" (the phase centre) is the default and '
+        '"centre" is a synonym for it; "auto" takes the brightest peak in a '
+        'wide-field dirty image; or give "x,y" in '
         "image axes -- +x right and +y up, as you would read it off "
         "summary.png (RA increases leftward, so x = -dRA), the same "
         "convention as --point. A negative x needs the "

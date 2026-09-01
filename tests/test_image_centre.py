@@ -277,3 +277,77 @@ def test_a_negative_x_is_caught_for_point_too():
 
     with pytest.raises(SystemExit, match='--point="-1.2,0.4"'):
         main(["fit", "x.npz", "--fov", "5", "--point", "-1.2,0.4"])
+
+
+# --- "0,0" is the default, and must be a true no-op -------------------------
+#
+# `shift_image_centre` pools sigma_re and sigma_im in quadrature, which is
+# right when the phase ramp really does mix them and wrong when there is no
+# ramp. So a zero offset must not go through it: doing so would quietly change
+# the noise map on every default run, and with it chi^2 and which path
+# `--inversion auto` takes (it declines sparse above 5% re/im asymmetry).
+
+def _uneven_noise_dataset(n_vis=64, seed=0):
+    """Deliberately unequal sigma_re and sigma_im, so pooling is detectable."""
+    from pyuvimage.uvdata import UVData
+
+    rng = np.random.default_rng(seed)
+    return UVData(
+        uvw=rng.normal(0, 100.0, (n_vis, 3)),
+        frequencies=np.array([2.3e11]),
+        data=rng.normal(size=(1, n_vis)) + 1j * rng.normal(size=(1, n_vis)),
+        noise=np.full((1, n_vis), 0.10 + 0.13j),
+        meta={},
+    )
+
+
+@pytest.mark.parametrize("spelling", ["0,0", "0.0,0.0", (0.0, 0.0), "centre"])
+def test_a_zero_offset_leaves_the_dataset_untouched(spelling):
+    from pyuvimage.api import _recentre
+
+    uvd = _uneven_noise_dataset()
+    out = _recentre(uvd, spelling, fov=3.0, dish_diameter=None)
+    assert out is uvd, f"{spelling!r} went through the recentring machinery"
+    np.testing.assert_allclose(np.asarray(out.noise), np.asarray(uvd.noise))
+
+
+def test_a_real_offset_still_recentres_and_pools_the_noise():
+    """The other half: the no-op must not have disabled recentring itself."""
+    from pyuvimage.api import _recentre
+    from pyuvimage.uvdata import reim_asymmetry
+
+    uvd = _uneven_noise_dataset()
+    assert reim_asymmetry(uvd.noise) > 0.2
+    out = _recentre(uvd, (1.0, -0.5), fov=3.0, dish_diameter=None)
+    assert out is not uvd
+    assert reim_asymmetry(out.noise) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_api_default_is_the_phase_centre():
+    """`run`'s default is the string "0,0", so it has to parse where the CLI's
+    parsed tuple used to arrive."""
+    import inspect
+
+    from pyuvimage.api import _recentre, run
+
+    assert inspect.signature(run).parameters["image_centre"].default == "0,0"
+    uvd = _uneven_noise_dataset()
+    assert _recentre(uvd, "0,0", fov=3.0, dish_diameter=None) is uvd
+
+
+def test_a_numeric_string_offset_works_through_the_api():
+    """The CLI spelling should mean the same thing passed to `run` directly."""
+    from pyuvimage.api import _recentre
+
+    uvd = _uneven_noise_dataset()
+    from_string = _recentre(uvd, "1.0,-0.5", fov=3.0, dish_diameter=None)
+    from_tuple = _recentre(uvd, (1.0, -0.5), fov=3.0, dish_diameter=None)
+    np.testing.assert_allclose(
+        np.asarray(from_string.data), np.asarray(from_tuple.data))
+
+
+def test_an_unparseable_centre_says_what_is_allowed():
+    from pyuvimage.api import _recentre
+
+    with pytest.raises(ValueError, match="not understood"):
+        _recentre(_uneven_noise_dataset(), "middle", fov=3.0, dish_diameter=None)

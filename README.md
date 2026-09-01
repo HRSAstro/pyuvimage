@@ -5,7 +5,9 @@ in the uv-plane**. A lightweight alternative to CLEAN for people who want a
 regularised maximum-likelihood image with honest residuals and honest error
 bars, without being an interferometry expert and without heavy compute.
 
-Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoArray](https://github.com/PyAutoLabs/PyAutoArray): the sky is a freeform image on a
+Built on [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy)'s
+pixelized-source inversion (developed for gravitational lens modelling, used
+here with the lens equation switched off): the sky is a freeform image on a
 cartesian grid, solved by a linear inversion under a Gaussian-process source
 prior whose hyperparameters are optimised automatically — so the model fits to
 the noise level rather than through it, with nothing to tune by hand.
@@ -147,7 +149,13 @@ The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
 with `C = (F+H)^-1`, verified against Monte Carlo at 0.996. That term alone is
 optimistic — a regularised model is smoothed, hence biased — so the systematic
 term measures how far each pixel moves when the regularisation strength is
-varied over ±0.5 dex. Neither includes calibration or deconvolution errors.
+varied over ±0.5 dex. Neither covers the prior *family* being wrong, nor
+calibration or deconvolution error.
+
+**Do not add per-pixel errors in quadrature**: they are correlated over the
+prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
+evaluates `w^T (M C M^T) w` properly — quadrature overstated a compact
+aperture's error by ~1.4× on our mocks.
 
 ![uncertainty](figures/uncertainty_total.png)
 
@@ -232,6 +240,45 @@ A jax/jaxlib mismatch is the usual cause; the `jax-metal` plugin and mixing
 conda-forge with pip installs each do it too. If you would rather not use JAX,
 `pip uninstall jax jaxlib` is a clean answer.
 
+## When not to trust a fit
+
+- **A structure ratio above ~1.5.** Every run prints one:
+
+  ```
+  residual map rms 4.28 sigma against 1.00 expected for white noise
+  at chi2/N = 1.008: structure ratio 4.28
+  ```
+
+  Incoherent residuals average down as `1/sqrt(N)`; coherent ones — sky the
+  model failed to reproduce — add in phase and land `sqrt(N)` higher. So the
+  ratio says whether what is left over is *noise or signal*, which `chi^2`
+  cannot: **`chi^2` constrains the residual's total power, not its
+  structure**, and a fit can sit exactly on `chi^2/N = 1` with the whole
+  source still in `residual.fits`.
+
+  This is the single most useful number the tool prints — it caught a noise
+  map inflated 1.4× by an export bug, on a fit whose `chi^2/N` read 1.0076.
+  The usual cause is a noise map that **over**estimates the noise, which stops
+  the fit early; also check `--fov` and whether the source has structure finer
+  than the model pixel scale.
+
+- **A structure ratio well below ~0.85.** The residual is *quieter* than the
+  noise it should contain, so the model has absorbed noise and its faint
+  structure is not all real. `--criterion structure` picks the smoothing from
+  the residual map rather than from `chi^2`, which on real data can be nearly
+  flat in the coefficient — see
+  [docs/design-notes.md](docs/design-notes.md#when-chi2--n-cannot-be-reached).
+
+- **`chi^2/N` well above 1.** The model cannot represent the data. The run says
+  so loudly and refuses to fit point sources.
+- **Sparsely sampled uv plane.** Faint structure is then set by the prior
+  rather than the data; the run warns.
+- **The mask edge.** On mocks the largest residual is often at the mask
+  boundary rather than the source: edge mesh pixels are poorly constrained and
+  absorb flux. Judge a fit from the interior.
+- **A "the non-negative solver is unreliable" warning.** Positivity has been
+  disabled for that fit and the model may contain small negative values.
+
 ## Run time and memory
 
 Two paths, chosen by `--inversion auto` at 5000 visibilities:
@@ -307,18 +354,23 @@ Full discussion: [docs/noise.md](docs/noise.md).
 ## Caveats
 
 - Only Stokes I is currently supported.
-- Only a single field is currently supported (no mosaics).
-- Several spectral windows can be 
-  imaged together ([docs/spectral-windows.md](docs/spectral-windows.md)) but there is no frequency term to account for spectral index.
+- Only a single field is currently supported; several spectral windows can be
+  imaged together ([docs/spectral-windows.md](docs/spectral-windows.md)).
 - The w-term is neglected (small-field approximation), so very large fields are
   not supported.
-- As for any interferometer, flux cannot be resolved beyond the maximum recovery scale of the data
+- Total flux cannot be resolved beyond the maximum recovery scale of the data
   set, which is determined by the baseline length distribution: emission
   resolved out by the array cannot be recovered (same as CLEAN).
 - The sparse (w-tilde) inversion that `--inversion auto` selects above 5000
-  visibilities is **new**. It should give the same answer as the dense path
-  and has not yet been shown to, on identical code and data. If a result
-  matters, check it against `--inversion dense`.
+  visibilities is **new**. It agrees with the dense path to 3e-8 on the
+  built-in mock (`python scripts/compare_inversions.py --mock`), but that mock
+  is small enough to use the DFT; the pynufft path that real datasets take has
+  not been compared head-to-head. If a result matters, check it against
+  `--inversion dense` — the same script does this on your own data.
+- Positivity applies to the mesh-only solve. With `--point-sources` the
+  bordered system is eliminated by an unconstrained Cholesky solve, so the
+  delivered mesh may hold small negative values whatever `--enforce-positive`
+  is set to; the point amplitudes are unaffected.
 
 ## Further reading
 
