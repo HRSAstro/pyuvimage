@@ -27,6 +27,7 @@ auto-detected one is kept only if its amplitude clears a significance cut.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -142,6 +143,20 @@ def point_visibilities(uv_wavelengths: np.ndarray, y: float, x: float) -> np.nda
     return np.cos(phase) + 1j * np.sin(phase)
 
 
+# Working-memory budgets for the two heavy paths.  Both are soft: they size
+# the chunks the lattice is processed in and decide what is worth memoising,
+# and nothing breaks if a single chunk cannot be made small enough.
+#
+# `scan` at 1e5 visibilities with the old fixed chunk of 1024 trial positions
+# built a 1.6 GB complex block per chunk (and copies of it), which was killed
+# on a 7 GB box.  A 256 MB budget keeps ~80 columns per chunk at 1e5
+# visibilities, while a 500-visibility test case still takes its whole 48x48
+# lattice in one chunk.
+SCAN_CHUNK_BYTES = 256 * 2**20
+# Per-position column data cached across `solve` calls (see `_column_terms`).
+COLUMN_CACHE_BYTES = 128 * 2**20
+
+
 class AugmentedSystem:
     """The mesh's linear system, extensible with analytic point components.
 
@@ -154,6 +169,17 @@ class AugmentedSystem:
     with `B`, `C`, `Dp` the point columns' cross-, self- and data terms.  The
     mesh block is factorised once, so trying a new position costs only a small
     Schur-complement solve.
+
+    Everything is done on *stacked real* arrays: a set of k complex columns
+    ``P`` is held as the real ``(2 n_vis, k)`` array ``[P.real; P.imag]``, and
+    the weights and data likewise.  The quadratic forms the inversion uses --
+    ``P.real^T W_re Q.real + P.imag^T W_im Q.imag`` -- are then a single real
+    GEMM.  The alternative, ``A.real.T @ ...`` on the complex operated mapping
+    matrix, materialises a strided copy of `A` on every call: measured at
+    n_vis = 1e5, n_mesh = 576 that made one `solve` cost 1.3 s against 0.14 s
+    with contiguous real parts, and `solve` is called ~600 times per two-point
+    auto-detection.  The complex `A` is not kept (the stacked array is
+    memory-neutral with it); `A` is a compatibility property that rebuilds it.
     """
 
     def __init__(self, inversion, dataset):
@@ -163,7 +189,16 @@ class AugmentedSystem:
         data = np.asarray(dataset.data)
         self.w_re, self.w_im = 1.0 / noise.real**2, 1.0 / noise.imag**2
         self.d_re, self.d_im = data.real, data.imag
-        self.A = np.asarray(inversion.operated_mapping_matrix)
+        A = np.asarray(inversion.operated_mapping_matrix)
+        self.n_vis = A.shape[0]
+        # [A.real; A.imag], contiguous: one real GEMM replaces two strided ones
+        self.A_stack = np.empty((2 * self.n_vis, A.shape[1]))
+        self.A_stack[: self.n_vis] = A.real
+        self.A_stack[self.n_vis:] = A.imag
+        del A
+        self.w_stack = np.concatenate([self.w_re, self.w_im])
+        self.d_stack = np.concatenate([self.d_re, self.d_im])
+        self.wd_stack = self.w_stack * self.d_stack
         self.F = np.asarray(inversion.curvature_matrix)
         self.D = np.asarray(inversion.data_vector)
         self.H = np.asarray(inversion.regularization_matrix)
@@ -171,9 +206,22 @@ class AugmentedSystem:
         self.n_data = 2 * len(self.d_re)
         self.h_scale = 1.0
         self._cho = cho_factor(self.F + self.H, lower=True, check_finite=False)
+        self._MinvD = None            # (F + h H)^-1 D for the current _cho
         self.chi2_const = float(
             np.sum(self.d_re**2 * self.w_re + self.d_im**2 * self.w_im)
         )
+        # per-position column terms, LRU (see `_column_terms`)
+        self._columns: OrderedDict = OrderedDict()
+        entry_bytes = 8 * (2 * self.n_vis + self.n_mesh)
+        self._column_cache_max = int(
+            min(4096, max(8, COLUMN_CACHE_BYTES // entry_bytes)))
+        # lattice terms memoised for the last detection lattice (see `scan`)
+        self._lattice = None
+
+    @property
+    def A(self) -> np.ndarray:
+        """The complex operated mapping matrix, rebuilt on request."""
+        return self.A_stack[: self.n_vis] + 1j * self.A_stack[self.n_vis:]
 
     def set_regularization_scale(self, factor: float) -> bool:
         """Rescale the regularisation, refactorising the mesh block.
@@ -195,30 +243,156 @@ class AugmentedSystem:
             return False
         self.h_scale = float(factor)
         self._cho = cho
+        self._MinvD = None
         return True
 
-    # ---- the framework's own quadratic forms, rebuilt for arbitrary columns
+    @property
+    def MinvD(self) -> np.ndarray:
+        """(F + h H)^-1 D under the current regularisation scale.
+
+        Only the scale changes it, so it is computed once per
+        `set_regularization_scale` rather than once per `solve`.
+        """
+        if self._MinvD is None:
+            self._MinvD = cho_solve(self._cho, self.D, check_finite=False)
+        return self._MinvD
+
+    # ---- the framework's own quadratic forms, on stacked real columns
     def _curv(self, P: np.ndarray, Q: np.ndarray) -> np.ndarray:
-        return P.real.T @ (self.w_re[:, None] * Q.real) + P.imag.T @ (
-            self.w_im[:, None] * Q.imag
-        )
+        """P^T W Q for stacked real column sets: P.real^T W_re Q.real + imag."""
+        return P.T @ (self.w_stack[:, None] * Q)
 
     def _dvec(self, P: np.ndarray) -> np.ndarray:
-        return P.real.T @ (self.w_re * self.d_re) + P.imag.T @ (
-            self.w_im * self.d_im
-        )
+        """P^T W d for a stacked real column set."""
+        return P.T @ self.wd_stack
 
-    def columns_for(self, positions, sigma_arcsec: float = 0.0) -> np.ndarray:
-        if sigma_arcsec > 0:
-            return np.column_stack(
-                [gaussian_visibilities(self.uv, y, x, sigma_arcsec)
-                 for (y, x) in positions]
-            )
-        return np.column_stack(
-            [point_visibilities(self.uv, y, x) for (y, x) in positions]
-        )
+    def _stacked_columns(self, ys, xs, sigmas=None) -> np.ndarray:
+        """``[Re; Im]`` of the analytic columns at grid positions (ys, xs).
 
-    def scan(self, positions, ys, xs, chunk: int = 1024):
+        Built by broadcasting, in the same operation order as
+        `point_visibilities` so the values are bitwise identical to it, but
+        without a Python loop or a complex intermediate: for one trial
+        position the phase is ``-2 pi ((x rad) u + (y rad) v)`` and the column
+        is ``[cos; sin]``, times the Gaussian taper where ``sigmas[j] > 0``.
+        Peak transient memory is ~32 bytes per visibility per column.
+        """
+        ys = np.asarray(ys, dtype=float).ravel()
+        xs = np.asarray(xs, dtype=float).ravel()
+        n = self.n_vis
+        phase = np.multiply.outer(self.uv[:, 0], xs * ARCSEC_TO_RAD)
+        phase += np.multiply.outer(self.uv[:, 1], ys * ARCSEC_TO_RAD)
+        phase *= -2.0 * np.pi
+        out = np.empty((2 * n, ys.size))
+        np.cos(phase, out=out[:n])
+        np.sin(phase, out=out[n:])
+        del phase
+        if sigmas is not None:
+            sigmas = np.asarray(sigmas, dtype=float).ravel()
+            for j in np.flatnonzero(sigmas > 0):
+                s_rad = sigmas[j] * ARCSEC_TO_RAD
+                taper = np.exp(
+                    -2.0 * np.pi**2 * s_rad**2
+                    * (self.uv[:, 0] ** 2 + self.uv[:, 1] ** 2)
+                )
+                out[:n, j] *= taper
+                out[n:, j] *= taper
+        return out
+
+    def columns_for(self, positions, sigma_arcsec=0.0) -> np.ndarray:
+        """Complex visibility columns for `positions`; ``sigma_arcsec`` may be
+        one width for all or one per column (0 = point)."""
+        positions = list(positions)
+        if not positions:
+            return np.zeros((self.n_vis, 0), dtype=complex)
+        sig = np.broadcast_to(
+            np.asarray(sigma_arcsec, dtype=float), (len(positions),))
+        P = self._stacked_columns(
+            [p[0] for p in positions], [p[1] for p in positions], sig)
+        return P[: self.n_vis] + 1j * P[self.n_vis:]
+
+    def _column_terms(self, positions, sigmas=None):
+        """(P, B, Dp) for the given columns: stacked columns, A^T W P, P^T W d.
+
+        Memoised per column on ``(y, x, sigma)``.  The callers repeat columns
+        heavily: `retune_regularization` solves the same positions 20-40
+        times while only the prior scale changes, and `refine_position` moves
+        one column ~150 times while the others stand still.  The A^T W P
+        column (one pass over the whole of `A`) is the expensive part and
+        depends on neither, so it is computed once per distinct position.
+        The cache is LRU, bounded to `COLUMN_CACHE_BYTES`; positions in use
+        are touched on every solve, so they are never the ones evicted.
+        """
+        positions = list(positions)
+        k = len(positions)
+        if sigmas is None:
+            sigmas = [0.0] * k
+        keys = [(float(y), float(x), float(s))
+                for (y, x), s in zip(positions, sigmas)]
+        missing = [i for i, key in enumerate(keys) if key not in self._columns]
+        if missing:
+            P_new = self._stacked_columns(
+                [keys[i][0] for i in missing], [keys[i][1] for i in missing],
+                [keys[i][2] for i in missing])
+            B_new = self._curv(self.A_stack, P_new)
+            Dp_new = self._dvec(P_new)
+            for j, i in enumerate(missing):
+                self._columns[keys[i]] = (
+                    np.ascontiguousarray(P_new[:, j]), B_new[:, j], Dp_new[j])
+            while len(self._columns) > self._column_cache_max:
+                self._columns.popitem(last=False)
+        P = np.empty((2 * self.n_vis, k))
+        B = np.empty((self.n_mesh, k))
+        Dp = np.empty(k)
+        for j, key in enumerate(keys):
+            self._columns.move_to_end(key)
+            P[:, j], B[:, j], Dp[j] = self._columns[key]
+        return P, B, Dp
+
+    def _lattice_chunk(self, ys, xs, chunk):
+        """Chunk size for `scan`: `chunk` if given, else from the memory budget."""
+        if chunk is not None:
+            return max(1, int(chunk))
+        per_column = 32 * self.n_vis
+        return int(max(16, min(ys.size, SCAN_CHUNK_BYTES // per_column)))
+
+    def _lattice_terms(self, ys, xs, chunk):
+        """Per-chunk ``(Pw, b, dp, c)`` for a detection lattice, memoised.
+
+        `scan` needs, for every trial column p_j: ``b_j = A^T W p_j``,
+        ``dp_j = p_j^T W d`` and ``c_j = p_j^T W p_j``.  None of these depends
+        on the points already accepted or on the regularisation scale, yet the
+        detection loop rescans the same lattice once per candidate (5-8 times
+        for a two-point field), and the ``A^T W P`` GEMM is the bulk of a scan
+        (2 n_vis n_mesh n_lattice flops: 4.7e11 at 1e5 visibilities, 576 mesh
+        pixels and a 64x64 lattice).  So the terms are kept for the most
+        recent lattice.  The weighted columns ``Pw`` themselves are kept too
+        when they fit the budget -- at 500 visibilities a 48x48 lattice is
+        35 MB -- because the rows of the accepted points against the lattice
+        need them; otherwise they are rebuilt from cos/sin, which is cheap
+        next to the GEMM.
+
+        Returns ``(entries, keep_Pw)`` with ``entries`` a dict ``lo -> (Pw or
+        None, b, dp, c)``, filled lazily by `scan`.
+        """
+        L = ys.size
+        lat = self._lattice
+        if (
+            lat is not None and lat["chunk"] == chunk
+            and np.array_equal(lat["ys"], ys) and np.array_equal(lat["xs"], xs)
+        ):
+            return lat["entries"], lat["keep_Pw"]
+        terms_bytes = 8 * L * (self.n_mesh + 2)
+        keep_terms = terms_bytes <= SCAN_CHUNK_BYTES
+        keep_Pw = keep_terms and terms_bytes + 16 * self.n_vis * L <= SCAN_CHUNK_BYTES
+        entries: dict = {}
+        if keep_terms:
+            self._lattice = dict(ys=ys.copy(), xs=xs.copy(), chunk=chunk,
+                                 entries=entries, keep_Pw=keep_Pw)
+        else:
+            self._lattice = None
+        return entries, keep_Pw
+
+    def scan(self, positions, ys, xs, chunk: int | None = None):
         """Exact amplitude and significance of adding *one* point, everywhere.
 
         This is the detector.  The obvious alternative -- take the peak of the
@@ -240,39 +414,61 @@ class AugmentedSystem:
         (r_j^2/s_j is the drop in the *penalised* objective chi^2 + s^T H s,
         not in chi^2 itself -- the regularisation term moves too.)
 
+        The lattice is processed in chunks sized from `SCAN_CHUNK_BYTES`
+        (``chunk`` overrides); the lattice-only terms are memoised across
+        calls, see `_lattice_terms`.  With accepted points the bordered block
+        M is assembled from the cached column terms rather than from
+        ``hstack([A, P0])`` -- that copied all of `A` per scan.  M carries a
+        1e-12 relative ridge and is factorised here even when there are no
+        accepted points, where `self._cho` would do: dropping the ridge would
+        change the result at the 1e-12 level and the factorisation costs
+        ~5 ms at 576 mesh pixels, so identical output was preferred.
+
         Returns (amplitude, significance), both flat arrays over the lattice.
         """
+        ys = np.asarray(ys, dtype=float).ravel()
+        xs = np.asarray(xs, dtype=float).ravel()
+        chunk = self._lattice_chunk(ys, xs, chunk)
+        entries, keep_Pw = self._lattice_terms(ys, xs, chunk)
+
         if positions:
-            P0 = self.columns_for(positions)
-            A_eff = np.hstack([self.A, P0])
-            B0 = self._curv(self.A, P0)
-            C0 = self._curv(P0, P0)
+            P0, B0, Dp0 = self._column_terms(positions)
+            P0w = self.w_stack[:, None] * P0
             M = np.block([
                 [self.F + self.h_scale * self.H, B0],
-                [B0.T, C0],
+                [B0.T, P0.T @ P0w],
             ])
-            D_eff = np.concatenate([self.D, self._dvec(P0)])
+            D_eff = np.concatenate([self.D, Dp0])
         else:
-            A_eff = self.A
+            P0 = None
             M = self.F + self.h_scale * self.H
             D_eff = self.D
         M = M + np.eye(M.shape[0]) * 1e-12 * max(np.trace(M), 1e-30)
         cho = cho_factor(M, lower=True, check_finite=False)
         MinvD = cho_solve(cho, D_eff, check_finite=False)
 
-        ys = np.asarray(ys, dtype=float)
-        xs = np.asarray(xs, dtype=float)
         amp = np.empty(ys.size)
         sig = np.empty(ys.size)
         for lo in range(0, ys.size, chunk):
             hi = min(lo + chunk, ys.size)
-            P = np.column_stack([
-                point_visibilities(self.uv, y, x)
-                for y, x in zip(ys[lo:hi], xs[lo:hi])
-            ])
-            B = self._curv(A_eff, P)
-            c = (self.w_re @ P.real**2) + (self.w_im @ P.imag**2)
-            r = self._dvec(P) - B.T @ MinvD
+            hit = entries.get(lo)
+            if hit is None or (hit[0] is None and P0 is not None):
+                P = self._stacked_columns(ys[lo:hi], xs[lo:hi])
+                Pw = self.w_stack[:, None] * P
+                if hit is None:
+                    b = self.A_stack.T @ Pw
+                    dp = self._dvec(P)
+                    c = np.einsum("ij,ij->j", P, Pw)
+                    if self._lattice is not None:
+                        entries[lo] = (Pw if keep_Pw else None, b, dp, c)
+                else:
+                    _, b, dp, c = hit
+                del P
+            else:
+                Pw, b, dp, c = hit
+            # the accepted points' rows against this chunk: P0^T W P
+            B = b if P0 is None else np.vstack([b, P0.T @ Pw])
+            r = dp - B.T @ MinvD
             MinvB = cho_solve(cho, B, check_finite=False)
             sch = c - np.einsum("ij,ij->j", B, MinvB)
             sch = np.maximum(sch, 1e-30)
@@ -282,41 +478,29 @@ class AugmentedSystem:
 
     def chi_squared_with_width(self, positions, index, sigma_arcsec) -> float:
         """chi^2 with one component widened to a Gaussian of this sigma."""
-        cols = [
-            gaussian_visibilities(self.uv, y, x, sigma_arcsec) if i == index
-            else point_visibilities(self.uv, y, x)
-            for i, (y, x) in enumerate(positions)
-        ]
-        P = np.column_stack(cols)
-        B = self._curv(self.A, P); C = self._curv(P, P); Dp = self._dvec(P)
-        MinvB = cho_solve(self._cho, B, check_finite=False)
-        MinvD = cho_solve(self._cho, self.D, check_finite=False)
-        S = C - B.T @ MinvB
-        S = S + np.eye(S.shape[0]) * 1e-10 * max(np.trace(S), 1e-30)
-        a = np.linalg.solve(S, Dp - B.T @ MinvD)
-        s = MinvD - MinvB @ a
-        theta = np.concatenate([s, a])
-        F_aug = np.block([[self.F, B], [B.T, C]])
-        return float(
-            self.chi2_const + theta @ F_aug @ theta
-            - 2.0 * theta @ np.concatenate([self.D, Dp])
-        )
+        sigmas = [0.0] * len(positions)
+        sigmas[index] = float(sigma_arcsec)
+        return self.solve(positions, sigmas=sigmas)[2]
 
-    def solve(self, positions) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
-        """Solve for (mesh values, point amplitudes, chi^2, amplitude covariance)."""
+    def solve(
+        self, positions, sigmas=None
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Solve for (mesh values, point amplitudes, chi^2, amplitude covariance).
+
+        ``sigmas`` optionally widens columns to Gaussians (0 = point); it is
+        how `chi_squared_with_width` asks its question through the same code.
+        """
         if not positions:
-            s = cho_solve(self._cho, self.D, check_finite=False)
+            s = self.MinvD
             chi2 = self.chi2_const + s @ self.F @ s - 2.0 * s @ self.D
             return s, np.array([]), float(chi2), np.zeros((0, 0))
 
-        P = self.columns_for(positions)
-        B = self._curv(self.A, P)
+        P, B, Dp = self._column_terms(positions, sigmas)
         C = self._curv(P, P)
-        Dp = self._dvec(P)
 
         # Schur complement: eliminate the mesh block, which is already factorised
         MinvB = cho_solve(self._cho, B, check_finite=False)
-        MinvD = cho_solve(self._cho, self.D, check_finite=False)
+        MinvD = self.MinvD
         S = C - B.T @ MinvB
         rhs = Dp - B.T @ MinvD
         # a tiny ridge keeps two coincident points from making S singular
@@ -334,7 +518,8 @@ class AugmentedSystem:
         return self.solve(positions)[2]
 
     def model_visibilities(self, mesh_values, positions, amplitudes) -> np.ndarray:
-        vis = self.A @ mesh_values
+        stacked = self.A_stack @ np.asarray(mesh_values)
+        vis = stacked[: self.n_vis] + 1j * stacked[self.n_vis:]
         if len(positions):
             vis = vis + self.columns_for(positions) @ amplitudes
         return vis
@@ -423,12 +608,17 @@ def detection_lattice(geometry) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _best_candidate(system, accepted, ys, xs, excluded, radius):
-    """Most significant *positive* trial position, avoiding earlier tries."""
+    """Most significant *positive* trial position, avoiding earlier tries.
+
+    The exclusion is ``<= radius``: with no beam size the radius is 0, and a
+    strict ``<`` then excluded nothing, so a rejected lattice point was picked
+    again on every iteration until the loop budget ran out.  At radius 0 the
+    lattice point itself is now excluded (its own distance is exactly 0).
+    """
     amp, sig = system.scan(accepted, ys, xs)
     score = np.where(amp > 0, sig, -np.inf)
     for (ey, ex) in excluded:
-        if radius > 0:
-            score[np.hypot(ys - ey, xs - ex) < radius] = -np.inf
+        score[np.hypot(ys - ey, xs - ex) <= radius] = -np.inf
     j = int(np.argmax(score))
     if not np.isfinite(score[j]):
         return None
@@ -531,7 +721,7 @@ def fit_point_sources(
     significance: float = DEFAULT_SIGNIFICANCE,
     max_points: int = DEFAULT_MAX_POINTS,
     refine: bool = True,
-    dirty_imager=None,   # unused; kept so older call sites keep working
+    dirty_imager=None,
     beam_fwhm: float | None = None,
     resolved_delta_chi2: float = DEFAULT_RESOLVED_DELTA_CHI2,
     retune: bool = True,
@@ -551,7 +741,19 @@ def fit_point_sources(
         Synthesised beam FWHM [arcsec].  Sets the minimum separation between
         detections and the width scale of the unresolved test.  Auto-detection
         without it is far more trigger-happy, so it is strongly recommended.
+    dirty_imager
+        A `beam.DirtyImager` for the dataset.  Used only when ``beam_fwhm`` is
+        not given: the FWHM is then taken as the geometric mean of the fitted
+        dirty-beam axes, exactly as `api.run` derives the value it passes as
+        ``beam_fwhm``.  (This argument was accepted and ignored until 1 Sep
+        2026, so a caller passing only the imager got the trigger-happy
+        beam-less detection without being told.)
     """
+    if beam_fwhm is None and dirty_imager is not None:
+        from .beam import fit_beam
+
+        b = fit_beam(dirty_imager.dirty_beam, geometry.pixel_scale)
+        beam_fwhm = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
     system = AugmentedSystem(inversion, dataset)
     pixel = geometry.pixel_scale
     accepted: list = []
@@ -885,7 +1087,6 @@ class PointAugmentedFit:
         M_inv = cho_solve(
             sysm._cho, np.eye(sysm.n_mesh), check_finite=False
         )
-        P = sysm.columns_for(self.solution.grid_positions)
-        B = sysm._curv(sysm.A, P)
+        _, B, _ = sysm._column_terms(self.solution.grid_positions)
         MinvB = cho_solve(sysm._cho, B, check_finite=False)
         return M_inv + MinvB @ self.solution.amplitude_covariance @ MinvB.T
