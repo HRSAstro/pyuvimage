@@ -1,9 +1,26 @@
 """Dirty images, the dirty beam, and the CLEAN-style restored image.
 
-All dirty images use natural weighting (w = 1/sigma^2) and are normalised so
-that the dirty beam peaks at 1 -- which makes their unit Jy/beam, directly
-comparable to CASA products.  The image-plane RMS follows analytically for
-natural weighting: sigma_im = sqrt(sum w^2 sigma^2) / sum w.
+All dirty images use natural weighting (w = 1/sigma^2) and are normalised by
+sum(w), the analytic peak of the dirty beam at zero offset -- which makes
+their unit Jy/beam, directly comparable to CASA products, and makes the
+image-plane RMS exactly sigma_im = sqrt(sum w^2 sigma^2) / sum w = 1/sqrt(sum w).
+
+Normalising by the *sampled* peak instead, as this module did until 1 Sep
+2026, is wrong on every production grid: `resolve_geometry` always produces an
+even number of pixels, so the phase centre falls between four pixel centres
+and the sampled peak sits half a pixel off it, 5-9% below sum(w) (0.92 on the
+mock, 0.945 on the demo). Dirty-image values were then that much *high*
+relative to `rms`, and the structure ratio -- the `--criterion structure`
+statistic -- read 1.06-1.09 for a residual that was actually white.
+
+Three frames meet here and the sign conventions are easy to get wrong. On
+the native image array row 0 is north and the column index increases with
+image +x, which is west (decreasing RA). A position angle is measured east of
+north (the CASA convention), so every Gaussian in this module is written in
+north-up, east-left coordinates: dy = (cy - row), dx = (col - cx) points west,
+and the major axis at angle theta points along (east, north) = (sin, cos).
+`pointsource.restore_points` uses the same expression and must keep doing so,
+or point sources and extended emission are restored with mirrored beams.
 """
 
 from __future__ import annotations
@@ -30,10 +47,6 @@ class BeamFit:
     bmin_arcsec: float  # FWHM minor axis
     bpa_deg: float      # position angle, East of North (CASA convention)
 
-    @property
-    def area_pixels(self) -> float:
-        raise NotImplementedError  # use beam_area_pixels(pixel_scale)
-
     def beam_area_pixels(self, pixel_scale: float) -> float:
         """Beam solid angle in units of image pixels: 2 pi sx sy / dpix^2."""
         sx = self.bmin_arcsec / SIGMA_TO_FWHM
@@ -59,15 +72,30 @@ class DirtyImager:
         return np.asarray(img.native)
 
     def _make_beam(self) -> tuple[np.ndarray, float]:
+        """The dirty beam and the normalisation every image is divided by.
+
+        The normalisation is sum(w): the value the dirty beam takes at exactly
+        zero offset, where every visibility's phase is zero. It is *not* the
+        sampled maximum -- on an even grid the phase centre lies between pixel
+        centres, so the sampled peak is half a pixel off and 5-9% low, and
+        dividing by it made every dirty image that much too bright next to
+        `rms`, which has always assumed sum(w). With sum(w) a 1 Jy point at
+        the phase centre reads 1 Jy/beam, and `rms` is exact.
+        """
         raw = self._image_from(self.weights.astype(complex))
-        norm = float(np.nanmax(raw))
-        if norm <= 0:
-            raise RuntimeError("dirty beam has non-positive peak")
+        norm = float(np.sum(self.weights))
+        if not np.isfinite(norm) or norm <= 0:
+            raise RuntimeError("dirty beam has non-positive weight sum")
         return raw / norm, norm
 
     @property
     def dirty_beam(self) -> np.ndarray:
-        """Peak-normalised dirty beam (PSF) on the image grid."""
+        """Dirty beam (PSF) on the image grid, unit response at zero offset.
+
+        Its sampled maximum is a little below 1 on an even grid, because no
+        pixel centre sits exactly on the phase centre. That is the truth of
+        the sampling, not an error, and `fit_beam` fits the amplitude freely.
+        """
         return self._beam_native
 
     def dirty_image(self, visibilities: np.ndarray) -> np.ndarray:
@@ -135,10 +163,15 @@ def fit_beam(
         m = patch > 0
 
     def model(p):
+        # north-up coordinates: dy points north (row 0 is north), dx points
+        # west (+x). See the module docstring; `gaussian_kernel` and
+        # `pointsource.restore_points` use the identical expression, which is
+        # what makes the fitted angle the one they restore with.
         amp, px, py, sx, sy, theta = p
         ct, st = np.cos(theta), np.sin(theta)
-        xr = (xx - px) * ct + (yy - py) * st
-        yr = -(xx - px) * st + (yy - py) * ct
+        dx, dy = xx - px, py - yy
+        xr = dx * ct + dy * st
+        yr = -dx * st + dy * ct
         return amp * np.exp(-0.5 * ((xr / sx) ** 2 + (yr / sy) ** 2))
 
     def resid(p):
@@ -148,14 +181,17 @@ def fit_beam(
     sol = least_squares(resid, p0, method="lm", max_nfev=5000)
     amp, px, py, sx, sy, theta = sol.x
     sx, sy = abs(sx), abs(sy)
-    # Major axis / position angle, East of North. Image x = -RA direction in
-    # our FITS convention; PA convention checked against CASA in tests.
+    # Position angle east of north. The yr axis lies along (dx, dy) =
+    # (-sin, cos), i.e. (east, north) = (sin, cos): angle theta east of north.
+    # The xr axis is 90 degrees from it. Until 1 Sep 2026 the model used
+    # row-down dy and the returned angle was the sky PA negated; no test
+    # checked the sign, and the comment claiming CASA agreement was untrue.
     if sy >= sx:
         smaj, smin = sy, sx
         pa = np.degrees(theta)
     else:
         smaj, smin = sx, sy
-        pa = np.degrees(theta) + 90.0
+        pa = np.degrees(theta) - 90.0
     pa = ((pa + 90.0) % 180.0) - 90.0
     return BeamFit(
         bmaj_arcsec=float(smaj * SIGMA_TO_FWHM * pixel_scale),
@@ -165,21 +201,29 @@ def fit_beam(
 
 
 def gaussian_kernel(beam: BeamFit, pixel_scale: float, shape: tuple[int, int]) -> np.ndarray:
-    """Peak-normalised restoring beam evaluated centred on the grid centre.
+    """Peak-normalised restoring beam, centred where `fftconvolve` expects it.
 
-    Evaluating analytically at the exact centre (rather than reusing the
-    fitted-position kernel) avoids the sub-pixel shift the prototype's
-    restore introduced.
+    `restore` convolves with ``mode="same"``, which centres the output on
+    kernel index ``(n - 1) // 2`` -- an integer pixel. The kernel has to be
+    evaluated about that same pixel, not about the geometric centre
+    ``(n - 1) / 2``: the two agree for odd ``n`` and differ by half a pixel
+    for even ``n``, and `resolve_geometry` always produces an even number of
+    pixels. Until 1 Sep 2026 this used the geometric centre, so on every
+    production grid the restored extended emission was shifted by (+0.5,
+    +0.5) pixels relative to the residual and to the point sources, which are
+    not convolved. The tests used odd grids and never saw it.
     """
     ny, nx = shape
-    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    cy, cx = (ny - 1) // 2, (nx - 1) // 2
     yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
     smaj = beam.bmaj_arcsec / SIGMA_TO_FWHM / pixel_scale
     smin = beam.bmin_arcsec / SIGMA_TO_FWHM / pixel_scale
     theta = np.radians(beam.bpa_deg)
     ct, st = np.cos(theta), np.sin(theta)
-    xr = (xx - cx) * ct + (yy - cy) * st
-    yr = -(xx - cx) * st + (yy - cy) * ct
+    # north-up, like `fit_beam.model` and `pointsource.restore_points`
+    dx, dy = xx - cx, cy - yy
+    xr = dx * ct + dy * st
+    yr = -dx * st + dy * ct
     return np.exp(-0.5 * ((xr / smin) ** 2 + (yr / smaj) ** 2))
 
 
