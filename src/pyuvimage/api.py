@@ -1189,9 +1189,13 @@ def _products_for(
 
     pb = model_pbcor = reconvolved_pbcor = None
     if pb_correction and dish:
+        # The PB belongs to the instrument, so it is centred on the phase
+        # centre of the data -- not on the image centre, which --image-centre
+        # may have moved several arcsec away from it.
         pb = primary_beam.primary_beam_map(
             geometry.shape_native, geometry.pixel_scale, frequency_hz, dish,
             pb_factor,
+            image_centre_offset_arcsec=uvd.meta.get("image_centre_offset_arcsec"),
         )
         model_pbcor = primary_beam.pb_correct(model_image, pb)
         reconvolved_pbcor = primary_beam.pb_correct(reconvolved, pb)

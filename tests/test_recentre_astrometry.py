@@ -91,3 +91,64 @@ def test_dec_is_not_flipped_by_the_recentring(recentred):
     with fits.open(recentred / "model_reconvolved.fits") as hdul:
         h = hdul[0].header
     assert np.sign((h["CRVAL2"] - 2.0)) == np.sign(D_DEC)
+
+
+@pytest.fixture(scope="module")
+def recentred_with_pb(tmp_path_factory):
+    """Same fit, with the primary-beam products switched on."""
+    uvd, _, geom, _ = mock.make_demo_dataset(
+        n_vis=700, mesh_n=20, seed=17, point_flux_jy=0.03,
+        point_centre=(D_RA, D_DEC),
+    )
+    out = tmp_path_factory.mktemp("recentred_pb")
+    pyuvimage.run(
+        uvd, fov=2.0, out=out, image_centre=(X, Y),
+        reg="matern", coefficient=1e4, uncertainty_map=False,
+        pb_correction=True, dish_diameter=12.0, mask_shape="square",
+    )
+    return out
+
+
+def test_the_primary_beam_peaks_at_the_phase_centre_not_the_image_centre(
+    recentred_with_pb,
+):
+    """The dish pointed at the phase centre; --image-centre only moved the
+    grid. So `pb.fits`, read through its own WCS, must peak at sky offset
+    (0, 0) -- and must NOT peak at the image centre, which is what it did.
+
+    The demo's 2" field at 230 GHz spans a tiny fraction of the 25" PB, so the
+    peak pixel is a weak locator on its own; the gradient check is the sharp
+    one. The PB must be *higher* on the side of the image facing the phase
+    centre than on the far side, by the analytic ratio.
+    """
+    with fits.open(recentred_with_pb / "pb.fits") as hdul:
+        pb = np.asarray(hdul[0].data, dtype=float)
+        w = WCS(hdul[0].header)
+        ra0, dec0 = hdul[0].header["CRVAL1"], hdul[0].header["CRVAL2"]
+        cd = abs(hdul[0].header["CDELT2"]) * 3600.0
+    if pb.ndim == 3:
+        pb, w = pb[0], w.celestial
+    ny, nx = pb.shape
+
+    # where, on this grid, is the phase centre? ask the WCS for its pixel
+    ra_pc = ra0 - D_RA / 3600.0 / np.cos(np.radians(dec0))   # CRVAL is the recentred position
+    dec_pc = dec0 - D_DEC / 3600.0
+    col_pc, row_pc = w.all_world2pix([[ra_pc, dec_pc]], 0)[0]
+    # it lies off the grid centre by the recentring offset, in pixels
+    assert abs(row_pc - (ny - 1) / 2) > 2 or abs(col_pc - (nx - 1) / 2) > 2
+
+    # the PB is symmetric about the phase centre: two pixels equidistant from
+    # it on opposite sides read the same, and a pixel nearer it reads higher
+    from pyuvimage.primary_beam import pb_fwhm_arcsec
+    sigma = pb_fwhm_arcsec(230e9, 12.0) / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    rows = np.arange(ny)[:, None]
+    cols = np.arange(nx)[None, :]
+    r2 = ((rows - row_pc) ** 2 + (cols - col_pc) ** 2) * cd**2
+    expected = np.exp(-0.5 * r2 / sigma**2)
+    np.testing.assert_allclose(pb, expected, rtol=2e-3)
+
+    # and it is definitely not centred on the image: that model is wrong by
+    # more than the tolerance above somewhere in the field
+    r2_grid = ((rows - (ny - 1) / 2) ** 2 + (cols - (nx - 1) / 2) ** 2) * cd**2
+    wrong = np.exp(-0.5 * r2_grid / sigma**2)
+    assert np.abs(pb - wrong).max() > 1e-3

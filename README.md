@@ -71,7 +71,7 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `snr.fits` | — | `model / uncertainty`, ready to use as a significance map |
 | `dirty_image.fits` | Jy/beam | naturally weighted dirty image of the data |
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
-| `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D) |
+| `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D), centred on the phase centre — not on the image centre when `--image-centre` is used |
 
 Plus `summary.png`, `fit_parameters.json` (every parameter of the run),
 `prior_scan.json` (every hyperparameter trial), and `point_sources.json` when

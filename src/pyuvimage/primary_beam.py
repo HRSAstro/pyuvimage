@@ -31,12 +31,34 @@ def primary_beam_map(
     frequency_hz: float,
     dish_diameter_m: float,
     pb_factor: float = DEFAULT_PB_FACTOR,
+    image_centre_offset_arcsec: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Gaussian PB, peak 1 at the phase centre (grid centre)."""
+    """Gaussian PB, peak 1 at the **phase centre** -- where the dish pointed.
+
+    The primary beam is a property of the instrument, not of the image: it is
+    centred on the pointing, and that is the phase centre of the data. When
+    the reconstruction has been recentred (``--image-centre``) the grid centre
+    is no longer the phase centre, and the PB peak has to move off the grid
+    centre by the same offset in the opposite direction. Without that, a
+    source 4 arcsec off the pointing at 245 GHz (12 m dish, PB FWHM ~24") was
+    "corrected" as if it sat at PB = 1.0 when the true response there is 0.93
+    -- both ALMA datasets this feature was built for.
+
+    ``image_centre_offset_arcsec`` is ``(y0, x0)`` as `uvdata.shift_image_centre`
+    records it in ``meta["image_centre_offset_arcsec"]``: the image centre's
+    offset from the phase centre, ``y0`` toward north (+Dec) and ``x0`` along
+    image +x (west, decreasing RA). On the native grid row 0 is north and the
+    column index increases with +x, so the phase centre sits at
+    ``row = cy + y0 / pixel_scale, col = cx - x0 / pixel_scale``.
+    """
     fwhm = pb_fwhm_arcsec(frequency_hz, dish_diameter_m, pb_factor)
     sigma_pix = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0))) / pixel_scale
     ny, nx = shape
     cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    if image_centre_offset_arcsec:
+        y0, x0 = (float(v) for v in image_centre_offset_arcsec)
+        cy += y0 / pixel_scale
+        cx -= x0 / pixel_scale
     yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
     r2 = (yy - cy) ** 2 + (xx - cx) ** 2
     return np.exp(-0.5 * r2 / sigma_pix**2)

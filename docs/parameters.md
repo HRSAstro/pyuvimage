@@ -62,7 +62,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--cube-prior` | **channel** | Cube mode only: what the shared prior is fitted on. `channel` uses a random 1-in-`n_chan` subset of the visibilities — the same amount of data each channel fit will have, and `n_chan` times cheaper. `mfs` uses every channel's visibilities at once, which is the single step that makes a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass). See below. |
 | `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
 | `--noise` (on `pyuvimage import` and `convert`) | **difference** | How the per-visibility noise is set. MS weights are relative, not absolute, so the scale is always recomputed from the data. `difference`: from the visibilities alone. `hybrid`: adds the weight column's time profile. `scaled`: whole shape from the weights. `sigma`: trust `SIGMA` as absolute, and warn. On `convert`, `keep` (the default there) leaves the stored map alone. Full discussion in [noise.md](noise.md). |
-| `--dish-diameter`, `--no-pb` | from MS | Gaussian primary beam, FWHM = `1.13 lambda/D`. |
+| `--dish-diameter`, `--no-pb` | from MS | Gaussian primary beam, FWHM = `1.13 lambda/D`, centred on the phase centre (the pointing) even when `--image-centre` has moved the grid. |
 
 
 ## When positivity is turned off for you
