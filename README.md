@@ -5,7 +5,7 @@ in the uv-plane**. A lightweight alternative to CLEAN for people who want a
 regularised maximum-likelihood image with honest residuals and honest error
 bars, without being an interferometry expert and without heavy compute.
 
-Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoArray)
+Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoArray](https://github.com/PyAutoLabs/PyAutoArray)
 tools: the sky is a freeform image on a
 cartesian grid, solved by a linear inversion under a Gaussian-process source
 prior whose hyperparameters are optimised automatically — so the model fits to
