@@ -75,14 +75,17 @@ Plus `summary.png`, `fit_parameters.json` (every parameter of the run),
 `prior_scan.json` (every hyperparameter trial), and `point_sources.json` when
 point components are fitted.
 
-![summary.png for PJ0116 at 245 GHz](figures/pj0116_summary.png)
+![summary.png for 9io9 at 135 GHz](figures/J0209_summary.png)
 
-PJ0116 at 245 GHz, an ALMA Band 6 observation of a lensed source (5158
-visibility samples, `--fov 8`): the arc and its counter-image at χ²/N = 1.007,
-a residual peaking at 3.7σ — 5% of the source peak — and a featureless residual
-map, which is what you want to see. The model panel is in Jy/pixel and the
-reconvolved panel in Jy/beam, which is why they look so different: the model is
-the sky at the mesh scale, not smoothed by the beam.
+J0209 (9io9) at 135 GHz, an ALMA Band 4 observation of a lensed source
+(164,262 visibility samples across four spectral windows, `pyuvimage fit
+9io9_135GHz_cont.npz --fov 8` and nothing else): the arc and its counter-image
+at χ²/N = 1.016 on a 62×62 mesh, a residual peaking at 4.1σ — 3.5% of a 117σ
+peak — and a residual map whose rms is 1.01σ with no trace of the source,
+which is what you want to see. The run chose the sparse inversion, the
+`structure` criterion and the adaptive prior for itself. The model panel is in
+Jy/pixel and the reconvolved panel in Jy/beam, which is why they look so
+different: the model is the sky at the mesh scale, not smoothed by the beam.
 
 ## The settings worth knowing about
 
