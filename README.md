@@ -204,6 +204,75 @@ frequencies are written:
 
 ## Troubleshooting
 
+### What to do if you get a bad fit
+
+You can see a bad fit in `summary.png`: the residual panel is where to look, and
+it should be featureless. What it shows tells you what to change.
+
+**The source is still in the residual** (a positive or negative imprint at the
+source position, `chi^2/N` well above 1 in the log). The model cannot reproduce
+the data. In rough order of likelihood: the field does not cover all the
+emission — look at `dirty_image.fits`, or run `--image-centre auto`, which
+images a field several times wider to find the peak, and grow `--fov` or
+recentre; there is a genuine point source, which no pixel grid can represent —
+`--point-sources`, or `--point x,y` if you know where it is; the mesh is too
+coarse for the S/N — `--pixel-scale nyquist`; or the noise map is wrong — see
+the next item.
+
+**`chi^2/N` is far from 1 but the residual looks like noise.** The noise
+estimate is off, not the model: `chi^2/N = 2` means the stored σ is √2 too
+small. Re-estimate it with `pyuvimage convert mydata.npz mydata/ --noise
+difference` (or `scaled`; see [Noise](#noise)) and refit. A residual that is
+white *and* at the right level is what a finished fit looks like; the number on
+its own is not the test.
+
+**Sidelobe-like structure across the whole residual, not centred on the
+source.** Emission outside the field. Grow `--fov`, or if the other source is
+far away and you only want this one, recentre on it with `--image-centre` and
+keep the field small.
+
+**The model is a set of blobs, or the peak is far too broad.** The prior is too
+strong. Check the log for `the constrained fit cannot go below chi2/N = …`: if
+the non-negative solver has a floor above 1, positivity is what is smoothing
+the fit, and `--no-positive` will show you whether the data want negative
+pixels (usually a sign of the problems above rather than of the sky). Otherwise
+try `--criterion evidence`, or `--reg gibbs` for a single compact feature.
+
+**The model is speckled, has negative bowls, or the residual is quieter than
+the noise** (the log warns that the model has *absorbed* noise; structure ratio
+below 1). The prior is too weak and the model is fitting noise. `--criterion
+structure` if the run took `discrepancy`; `--enforce-positive` if the solver
+was switched off mid-fit (the log says so); or set `--lambda` a decade above
+the value in `fit_parameters.json`.
+
+**A checkerboard or stripes at the mesh scale, and a warning that the model
+has more pixels than data.** The fit is under-constrained: the faint structure
+is set by the prior, not the data. A smaller `--fov` or a coarser
+`--pixel-scale`, or average the data less aggressively if it was averaged.
+
+**The total flux is well below what you expected.** Usually not a fit problem:
+extended flux on scales the shortest baselines do not sample is resolved out,
+exactly as in CLEAN. Compare against `dirty_image.fits` — if the flux is not in
+the dirty image either, the interferometer never measured it.
+
+**The source is on the wrong side of the field, or `--image-centre` moved it the
+wrong way.** Positions on the command line are image axes, +x right and +y up as
+you read `summary.png`, so `x = −dRA`; products are written in dRA/dDec. A
+negative x needs the `=` form: `--image-centre="-2.3,0.3"`.
+
+**It is taking hours.** With positivity on, each trial of the prior strength is
+a non-negative least-squares solve whose cost grows steeply with the number of
+mesh pixels; `--no-positive` is many times faster and a fine way to explore
+before a final constrained run. Otherwise see [Run time and
+memory](#run-time-and-memory): `--fov` is the lever (cost goes as its square),
+then `--inversion sparse` and averaging.
+
+If none of these applies, `fit_parameters.json` and `prior_scan.json` record
+every choice the run made and every hyperparameter it tried; those two files
+plus `summary.png` are what to send when asking for help.
+
+### Install and environment
+
 **Install problems** — `ModuleNotFoundError: No module named 'pyuvimage'` from
 the `pyuvimage` script itself, an editable install pointing at a moved
 directory, or the console script and the package living in different
