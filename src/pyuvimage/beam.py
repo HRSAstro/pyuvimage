@@ -67,9 +67,26 @@ class DirtyImager:
         self._beam_native, self._norm = self._make_beam()
 
     def _image_from(self, values: np.ndarray) -> np.ndarray:
+        """The plain mathematical adjoint of `values`, whatever the transformer.
+
+        Not `transformer.image_from` directly: a pynufft-backed transformer's
+        raw adjoint is a factor 4 N_y N_x low (its internal IFFT
+        normalisation), and only `fitting.adjoint_image` asks for the scaled
+        one. While `_norm` was the *sampled* beam peak, computed through this
+        same method, the factor cancelled and nobody noticed. The moment
+        `_norm` became the analytic sum(w) (1 Sep 2026) it stopped
+        cancelling: on 9io9 through pynufft every dirty image came out ~1e-5
+        of its true value and the structure ratio read 1.4e-05 at every
+        coefficient, so `--criterion structure` had nothing to select on and
+        the fit ran for hours through its fallbacks.
+        `assert_adjoint_scale_consistent` guarantees this adjoint matches the
+        DFT for any transformer the sparse path accepts, which is what makes
+        sum(w) the right normalisation.
+        """
+        from .fitting import adjoint_image  # lazy: fitting imports this module
+
         vis = ag.Visibilities(np.asarray(values, dtype=complex))
-        img = self.transformer.image_from(visibilities=vis)
-        return np.asarray(img.native)
+        return np.asarray(adjoint_image(self.transformer, vis).native)
 
     def _make_beam(self) -> tuple[np.ndarray, float]:
         """The dirty beam and the normalisation every image is divided by.
@@ -86,6 +103,26 @@ class DirtyImager:
         norm = float(np.sum(self.weights))
         if not np.isfinite(norm) or norm <= 0:
             raise RuntimeError("dirty beam has non-positive weight sum")
+        # The sampled peak cannot exceed sum(w) -- every visibility's phase is
+        # zero there and nowhere else adds up higher -- and on a grid that
+        # resolves the beam it cannot fall far below it either (0.92 on the
+        # mock, half a pixel off centre). Anything outside that band is a
+        # transformer whose adjoint is not on the mathematical scale, and the
+        # place to find that out is here, in one line, not from a structure
+        # ratio of 1e-5 after hours of fitting (9io9 through pynufft, 2 Sep
+        # 2026: the raw adjoint was 4 N_y N_x = 65536 times too small).
+        peak = float(np.nanmax(raw))
+        ratio = peak / norm
+        if not (0.5 <= ratio <= 1.0 + 1e-6):
+            ny, nx = np.shape(raw)
+            raise RuntimeError(
+                f"the dirty beam's sampled peak is {ratio:.4g} x sum(w); it "
+                f"must lie in [0.5, 1]. {type(self.transformer).__name__}'s "
+                "adjoint is not on the plain mathematical scale (a pynufft "
+                f"adjoint without use_adjoint_scaling is 1/(4 N_y N_x) = "
+                f"{1.0 / (4.0 * ny * nx):.3g} of it). Check "
+                "`fitting.adjoint_image` for this transformer class."
+            )
         return raw / norm, norm
 
     @property

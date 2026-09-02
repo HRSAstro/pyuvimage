@@ -164,3 +164,65 @@ def test_dirty_image_is_normalised_by_the_weight_sum():
     assert centre4.max() == pytest.approx(im.dirty_beam.max(), rel=1e-6)
 
     assert im.rms_empirical(n_draws=12) == pytest.approx(im.rms, rel=0.05)
+
+
+def test_dirty_images_are_on_the_true_adjoint_scale_whatever_the_transformer():
+    """A pynufft-backed transformer's raw `image_from` is 4 N_y N_x low and
+    only `use_adjoint_scaling=True` corrects it. When `_norm` was the sampled
+    beam peak the factor cancelled; with the analytic sum(w) it must be asked
+    for explicitly -- on 9io9 the structure ratio read 1.4e-05 for a day
+    because it was not (2 Sep 2026)."""
+    import autogalaxy as ag
+
+    from pyuvimage import fitting
+    from pyuvimage.beam import DirtyImager
+    from pyuvimage.mock import make_sparse_test_dataset
+    from pyuvimage.pointsource import point_visibilities
+
+    class ScaledDownDFT(ag.TransformerDFT):
+        """Behaves like the vendored pynufft transformer: raw adjoint low by
+        4 N_y N_x, exact only when asked."""
+
+        def image_from(self, visibilities, use_adjoint_scaling=False, **kw):
+            img = super().image_from(visibilities=visibilities)
+            if use_adjoint_scaling:
+                return img
+            ny, nx = img.native.shape
+            return type(img)(values=np.asarray(img) / (4.0 * ny * nx),
+                             mask=img.mask)
+
+    uvd, _, geom, _ = make_sparse_test_dataset(n_vis=3000)
+    uv, d, n = uvd.flattened()
+    ds = fitting.make_dataset(uv, d, n, geom, ScaledDownDFT, mask_shape="square")
+    ds_ref = fitting.make_dataset(uv, d, n, geom, ag.TransformerDFT, mask_shape="square")
+    im, ref = DirtyImager(ds), DirtyImager(ds_ref)
+
+    np.testing.assert_allclose(im.dirty_beam, ref.dirty_beam, rtol=1e-10)
+    point = point_visibilities(uv, 0.0, 0.0)
+    np.testing.assert_allclose(im.dirty_image(point), ref.dirty_image(point), rtol=1e-10)
+    assert np.asarray(im.dirty_image(point)).max() > 0.85     # ~1 Jy/beam, not 1e-5
+    assert im.rms_empirical(n_draws=8) == pytest.approx(im.rms, rel=0.05)
+
+
+def test_a_mis_scaled_adjoint_is_refused_at_construction():
+    """The failure mode above must be loud and immediate, not a structure
+    ratio of 1e-5 discovered hours into a fit."""
+    import autogalaxy as ag
+
+    from pyuvimage import fitting
+    from pyuvimage.beam import DirtyImager
+    from pyuvimage.mock import make_sparse_test_dataset
+
+    class BrokenScaleDFT(ag.TransformerDFT):
+        """A raw adjoint 1/(4 N_y N_x) low that ignores the scaling request."""
+
+        def image_from(self, visibilities, **kw):
+            img = super().image_from(visibilities=visibilities)
+            ny, nx = img.native.shape
+            return type(img)(values=np.asarray(img) / (4.0 * ny * nx), mask=img.mask)
+
+    uvd, _, geom, _ = make_sparse_test_dataset(n_vis=1500)
+    uv, d, n = uvd.flattened()
+    ds = fitting.make_dataset(uv, d, n, geom, BrokenScaleDFT, mask_shape="square")
+    with pytest.raises(RuntimeError, match="not on the plain mathematical scale"):
+        DirtyImager(ds)
