@@ -5,9 +5,8 @@ in the uv-plane**. A lightweight alternative to CLEAN for people who want a
 regularised maximum-likelihood image with honest residuals and honest error
 bars, without being an interferometry expert and without heavy compute.
 
-Built on [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy)'s
-pixelized-source inversion (developed for gravitational lens modelling, used
-here with the lens equation switched off): the sky is a freeform image on a
+Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoArray)
+tools: the sky is a freeform image on a
 cartesian grid, solved by a linear inversion under a Gaussian-process source
 prior whose hyperparameters are optimised automatically — so the model fits to
 the noise level rather than through it, with nothing to tune by hand.
@@ -239,45 +238,6 @@ pip install -U 'jax[cpu]'                        # a matched jax/jaxlib pair
 A jax/jaxlib mismatch is the usual cause; the `jax-metal` plugin and mixing
 conda-forge with pip installs each do it too. If you would rather not use JAX,
 `pip uninstall jax jaxlib` is a clean answer.
-
-## When not to trust a fit
-
-- **A structure ratio above ~1.5.** Every run prints one:
-
-  ```
-  residual map rms 4.28 sigma against 1.00 expected for white noise
-  at chi2/N = 1.008: structure ratio 4.28
-  ```
-
-  Incoherent residuals average down as `1/sqrt(N)`; coherent ones — sky the
-  model failed to reproduce — add in phase and land `sqrt(N)` higher. So the
-  ratio says whether what is left over is *noise or signal*, which `chi^2`
-  cannot: **`chi^2` constrains the residual's total power, not its
-  structure**, and a fit can sit exactly on `chi^2/N = 1` with the whole
-  source still in `residual.fits`.
-
-  This is the single most useful number the tool prints — it caught a noise
-  map inflated 1.4× by an export bug, on a fit whose `chi^2/N` read 1.0076.
-  The usual cause is a noise map that **over**estimates the noise, which stops
-  the fit early; also check `--fov` and whether the source has structure finer
-  than the model pixel scale.
-
-- **A structure ratio well below ~0.85.** The residual is *quieter* than the
-  noise it should contain, so the model has absorbed noise and its faint
-  structure is not all real. `--criterion structure` picks the smoothing from
-  the residual map rather than from `chi^2`, which on real data can be nearly
-  flat in the coefficient — see
-  [docs/design-notes.md](docs/design-notes.md#when-chi2--n-cannot-be-reached).
-
-- **`chi^2/N` well above 1.** The model cannot represent the data. The run says
-  so loudly and refuses to fit point sources.
-- **Sparsely sampled uv plane.** Faint structure is then set by the prior
-  rather than the data; the run warns.
-- **The mask edge.** On mocks the largest residual is often at the mask
-  boundary rather than the source: edge mesh pixels are poorly constrained and
-  absorb flux. Judge a fit from the interior.
-- **A "the non-negative solver is unreliable" warning.** Positivity has been
-  disabled for that fit and the model may contain small negative values.
 
 ## Run time and memory
 
