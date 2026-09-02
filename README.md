@@ -8,8 +8,7 @@ bars, without being an interferometry expert and without heavy compute.
 Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoArray](https://github.com/PyAutoLabs/PyAutoArray)
 tools: the sky is a freeform image on a
 cartesian grid, solved by a linear inversion under a Gaussian-process source
-prior whose hyperparameters are optimised automatically — so the model fits to
-the noise level rather than through it, with nothing to tune by hand.
+prior whose hyperparameters are optimised automatically with nothing to tune by hand.
 
 ## Install
 
