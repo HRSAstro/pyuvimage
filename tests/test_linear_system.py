@@ -65,8 +65,24 @@ def test_a_trial_reproduces_the_framework_fit_bitwise(
         kind, coefficient, kwargs.get("reg_scale"), 1.5, kwargs.get("envelope")
     )
     trial = system.trial(reg, positive=positive)
-    assert np.array_equal(trial.reconstruction, np.asarray(fit.inversion.reconstruction))
-    assert trial.chi_squared == float(fit.inversion.fast_chi_squared)
+    framework = np.asarray(fit.inversion.reconstruction)
+    if kind == "constant" and positive:
+        # The constant scheme is rank-deficient, so F + H is singular to
+        # working precision (autoarray's fnnls logs rcond ~ 1e-17 on it) and
+        # the NNLS active set is at the mercy of the BLAS: bitwise equality
+        # held on Linux/OpenBLAS and failed on macOS/Accelerate with the same
+        # autoarray on both sides of the comparison. For a singular system the
+        # non-negative minimiser is not even unique -- two active sets can
+        # reach the same chi^2 -- so the reconstruction is not the thing to
+        # pin. chi^2 is, and the invariant this test is about (no second pass
+        # over the inversion) needs only that.
+        assert trial.chi_squared == pytest.approx(
+            float(fit.inversion.fast_chi_squared), rel=1e-6)
+        assert np.all(trial.reconstruction >= 0)
+        assert trial.reconstruction.shape == framework.shape
+    else:
+        assert np.array_equal(trial.reconstruction, framework)
+        assert trial.chi_squared == float(fit.inversion.fast_chi_squared)
     assert trial.log_evidence == _framework_evidence(fit)
 
 

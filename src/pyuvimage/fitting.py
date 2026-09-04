@@ -791,8 +791,15 @@ def current_memory_gb() -> float:
     adaptive prior has been freed -- which `fit_dataset` does deliberately,
     with a `gc.collect()`, before the second pass allocates -- the peak still
     reads as if it were held. That double-counted the released mapping matrix
-    against the budget and refused fits that would have run. `ru_maxrss` stays
-    as the fallback where `/proc` is not available.
+    against the budget and refused fits that would have run.
+
+    macOS has no `/proc`, and for a while this fell straight through to
+    `ru_maxrss` there -- so on the platform Hannah actually runs on, the
+    budget was charged the high-water mark after all, and the test that
+    guards against exactly that failed on her machine while passing on Linux.
+    `psutil` gives the current RSS where it is installed; failing that, `ps`
+    does, at the cost of a subprocess a few times per fit. `ru_maxrss` is the
+    last resort only.
     """
     try:  # pragma: no cover - Linux
         with open("/proc/self/statm") as f:
@@ -803,7 +810,25 @@ def current_memory_gb() -> float:
         return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1e9
     except Exception:
         pass
-    try:  # pragma: no cover - platform dependent
+    try:  # pragma: no cover - any platform with psutil
+        import psutil
+
+        return float(psutil.Process().memory_info().rss) / 1e9
+    except Exception:
+        pass
+    try:  # pragma: no cover - macOS and other BSDs: `ps` reports RSS in kB
+        import os
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if out:
+            return float(out) * 1024 / 1e9
+    except Exception:
+        pass
+    try:  # pragma: no cover - last resort: the peak, not the present
         import resource
 
         r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
