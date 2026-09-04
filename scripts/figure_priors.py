@@ -219,6 +219,9 @@ def plot() -> None:
         if row == n_p - 1:
             fs.sky_axes(ax_m, ext_img)
 
+        fs.panel_label(ax_r, f"$\\lambda$ = {params['source_prior']['coefficient']:.2g}",
+                       loc="lower left", color=fs.INK, size=5.4)
+
     fs.hcolorbar(fig, im_i, [gs[n_p - 1, 0]], "Jy arcsec$^{-2}$", bar_h,
                  ticks=[0.0, 1e-3, 1e-2, 1e-1])
     fs.hcolorbar(fig, im_r, [gs[n_p - 1, 1]], "residual [$\\sigma$]", bar_h)

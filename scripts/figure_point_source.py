@@ -170,6 +170,11 @@ def plot() -> None:
 
         ax_m.set_ylabel(label, color=fs.INK, fontsize=6.8, labelpad=3,
                         linespacing=1.6)
+        sp = r["params"]["source_prior"]
+        fs.panel_label(
+            ax_u,
+            f"{sp['regularization']} prior, $\\lambda$ = {sp['coefficient']:.3g}",
+            loc="upper left", color="white", size=5.4)
         chi2 = (r["params"]["fit_quality"]["chi_squared"]
                 / r["params"]["fit_quality"]["n_data"])
         fs.panel_label(ax_r, f"$\\chi^2/N$ {chi2:.3f}", loc="upper right",

@@ -1027,8 +1027,41 @@ class PointAugmentedFit:
         self._sf = single_fit
         self.solution = solution
 
-    def __getattr__(self, item):          # prior, geometry, coefficient, ...
+    def __getattr__(self, item):          # geometry, scan, positive_only, ...
         return getattr(self._sf, item)
+
+    @property
+    def prior(self) -> dict:
+        """The prior that produced *this* fit, retune included.
+
+        `retune_regularization` re-imposes chi^2 = N once the points carry the
+        compact flux, by scaling H by `regularization_factor` -- so the prior
+        actually delivered has coefficient x factor, and the factor is
+        routinely large (334 on the demo mock, 8e6 on the knot mock).
+
+        Delegating this to the mesh-only fit, as everything else here does,
+        therefore misreported the delivered prior by that factor in
+        `fit_parameters.json`, and handed cube mode a coefficient hundreds of
+        times too weak to freeze into its channels. `SingleFit.coefficient`
+        and the `REGCOEF` header follow this property, so they are corrected
+        with it.
+        """
+        prior = dict(self._sf.prior)
+        factor = float(getattr(self.solution, "regularization_factor", 1.0))
+        if "coefficient" in prior and factor != 1.0:
+            prior["coefficient"] = float(prior["coefficient"]) * factor
+        return prior
+
+    @property
+    def coefficient(self) -> float:
+        """The delivered prior strength -- retune included.
+
+        Not inherited: `SingleFit.coefficient` reads the *mesh* fit's own
+        `prior`, so delegating it would report the un-retuned value even
+        though `prior` above is corrected. `REGCOEF` in the FITS headers
+        comes through here.
+        """
+        return float(self.prior["coefficient"])
 
     @property
     def points(self) -> list:

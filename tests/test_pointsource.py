@@ -473,3 +473,41 @@ class caplog_at:
         self._logger.removeHandler(self._handler)
         self._logger.setLevel(self._old)
         return False
+
+
+def test_the_delivered_prior_includes_the_point_retune():
+    """`fit_parameters.json` must report the prior that actually ran.
+
+    `retune_regularization` scales H once the points carry the compact flux,
+    and the factor is large -- 334 on the demo mock. `PointAugmentedFit`
+    delegates almost everything to the mesh-only fit, and delegating `prior`
+    too meant the record understated the delivered coefficient by that
+    factor, and cube mode froze the understated value into every channel.
+    """
+    from types import SimpleNamespace
+
+    from pyuvimage.pointsource import PointAugmentedFit
+
+    mesh = SimpleNamespace(prior={"coefficient": 1.0e4, "scale": 0.24, "nu": 1.5},
+                           geometry="unchanged")
+    sol = SimpleNamespace(points=[], regularization_factor=334.0)
+    aug = PointAugmentedFit(mesh, sol)
+
+    assert aug.prior["coefficient"] == pytest.approx(3.34e6)
+    assert aug.coefficient == pytest.approx(3.34e6)
+    # everything else still comes from the mesh fit, unaltered
+    assert aug.prior["scale"] == pytest.approx(0.24)
+    assert aug.geometry == "unchanged"
+    # and the mesh fit's own record is not mutated
+    assert mesh.prior["coefficient"] == pytest.approx(1.0e4)
+
+
+def test_an_unretuned_point_fit_reports_the_coefficient_unchanged():
+    from types import SimpleNamespace
+
+    from pyuvimage.pointsource import PointAugmentedFit
+
+    mesh = SimpleNamespace(prior={"coefficient": 5.0e3})
+    aug = PointAugmentedFit(mesh, SimpleNamespace(points=[],
+                                                 regularization_factor=1.0))
+    assert aug.prior["coefficient"] == pytest.approx(5.0e3)

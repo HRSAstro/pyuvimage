@@ -718,11 +718,8 @@ def run(
         cube_points = None
         if point_solution is not None and point_solution.points:
             cube_points = [(p.d_ra, p.d_dec) for p in point_solution.points]
-            # `PointAugmentedFit.prior` delegates to the mesh-only fit, so the
-            # retune the point fit applied to the coefficient was lost here.
-            factor = float(getattr(point_solution, "regularization_factor", 1.0))
-            if factor != 1.0 and "coefficient" in frozen:
-                frozen["coefficient"] = float(frozen["coefficient"]) * factor
+            # the retune is already in `frozen`: `PointAugmentedFit.prior`
+            # folds `regularization_factor` into the coefficient
             logger.info(
                 "cube mode: %d point source(s) carried into every channel at "
                 "the MFS positions; amplitudes are fitted per channel",
