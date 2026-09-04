@@ -321,7 +321,7 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 
 | | limited by | Ruby at 200 GHz (148k samples, 26×26 mesh) |
 |---|---|---|
-| **sparse** (≥5000 vis) | `--mesh`, as `n_mesh²` | ~1.1 GB, independent of visibility count |
+| **sparse** (≥5000 vis) | `--mesh`, as `n_mesh²` — plus ~136 B per visibility just to hold the data | ~1.1 GB; the inversion is independent of visibility count, the dataset is not |
 | **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
 
 Sparse needs JAX; `auto` falls back to dense and says so when it is missing,

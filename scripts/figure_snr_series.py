@@ -264,11 +264,12 @@ def plot() -> None:
     # posterior variance, while the actual error does the opposite -- so with
     # a fixed systematic window the two crossed near 11 sigma and the map
     # under-stated the error by 9.6x by 5 sigma. The systematic window is now
-    # measured per fit (`SingleFit.chi2_admissible_dex`) and opens as chi^2
-    # goes flat, which holds the quoted 1 sigma roughly constant across the
-    # whole 60x range instead. The actual error still catches it at the
-    # faintest point: that crossing is the honest end of the calibration, and
-    # it is not a detail a caption can be trusted to carry.
+    # measured per fit (`SingleFit.chi2_admissible_dex`), sampled at every
+    # step rather than only its edges, and opens as chi^2 goes flat -- so the
+    # quoted 1 sigma now rises with the actual error instead of falling away
+    # from it, and covers it across the whole 60x range (coverage 0.26 at 300
+    # sigma to 0.94 at 5). Where the two curves meet is the honest end of the
+    # calibration, and it is not a detail a caption can be trusted to carry.
     k = ref["model"].shape[0] // truth_sb.shape[0]
     truth_img = to_fits_orientation(
         np.kron(np.load(CACHE / "truth.npy"), np.ones((k, k))) / k**2)

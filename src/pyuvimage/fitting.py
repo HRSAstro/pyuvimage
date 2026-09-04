@@ -270,6 +270,10 @@ def pynufft_transformer_class():
     import autoarray as aa
 
     class TransformerPyNUFFT(NUFFT_cpu):
+        #: marker `transformer_memory_gb` keys on, so it can be recognised
+        #: (and tested) without importing pynufft
+        pyuvimage_transformer = "pynufft"
+
         # After autoarray's removed TransformerNUFFTPyNUFFT (MIT licence),
         # with the half-pixel shift applied; see pynufft_transformer_class.
 
@@ -422,6 +426,50 @@ def chunked_nufft_transformer_class():
     return _CHUNKED_NUFFT_CLASS
 
 
+_VIS_CHUNKED_NUFFT_CLASSES: dict[int, type] = {}
+
+
+def visibility_chunked_nufft_class(chunk_size: int):
+    """`TransformerNUFFT` with the *visibility* axis split into `chunk_size`.
+
+    The other chunked class above splits the mapping-matrix transform by mesh
+    pixel, which bounds the dense path's batched call but can never get below
+    one image's worth -- `n_vis x nspread^2` -- because that is one column.
+    On the sparse path the mapping matrix is never transformed at all and the
+    single-image forward/adjoint is the only NUFFT that runs, so the mesh axis
+    is not there to split. The visibility axis is, and autoarray already
+    supports splitting it: `TransformerNUFFT(chunk_size=...)` runs the
+    forward and adjoint in `chunk_size` pieces (a `jax.lax.scan` on the JAX
+    path), capping the gather buffer at `~2 x chunk_size x nspread^2 x 16 B`
+    whatever `n_vis` is. Its own docstring calls this "required for
+    visibility counts above ~5M". pyuvimage never set it, so every transform
+    ran one-shot and `resolve_transformer` vetoed JAX on the sparse path for
+    a buffer that a single keyword would have bounded -- and fell back to
+    pynufft, whose plan costs 1440 B/visibility and is the one thing *less*
+    affordable at that size.
+
+    `autoarray` instantiates transformers as `cls(uv_wavelengths=...,
+    real_space_mask=...)`, so the chunk has to ride in on the class.
+    """
+    chunk_size = int(chunk_size)
+    if chunk_size in _VIS_CHUNKED_NUFFT_CLASSES:
+        return _VIS_CHUNKED_NUFFT_CLASSES[chunk_size]
+
+    class TransformerNUFFTVisChunked(ag.TransformerNUFFT):
+        pyuvimage_chunk_size = chunk_size
+
+        def __init__(self, *args, chunk_size=None, **kwargs):
+            super().__init__(
+                *args,
+                chunk_size=chunk_size or self.pyuvimage_chunk_size,
+                **kwargs,
+            )
+
+    TransformerNUFFTVisChunked.__name__ = f"TransformerNUFFTVisChunked{chunk_size}"
+    _VIS_CHUNKED_NUFFT_CLASSES[chunk_size] = TransformerNUFFTVisChunked
+    return TransformerNUFFTVisChunked
+
+
 def _require_pynufft():
     cls = pynufft_transformer_class()
     if cls is None:
@@ -457,6 +505,45 @@ BYTES_PER_IMAGE_MAPPING_ELEMENT = 8
 #: mesh before a geometry exists. `oversample=2` is the default and the grid
 #: trap is the reason it is not 1 (see docs/design-notes.md).
 DEFAULT_PIXELS_PER_MESH = 4
+
+# What one visibility costs just by being *held* through a fit, independent
+# of the inversion or the transformer. Counted from the arrays, not measured
+# -- the mock generator's own DFT temporaries make a clean measurement of the
+# resident delta unreliable, and this is arithmetic rather than a calibration:
+#
+#     UVData                 uv (2 x f64) + data (c128) + noise (f64)   40
+#     UVData.flattened()     copies all three (flatten/concatenate)     40
+#     ag.Interferometer      noise cast to complex; data and uv shared  16
+#     per likelihood call    model visibilities + residual (c128 each)  32
+#     chi^2 temporaries      |r|^2 / sigma^2 as float64                  8
+#                                                                      ---
+#                                                                      136
+#
+# On a 5000-visibility dataset that is 0.7 MB and invisible. On a 200-million
+# visibility MFS cube it is 27 GB, and it is the reason a fit whose *model* is
+# a few hundred pixels was killed on a 24 GB laptop while the memory report
+# said the inversion was "independent of the visibilities". The inversion is;
+# holding the visibilities is not.
+BYTES_PER_VISIBILITY_HELD = 136
+
+# pynufft's plan. `TransformerPyNUFFT` plans with Jd=(6, 6), so pynufft builds
+# a CSR interpolation matrix with 36 complex128 entries per visibility
+# (16 B value + 4 B column index = 720 B/vis) and keeps its adjoint as a second
+# copy: 1440 B/vis, before the plan's own transients. Nothing in the fit is
+# more expensive per visibility, and it is what the JAX veto used to fall
+# back to for datasets too large for the JAX gather buffer -- i.e. exactly the
+# datasets it cannot afford either.
+PYNUFFT_PLAN_BYTES_PER_VISIBILITY = 2 * 36 * (16 + 4)
+
+
+def visibility_storage_gb(n_vis: int) -> float:
+    """GB resident just to hold `n_vis` visibilities through a fit."""
+    return float(n_vis) * BYTES_PER_VISIBILITY_HELD / 1e9
+
+
+def pynufft_plan_gb(n_vis: int) -> float:
+    """GB pynufft's interpolation matrix and its adjoint occupy."""
+    return float(n_vis) * PYNUFFT_PLAN_BYTES_PER_VISIBILITY / 1e9
 
 
 def estimate_peak_memory_gb(
@@ -572,6 +659,24 @@ def nufftax_block_columns(
     return int(max(1, min(n_mesh_pixels, math.floor(budget / per_column))))
 
 
+def nufftax_visibility_chunk(
+    available_gb: float | None = None, eps: float = NUFFTAX_DEFAULT_EPS
+) -> int:
+    """Visibilities per NUFFT call that keep one image's gather buffer in budget.
+
+    `NUFFTAX_GATHER_BUDGET` of what is available, over the per-visibility cost
+    `2 x nspread^2 x 16 B`. On an 18.8 GB machine at the default precision
+    that is ~750,000 visibilities per chunk -- 270 calls for a 200-million
+    visibility transform, against one call that would have needed 1268 GB.
+    """
+    if available_gb is None:
+        available_gb = available_memory_gb()
+    if not available_gb or available_gb <= 0:
+        return 0                        # unknown: leave the call one-shot
+    per_vis = nufftax_gather_gb(1, 1, eps) * 1e9
+    return int(max(1, math.floor(NUFFTAX_GATHER_BUDGET * available_gb * 1e9 / per_vis)))
+
+
 def available_memory_gb() -> float | None:
     """Usable memory in GB, or None if it cannot be determined.
 
@@ -638,18 +743,28 @@ def _macos_available_gb() -> float | None:  # pragma: no cover - macOS only
 def transformer_memory_gb(transformer_cls, n_vis: int, n_mesh_pixels: int) -> float:
     """Extra GB the chosen transformer needs on top of the mapping matrix.
 
-    Only the nufftax-backed `TransformerNUFFT` has one worth counting, and it
-    is not a correction -- it is usually the whole bill. Chunking bounds it,
-    so the figure follows the block size the transform will actually use.
+    Two transformers have one worth counting. The nufftax-backed
+    `TransformerNUFFT`'s gather buffer is not a correction -- it is usually
+    the whole bill -- and chunking bounds it, so the figure follows the block
+    size the transform will actually use. pynufft's is its plan: 1440 B per
+    visibility whatever the mesh (`PYNUFFT_PLAN_BYTES_PER_VISIBILITY`), which
+    is nothing at 5000 visibilities and 290 GB at 200 million.
     """
     if transformer_cls is None:
         return 0.0
+    if getattr(transformer_cls, "pyuvimage_transformer", None) == "pynufft":
+        return pynufft_plan_gb(n_vis)
     try:
         is_nufftax = issubclass(transformer_cls, ag.TransformerNUFFT)
     except TypeError:
         return 0.0
     if not is_nufftax:
         return 0.0
+    if _VIS_CHUNKED_NUFFT_CLASSES and any(
+        issubclass(transformer_cls, c) for c in _VIS_CHUNKED_NUFFT_CLASSES.values()
+    ):
+        # the visibility axis is chunked, so the buffer is the chunk's
+        return nufftax_gather_gb(transformer_cls.pyuvimage_chunk_size, 1)
     chunked = _CHUNKED_NUFFT_CLASS is not None and issubclass(
         transformer_cls, _CHUNKED_NUFFT_CLASS
     )
@@ -733,16 +848,24 @@ def check_memory(
         if n_image_pixels is None:
             return
         chunk_k = sparse_chunk_k_for_budget(n_image_pixels)
-        need = sparse_peak_memory_gb(
+        model_only = sparse_peak_memory_gb(
             n_image_pixels, n_mesh_pixels, chunk_k=chunk_k,
             kernel_cached=kernel_cached,
+        )
+        need = sparse_peak_memory_gb(
+            n_image_pixels, n_mesh_pixels, chunk_k=chunk_k,
+            kernel_cached=kernel_cached, n_vis=n_vis,
+            transformer_cls=transformer_cls,
         ) + held
+        data_side = need - held - model_only
         have = available_memory_gb()
         logger.info(
-            "sparse inversion: roughly %.1f GB (%.1f GB already resident), "
-            "independent of the %d visibilities -- the kernel build streams "
-            "them %d at a time onto a fixed %d-pixel grid",
-            need, held, n_vis, chunk_k, n_image_pixels,
+            "sparse inversion: roughly %.1f GB (%.1f GB already resident). "
+            "The inversion's own %.1f GB is independent of the %d "
+            "visibilities -- the kernel build streams them %d at a time onto "
+            "a fixed %d-pixel grid -- but holding them is not: %.1f GB for "
+            "the visibility arrays and the transformer's per-visibility state.",
+            need, held, model_only, n_vis, chunk_k, n_image_pixels, data_side,
         )
         if n_chan and n_chan > 1:
             # The dense path's cube warning is about one pass over every
@@ -758,13 +881,26 @@ def check_memory(
                 "dataset.", n_chan, n_chan,
             )
         if have is not None and need > have:
-            logger.warning(
-                "estimated peak memory (%.1f GB) exceeds what looks "
-                "available (%.1f GB). On the sparse path the ceiling is the "
-                "model, not the data: reduce --mesh (F is n_mesh^2) or the "
-                "image size (--fov, --pixel-scale).",
-                need, have,
-            )
+            if data_side > model_only:
+                logger.warning(
+                    "estimated peak memory (%.1f GB) exceeds what looks "
+                    "available (%.1f GB), and it is the data, not the model: "
+                    "%.1f GB of it is holding %d visibilities (%.0f B each "
+                    "through the dataset, plus the transformer's plan or "
+                    "gather buffer). No --mesh or --fov change helps here; "
+                    "the levers are fewer visibilities -- average channels or "
+                    "time before export -- or a machine with more memory.",
+                    need, have, data_side, n_vis,
+                    BYTES_PER_VISIBILITY_HELD,
+                )
+            else:
+                logger.warning(
+                    "estimated peak memory (%.1f GB) exceeds what looks "
+                    "available (%.1f GB). On the sparse path the ceiling is "
+                    "the model, not the data: reduce --mesh (F is n_mesh^2) "
+                    "or the image size (--fov, --pixel-scale).",
+                    need, have,
+                )
         return
 
     def _need(nv):
@@ -972,22 +1108,42 @@ def resolve_transformer(
     if not too_big:
         return ag.TransformerDFT
     if jax_available():
-        # On the sparse path the mapping matrix is never transformed, so the
-        # buffer that decides this is the single-image one.
-        columns = 1 if inversion == "sparse" else n_mesh_pixels
-        gather = (
-            nufftax_gather_gb(n_vis, columns) if columns else 0.0
-        )
         have = available_memory_gb()
-        fits = not have or gather <= NUFFTAX_GATHER_BUDGET * have
-        if fits and inversion == "sparse" and n_mesh_pixels:
+        budget = NUFFTAX_GATHER_BUDGET * have if have else None
+        if inversion == "sparse":
+            # The mapping matrix is never transformed here, so the only NUFFT
+            # that runs is the single-image forward/adjoint, whose gather
+            # buffer is n_vis x nspread^2. That is bounded by chunking the
+            # *visibility* axis, which autoarray supports and pyuvimage used
+            # not to ask for -- it vetoed JAX instead and fell back to pynufft,
+            # whose plan costs 1440 B/visibility and is the one transformer
+            # that cannot afford a large dataset either. Nothing about this
+            # choice depends on n_vis any more, which is the sparse path's
+            # whole premise.
+            one_shot = nufftax_gather_gb(n_vis, 1)
+            if budget is None or one_shot <= budget:
+                if n_mesh_pixels:
+                    logger.info(
+                        "the JAX NUFFT transforms one image at a time on the "
+                        "sparse path (%.1f GB), not the whole mapping matrix "
+                        "(%.0f GB): using it.",
+                        one_shot, nufftax_gather_gb(n_vis, n_mesh_pixels),
+                    )
+                return ag.TransformerNUFFT
+            chunk = nufftax_visibility_chunk(have)
             logger.info(
-                "the JAX NUFFT transforms one image at a time on the sparse "
-                "path (%.1f GB), not the whole mapping matrix (%.0f GB): "
-                "using it.",
-                gather, nufftax_gather_gb(n_vis, n_mesh_pixels),
+                "the JAX NUFFT would need a %.0f GB gather buffer to transform "
+                "one image over all %d visibilities at once, against %.1f GB "
+                "available: transforming in %d chunks of %d visibilities "
+                "(%.1f GB each) instead. The inversion itself never sees the "
+                "visibility count on the sparse path.",
+                one_shot, n_vis, have, -(-n_vis // chunk), chunk,
+                nufftax_gather_gb(chunk, 1),
             )
-        if fits or not pynufft_available():
+            return visibility_chunked_nufft_class(chunk)
+
+        gather = nufftax_gather_gb(n_vis, n_mesh_pixels) if n_mesh_pixels else 0.0
+        if budget is None or gather <= budget or not pynufft_available():
             return _jax_nufft_class(n_vis, n_mesh_pixels)
         logger.info(
             "the JAX NUFFT would need a %.0f GB gather buffer to transform "
@@ -995,8 +1151,7 @@ def resolve_transformer(
             "visibilities x a %d-tap kernel), against %.1f GB available: "
             "using the pynufft transformer instead, which loops over mesh "
             "pixels and never holds more than one at a time.",
-            gather, n_mesh_pixels, n_vis,
-            nufftax_kernel_width() ** 2, have,
+            gather, n_mesh_pixels, n_vis, nufftax_kernel_width() ** 2, have,
         )
         return pynufft_transformer_class()
     if pynufft_available():
@@ -1105,10 +1260,12 @@ def sparse_peak_memory_gb(
     chunk_k: int = SPARSE_CHUNK_K,
     batch_size: int = SPARSE_BATCH_SIZE,
     kernel_cached: bool = False,
+    n_vis: int = 0,
+    transformer_cls=None,
 ) -> float:
     """Rough peak RSS for one sparse inversion, in GB.
 
-    Three terms, none of which involves n_vis:
+    Three terms belong to the *inversion*, and none of them involves n_vis:
 
     * the kernel build, `n_image x chunk_k` (skipped when a cached kernel is
       reused, which is why `--kernel-cache` is worth having);
@@ -1116,9 +1273,25 @@ def sparse_peak_memory_gb(
       `batch_size` columns in flight while F is assembled;
     * F and the regularisation matrix, `n_mesh^2` each, plus the solver's copy.
 
-    The last term is the one that eventually bites: the sparse path moves the
-    ceiling off the data and onto the model, so it is `--mesh` that limits a
-    sparse fit, not the size of the measurement set.
+    Two more belong to the *dataset*, and they scale with nothing else:
+
+    * holding the visibilities at all -- `BYTES_PER_VISIBILITY_HELD`, 136 B
+      each through the UVData, its flattened copy, autoarray's dataset and
+      the per-likelihood model and residual vectors;
+    * the transformer's own per-visibility state, if it has one: pynufft's
+      plan is 1440 B/visibility, a chunked JAX NUFFT's gather buffer is one
+      chunk's worth.
+
+    This function used to have only the first three and to say so -- "none of
+    which involves n_vis" -- which was true of the inversion and false of the
+    fit. On a 200-million visibility MFS cube the model terms come to under a
+    gigabyte and the data terms to 27 GB, and the memory report told the user
+    the fit was "independent of the visibilities" as the kernel killed it. The
+    sparse path moves the *inversion's* ceiling off the data and onto the
+    model; the data still have to be somewhere.
+
+    `n_vis=0` reproduces the model-only figure, for callers that only want to
+    compare meshes.
     """
     kernel = 0.0 if kernel_cached else sparse_kernel_build_gb(n_image_pixels, chunk_k)
     operator = (
@@ -1127,7 +1300,11 @@ def sparse_peak_memory_gb(
         * float(batch_size) * 4.0 * float(n_image_pixels) * 16.0  # padded FFTs
     ) / 1e9
     curvature = 3.0 * float(n_mesh_pixels) ** 2 * 8.0 / 1e9
-    return MEMORY_BASE_GB + kernel + operator + curvature
+    data = visibility_storage_gb(n_vis) if n_vis else 0.0
+    transformer = (
+        transformer_memory_gb(transformer_cls, n_vis, 1) if n_vis else 0.0
+    )
+    return MEMORY_BASE_GB + kernel + operator + curvature + data + transformer
 
 
 def sparse_chunk_k_for_budget(
@@ -3136,6 +3313,15 @@ class SingleFit:
             )
         except Exception:  # LinAlgError, InversionException
             return None
+        return self._image_from_values(values)
+
+    def _image_from_values(self, values: np.ndarray) -> np.ndarray:
+        """Map a stacked parameter vector onto the image grid.
+
+        Split out of `model_image_at_scale` so a caller that already holds the
+        solution -- `_admissible_scan` solves at every step of its walk --
+        does not pay for the same solve twice.
+        """
         inv = self.fit.inversion
         slim = None
         for obj, _ in inv.reconstruction_dict.items():
@@ -3148,6 +3334,64 @@ class SingleFit:
                 values=slim, mask=self.fit.dataset.real_space_mask
             ).native
         )
+
+    def _admissible_scan(
+        self, max_dex: float = CHI2_WINDOW_MAX_DEX, per_dex: int = 2,
+        min_dex: float = CHI2_WINDOW_MIN_DEX,
+    ) -> tuple[float, float, list[tuple[float, np.ndarray]]]:
+        """`chi2_admissible_dex`, plus the solution at every accepted step.
+
+        The steps matter to `prior_systematic`, which must sample *inside* the
+        window and not only at its edges -- see there for why. Their solutions
+        are carried out with them because the walk has already paid for them:
+        re-deriving each one through `model_image_at_scale` doubled the solve
+        count (27 -> 49 on the faintest demo mock) for no new information.
+        """
+        H = self.regularization_matrix
+        system, positive = self.system, bool(self.positive_only)
+        floor = abs(min_dex)
+
+        def solved(dex):
+            try:
+                return system.solve(10.0**dex * H, positive=positive)
+            except Exception:                   # LinAlgError, InversionException
+                return None
+
+        try:
+            chi2_0 = system.chi_squared(system.solve(H, positive=positive))
+        except Exception:                       # pragma: no cover - singular
+            return -floor, floor, []
+        tolerance = np.sqrt(2.0 * system.n_data)
+
+        lo = hi = 0.0
+        steps: list[tuple[float, np.ndarray]] = []
+        for sign in (+1.0, -1.0):
+            reach = 0.0
+            for step in range(1, int(max_dex * per_dex) + 1):
+                dex = sign * step / per_dex
+                values = solved(dex)
+                if values is None:
+                    break                       # the rescaled system is singular
+                moved = abs(system.chi_squared(values) - chi2_0)
+                if not np.isfinite(moved) or moved > tolerance:
+                    break
+                reach = dex
+                steps.append((dex, values))
+            if sign > 0:
+                hi = reach
+            else:
+                lo = reach
+        lo, hi = min(lo, -floor), max(hi, floor)
+        # The floor is part of the window whether or not the walk got there --
+        # it is what makes `measured >= fixed` hold pixel by pixel -- so if the
+        # walk stopped short, those two points are solved for explicitly.
+        reached = {dex for dex, _ in steps}
+        for dex in (-floor, floor):
+            if dex not in reached:
+                values = solved(dex)
+                if values is not None:
+                    steps.append((dex, values))
+        return lo, hi, sorted(steps, key=lambda s: s[0])
 
     def chi2_admissible_dex(
         self, max_dex: float = CHI2_WINDOW_MAX_DEX, per_dex: int = 2,
@@ -3168,7 +3412,7 @@ class SingleFit:
         not. Measured on the demo mock across a 60x range in noise, it stays
         at the +/-0.5 dex floor down to a peak signal-to-noise of ~60 and then
         opens to the +/-6 dex cap by 5 -- where a fixed +/-0.5 dex window
-        under-states the actual rms error by 9.6x and this one by 1.9x.
+        under-states the actual rms error by 9.6x and this one by 1.2x.
 
         The result is floored at `min_dex`, so it is never narrower than the
         fixed window it replaces: the walk cannot resolve a reach below one
@@ -3178,36 +3422,16 @@ class SingleFit:
         levels) the measured window's coverage was never worse than the fixed
         window's -- identical wherever the fit was well constrained.
 
+        A wider window is not automatically a larger systematic, which is why
+        `prior_systematic` samples the steps and not just the edges -- see
+        `_admissible_scan`.
+
         Costs at most `2 * max_dex * per_dex + 1` solves of an n_mesh system
         -- no transforms and no refit -- and only reaches that on a fit chi^2
         barely responds to, which is the case where the answer matters.
         """
-        H = self.regularization_matrix
-        system, positive = self.system, bool(self.positive_only)
-        try:
-            chi2_0 = system.chi_squared(system.solve(H, positive=positive))
-        except Exception:                       # pragma: no cover - singular
-            return -abs(min_dex), abs(min_dex)
-        tolerance = np.sqrt(2.0 * system.n_data)
-
-        lo = hi = 0.0
-        for sign in (+1.0, -1.0):
-            reach = 0.0
-            for step in range(1, int(max_dex * per_dex) + 1):
-                dex = sign * step / per_dex
-                try:
-                    values = system.solve(10.0**dex * H, positive=positive)
-                    moved = abs(system.chi_squared(values) - chi2_0)
-                except Exception:
-                    break                       # the rescaled system is singular
-                if not np.isfinite(moved) or moved > tolerance:
-                    break
-                reach = dex
-            if sign > 0:
-                hi = reach
-            else:
-                lo = reach
-        return min(lo, -abs(min_dex)), max(hi, abs(min_dex))
+        lo, hi, _ = self._admissible_scan(max_dex, per_dex, min_dex)
+        return lo, hi
 
     def prior_systematic(self, spread_dex: float | None = None) -> np.ndarray:
         """Per-pixel systematic from the choice of regularisation strength.
@@ -3225,6 +3449,20 @@ class SingleFit:
         number restores a fixed window, which is what the point-source flux
         systematic still uses.
 
+        **The window is sampled, not just its edges.** A pixel's deviation is
+        not monotonic in the scale factor: it can move further at 10^0.5 than
+        at 10^6, because a model with the prior turned up to nonsense is not
+        "further from" the fitted one everywhere. Taking only the two edges
+        therefore let a *wider* window report a *smaller* systematic -- across
+        32 mock configurations, 7 of them did, by up to 20% of the peak, which
+        would have made the measured window worse than the fixed one it is
+        supposed to subsume. So every half-decade step the walk accepted is
+        evaluated, and the pixel-wise maximum taken over all of them. The
+        floor's endpoints are always in that set, which is what makes
+        "measured >= fixed, pixel by pixel" true rather than merely likely.
+        The solves are the walk's own, so the extra cost is one mapping per
+        step, not one fit.
+
         **Why the fixed window was not enough.** It assumes the admissible
         range of strengths is the same whatever the data, and it is not. On a
         weakly constrained fit the prior takes over, chi^2 stops responding to
@@ -3234,7 +3472,7 @@ class SingleFit:
         falls as the data get worse, which is exactly backwards. Measured on
         the demo mock at a peak signal-to-noise of 5, the total 1 sigma
         understated the actual rms error by 9.6x with the fixed window and by
-        1.9x with the measured one.
+        1.2x with the measured one.
 
         This captures neither the prior *family* being wrong nor the smoothing
         bias *at* the fitted strength, which is what is left over on compact
@@ -3243,16 +3481,17 @@ class SingleFit:
         cache = self.__dict__.setdefault("_prior_systematic_cache", {})
         key = "measured" if spread_dex is None else float(spread_dex)
         if key not in cache:
-            if spread_dex is None:
-                window = self.chi2_admissible_dex()
-            else:
-                window = (-float(spread_dex), float(spread_dex))
             base = self.model_image
             worst = np.zeros_like(base)
-            for dex in window[::-1]:
-                if dex == 0.0:
-                    continue
-                alt = self.model_image_at_scale(10.0**dex)
+            if spread_dex is None:
+                lo, hi, samples = self._admissible_scan()
+                window = (lo, hi)
+                # the walk already solved at each of these
+                images = (self._image_from_values(v) for _, v in samples)
+            else:
+                window = (-float(spread_dex), float(spread_dex))
+                images = (self.model_image_at_scale(10.0**d) for d in window)
+            for alt in images:
                 if alt is None:
                     continue
                 worst = np.maximum(worst, np.abs(alt - base))

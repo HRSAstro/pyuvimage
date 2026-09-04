@@ -223,12 +223,26 @@ is what it costs:
 |---|---|---|
 | largest allocation | `n_vis x n_mesh` mapping matrix | `n_image x chunk_k` streaming buffer |
 | Ruby CO(7-6) that allocation | 21.6 GB | 0.10 MB kernel |
-| scales with the number of visibilities | yes | **no** |
+| the *inversion* scales with the number of visibilities | yes | **no** |
+| *holding the dataset* scales with the number of visibilities | yes, ~136 B each | yes, ~136 B each |
 
-The last row is the whole point, and it is the lesson taken from CASA's
-`tclean`: stream the data onto a fixed-size grid rather than holding a matrix
-whose size is the data. A dataset ten times larger costs ten times the *time*
-in the kernel build and not one byte more memory. `chunk_k` — how many
+The first of those rows is the whole point, and it is the lesson taken from
+CASA's `tclean`: stream the data onto a fixed-size grid rather than holding a
+matrix whose size is the data. A dataset ten times larger costs ten times the
+*time* in the kernel build and not one byte more memory **in the inversion**.
+
+The second row is the part this document used to leave out. The visibilities
+still have to be somewhere: the `UVData`, its flattened copy, autoarray's
+dataset and the per-likelihood model and residual vectors come to about
+136 bytes per visibility, and the transformer may add its own — pynufft's
+plan is 1440 B/visibility, and the JAX NUFFT's single-image gather buffer is
+`n_vis × nspread² × 32 B` unless the visibility axis is chunked, which
+`resolve_transformer` now does on the sparse path (autoarray's `chunk_size`).
+On 5000 visibilities all of this is under a megabyte. On a 200-million
+visibility MFS cube it is 27 GB before the fit starts, on a model of 324
+pixels, and the memory report will say so: "it is the data, not the model".
+The lever there is not `--mesh` or `--fov` but fewer visibilities — average
+channels or time before export. `chunk_k` — how many
 visibilities are accumulated at once — trades the two against each other and
 is chosen automatically to keep the build inside a quarter of available
 memory, so there is no knob to find.

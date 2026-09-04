@@ -234,6 +234,54 @@ def test_the_systematic_window_is_measured_and_never_narrower_than_the_floor(sma
     assert np.all(measured >= fixed - 1e-12)
 
 
+@pytest.fixture(scope="module")
+def wide_window():
+    """A fit whose admissible window opens well past the floor.
+
+    The `small` fixture sits at +/-0.5 dex, so it cannot exercise anything the
+    floor does not already cover -- and a test that only ever sees the floor
+    was how the endpoint-sampling bug below survived.
+    """
+    uvd, _, geom, _ = mock.make_demo_dataset(n_vis=600, mesh_n=14, seed=3)
+    uv, d, n = uvd.flattened()
+    dataset = fitting.make_dataset(uv, d, n, geom, transformer="dft")
+    return fitting.fit_dataset(
+        dataset, geom, reg_kind="matern", positive_only=True,
+        criterion="discrepancy", warn_on_chi2=False,
+    )
+
+
+def test_a_wider_window_never_reports_a_smaller_systematic(wide_window):
+    """The property the floor is supposed to buy, on a fit that can break it.
+
+    A pixel's deviation is *not* monotonic in the scale factor -- the model at
+    10^6 x lambda is not "further from" the fitted one everywhere than the
+    model at 10^0.5 x. So sampling only the window's two edges let a wider
+    window report a *smaller* systematic than the fixed +/-0.5 dex one: across
+    32 mock configurations 7 did, by up to 20% of the peak. `prior_systematic`
+    evaluates every half-decade step the walk accepted, which puts the floor's
+    endpoints in the set and makes this structural rather than lucky.
+    """
+    sf = wide_window
+    lo, hi = sf.chi2_admissible_dex()
+    assert lo < -fitting.CHI2_WINDOW_MIN_DEX, "fixture no longer exercises this"
+
+    measured = sf.prior_systematic()
+    fixed = sf.prior_systematic(fitting.CHI2_WINDOW_MIN_DEX)
+    assert np.all(measured >= fixed - 1e-12)
+    assert np.nanmax(measured) > np.nanmax(fixed), "and it is strictly bigger"
+
+    # the endpoint-only construction is what used to be wrong: the edge alone
+    # would have to beat every interior step, and here it does not
+    base = sf.model_image
+    edge = np.zeros_like(base)
+    for dex in (lo, hi):
+        alt = sf.model_image_at_scale(10.0**dex)
+        if alt is not None:
+            edge = np.maximum(edge, np.abs(alt - base))
+    assert np.any(measured > edge + 1e-12)
+
+
 def test_the_reported_window_follows_the_call_not_the_cache(small):
     """Both modes share one fit, and each `model_uncertainty_total` must
     report the window it actually used however they are interleaved."""

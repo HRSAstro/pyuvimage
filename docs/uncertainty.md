@@ -49,6 +49,18 @@ in half decades. It is floored at ±0.5 dex — the walk cannot resolve a reach
 finer than one step, and this is the fixed window the method used before — and
 capped at ±6 dex, by which point the model no longer resembles the data.
 
+**And the window is sampled, not just its edges.** A pixel's deviation is not
+monotonic in the scale factor: the model with the prior turned up to nonsense
+is not "further from" the fitted one everywhere than the model half a decade
+away. Taking only the two edges therefore let a *wider* window report a
+*smaller* systematic — across 32 mock configurations, 7 did, by up to 20% of
+the peak — which would have made the measured window worse than the fixed one
+it is meant to subsume. So every half-decade step the walk accepted is
+evaluated and the pixel-wise maximum taken over all of them; the floor's
+endpoints are always in that set, which is what makes "measured ≥ fixed, pixel
+by pixel" a property rather than a tendency. The solves are the walk's own, so
+this costs one mesh→image mapping per step, not one solve.
+
 A fixed window assumes the admissible range of strengths is the same whatever
 the data, and it is not. On a weakly constrained fit the prior takes over, χ²
 stops responding to the strength, and the model can be orders of magnitude
@@ -64,13 +76,14 @@ a 60× range in noise, comparing the quoted 1σ against the actual rms error
 | 132 | ±0.5 | 0.71 | 0.71 |
 | 58 | ±0.5 | 0.67 | 0.67 |
 | 26 | ±1.5 | 0.72 | 0.59 |
-| 11 | −5.0/+1.5 | **1.91** | 0.53 |
-| 5 | ±6.0 | **9.64** | 1.87 |
+| 11 | −5.0/+1.5 | **1.91** | 0.50 |
+| 5 | ±6.0 | **9.64** | 1.23 |
 
 Because of the floor the two are identical wherever the fit is well
 constrained; the window only ever opens. The cost is the walk: 5 extra solves
 of the n_mesh system on a well-constrained fit, at most 25 on one χ² barely
-responds to — no transforms and no refit. Passing
+responds to — no transforms and no refit — plus one mesh→image mapping per
+accepted step. Passing
 `model_uncertainty_total(0.5)` restores a fixed window if you want the old
 number.
 

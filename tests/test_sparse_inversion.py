@@ -24,6 +24,8 @@ that has JAX; nothing here re-measures it.
 import numpy as np
 import pytest
 
+import autogalaxy as ag
+
 from pyuvimage import fitting
 
 
@@ -766,16 +768,131 @@ def test_the_veto_does_not_apply_on_the_sparse_path(monkeypatch, caplog):
     monkeypatch.setattr(fitting, "jax_available", lambda: True)
     monkeypatch.setattr(fitting, "pynufft_available", lambda: True)
     monkeypatch.setattr(fitting, "available_memory_gb", lambda: 12.1)
-    sentinel = object()
-    monkeypatch.setattr(fitting, "_jax_nufft_class", lambda *a, **k: sentinel)
     with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
         cls = fitting.resolve_transformer(
             n_vis=164262, transformer="auto",
             n_image_pixels=116 * 116, n_mesh_pixels=1444, inversion="sparse",
         )
-    assert cls is sentinel, "the sparse path was vetoed on a cost it never pays"
+    assert cls is ag.TransformerNUFFT, "the sparse path was vetoed on a cost it never pays"
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "one image at a time" in text
+
+
+def test_the_sparse_path_chunks_visibilities_instead_of_vetoing_jax(
+    monkeypatch, caplog
+):
+    """Hannah's MFS cube: 202,135,200 visibilities on a 324-pixel mesh.
+
+    The single-image gather buffer is 1268 GB against 18.8 GB available. The
+    old answer was to veto JAX and use pynufft -- whose plan is 1440 B per
+    visibility, 291 GB here, so the "safe" fallback was the one thing less
+    affordable than the buffer it avoided. The sparse path's premise is that
+    nothing depends on the visibility count, and autoarray's `chunk_size`
+    makes the transform honour that too: the visibility axis is split so the
+    buffer is one chunk's worth whatever n_vis is.
+    """
+    import logging
+
+    monkeypatch.setattr(fitting, "jax_available", lambda: True)
+    monkeypatch.setattr(fitting, "pynufft_available", lambda: True)
+    monkeypatch.setattr(fitting, "available_memory_gb", lambda: 18.8)
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        cls = fitting.resolve_transformer(
+            n_vis=202_135_200, transformer="auto",
+            n_image_pixels=36 * 36, n_mesh_pixels=324, inversion="sparse",
+        )
+    assert cls is not fitting.pynufft_transformer_class()
+    assert issubclass(cls, ag.TransformerNUFFT)
+    chunk = cls.pyuvimage_chunk_size
+    assert chunk == fitting.nufftax_visibility_chunk(18.8)
+    # the chunk's buffer sits inside the budget, and the budget is what
+    # bounded it -- not the mesh, which never enters
+    assert fitting.nufftax_gather_gb(chunk, 1) <= fitting.NUFFTAX_GATHER_BUDGET * 18.8
+    assert fitting.nufftax_gather_gb(chunk + 1, 1) > fitting.NUFFTAX_GATHER_BUDGET * 18.8
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "chunks of" in text and "324 mesh pixels" not in text
+    # and the estimate follows the transform that will actually run
+    assert fitting.transformer_memory_gb(cls, 202_135_200, 1) == pytest.approx(
+        fitting.nufftax_gather_gb(chunk, 1)
+    )
+
+
+def test_the_chunked_class_carries_its_chunk_into_autoarrays_constructor():
+    """autoarray builds transformers as `cls(uv_wavelengths=, real_space_mask=)`
+    -- no extra kwargs -- so the chunk has to be baked into the class."""
+    cls = fitting.visibility_chunked_nufft_class(1000)
+    assert cls is fitting.visibility_chunked_nufft_class(1000), "cached per size"
+    assert cls is not fitting.visibility_chunked_nufft_class(2000)
+    seen = {}
+
+    def fake_init(self, *a, chunk_size=None, **k):
+        seen["chunk_size"] = chunk_size
+
+    orig = ag.TransformerNUFFT.__init__
+    ag.TransformerNUFFT.__init__ = fake_init
+    try:
+        cls(uv_wavelengths=None, real_space_mask=None)
+    finally:
+        ag.TransformerNUFFT.__init__ = orig
+    assert seen["chunk_size"] == 1000
+
+
+def test_the_sparse_estimate_now_counts_the_visibilities_it_holds(caplog):
+    """"Three terms, none of which involves n_vis" was true of the inversion
+    and false of the fit. Her cube: model terms under 1 GB, data terms 27 GB,
+    and the report said "independent of the visibilities" as it was killed."""
+    import logging
+
+    n_vis, n_img, n_mesh = 202_135_200, 36 * 36, 324
+    model_only = fitting.sparse_peak_memory_gb(n_img, n_mesh, kernel_cached=True)
+    with_data = fitting.sparse_peak_memory_gb(
+        n_img, n_mesh, kernel_cached=True, n_vis=n_vis)
+    assert model_only < 1.0
+    assert with_data - model_only == pytest.approx(
+        fitting.visibility_storage_gb(n_vis))
+    assert with_data > 25.0                              # 136 B x 202M
+
+    # pynufft's plan on top is the largest single per-visibility term. The
+    # estimate keys on the class marker, so pynufft need not be installed.
+    class pyn:
+        pyuvimage_transformer = "pynufft"
+    with_pynufft = fitting.sparse_peak_memory_gb(
+        n_img, n_mesh, kernel_cached=True, n_vis=n_vis, transformer_cls=pyn)
+    assert with_pynufft - with_data == pytest.approx(fitting.pynufft_plan_gb(n_vis))
+    assert fitting.pynufft_plan_gb(n_vis) > 250.0
+
+    # and the report says which side of the ledger the problem is on
+    with caplog.at_level(logging.INFO, logger="pyuvimage.fitting"):
+        fitting.check_memory(
+            n_vis, n_mesh, transformer_cls=pyn, inversion="sparse",
+            n_image_pixels=n_img, kernel_cached=True,
+        )
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "holding them is not" in text
+    assert "it is the data, not the model" in text
+    assert "independent of the %d visibilities" not in text
+
+
+def test_a_small_dataset_is_still_dominated_by_its_model():
+    """The storage term must not inflate the case the sparse path was built
+    for. 9io9: 164k visibilities, 1444 mesh pixels -- holding them is ~22 MB.
+
+    The transformer term is a different matter and is deliberately *not*
+    small here: the unchunked JAX NUFFT's single-image gather buffer on 9io9
+    is 1.03 GB (`claude/sparse-wtilde-inversion.md`), and the estimate should
+    say so -- it used to say nothing.
+    """
+    n_vis, n_img, n_mesh = 164_262, 116 * 116, 1444
+    model_only = fitting.sparse_peak_memory_gb(n_img, n_mesh, kernel_cached=True)
+    with_storage = fitting.sparse_peak_memory_gb(
+        n_img, n_mesh, kernel_cached=True, n_vis=n_vis)
+    assert (with_storage - model_only) / model_only < 0.05
+    assert with_storage - model_only == pytest.approx(0.0223, rel=0.05)
+
+    with_nufft = fitting.sparse_peak_memory_gb(
+        n_img, n_mesh, kernel_cached=True, n_vis=n_vis,
+        transformer_cls=ag.TransformerNUFFT)
+    assert with_nufft - with_storage == pytest.approx(1.03, rel=0.02)
 
 
 def test_the_single_image_buffer_is_what_sparse_actually_pays():
