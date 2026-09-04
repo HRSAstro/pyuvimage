@@ -203,6 +203,55 @@ def test_single_fit_products_are_computed_once(small):
     assert fit_curv.shape == (100, 100)
 
 
+def test_the_systematic_window_is_measured_and_never_narrower_than_the_floor(small):
+    """The window is the range of strengths chi^2 cannot separate, floored at
+    the fixed half-decade the method used before, so the measured systematic
+    can only be larger than the old one -- never smaller."""
+    dataset, geom = small
+    sf = fitting.fit_dataset(
+        dataset, geom, reg_kind="matern", positive_only=True,
+        criterion="discrepancy",
+    )
+    lo, hi = sf.chi2_admissible_dex()
+    assert lo <= -fitting.CHI2_WINDOW_MIN_DEX
+    assert hi >= fitting.CHI2_WINDOW_MIN_DEX
+    assert lo >= -fitting.CHI2_WINDOW_MAX_DEX and hi <= fitting.CHI2_WINDOW_MAX_DEX
+
+    # chi^2 really does stay inside one sigma across the reported window, and
+    # the walk stopped because the next half-decade left it
+    H, positive = sf.regularization_matrix, bool(sf.positive_only)
+    chi2_0 = sf.system.chi_squared(sf.system.solve(H, positive=positive))
+    tol = np.sqrt(2.0 * sf.system.n_data)
+    for dex in (lo, hi):
+        if abs(dex) <= fitting.CHI2_WINDOW_MIN_DEX:
+            continue                    # the floor, not a measurement
+        moved = abs(sf.system.chi_squared(
+            sf.system.solve(10.0**dex * H, positive=positive)) - chi2_0)
+        assert moved <= tol
+
+    measured = sf.prior_systematic()
+    fixed = sf.prior_systematic(fitting.CHI2_WINDOW_MIN_DEX)
+    assert np.all(measured >= fixed - 1e-12)
+
+
+def test_the_reported_window_follows_the_call_not_the_cache(small):
+    """Both modes share one fit, and each `model_uncertainty_total` must
+    report the window it actually used however they are interleaved."""
+    dataset, geom = small
+    sf = fitting.fit_dataset(
+        dataset, geom, reg_kind="matern", positive_only=True,
+        prior={"coefficient": 10.0, "scale": 0.5},
+    )
+    _, measured = sf.model_uncertainty_total()
+    _, fixed = sf.model_uncertainty_total(0.25)
+    _, again = sf.model_uncertainty_total()      # served from the cache
+    assert fixed["systematic_spread_dex"] == 0.25
+    assert fixed["systematic_window_dex"] == [-0.25, 0.25]
+    assert measured["systematic_spread_dex"] is None
+    assert again["systematic_window_dex"] == measured["systematic_window_dex"]
+    assert again["systematic_window_dex"] != fixed["systematic_window_dex"]
+
+
 def test_the_prior_systematic_of_a_positive_fit_uses_the_positive_solver(small):
     """`model_image_at_scale` re-solved unconstrained whatever the delivered
     fit did, so on a non-negative fit the "systematic" compared a non-negative

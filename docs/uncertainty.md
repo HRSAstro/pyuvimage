@@ -13,8 +13,9 @@ anything:
 | term | header key | what it is | how it is obtained |
 |---|---|---|---|
 | statistical | `ERRSTAT` | how well the data pin this pixel down, given the prior | `sqrt(diag(M C M^T))` with `C = (F+H)^-1`, the closed-form posterior covariance |
-| prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed | how far the pixel moves when the regularisation strength is varied over ±0.5 dex |
-| | `ERRSPRD` | (records the ±dex used) | |
+| prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed | how far the pixel moves when the regularisation strength is varied over the range χ² cannot distinguish |
+| | `ERRWLO`, `ERRWHI` | (record that range, in dex either side of the fitted strength) | |
+| | `ERRWMEA` | (`T` if the range was measured, `F` if a fixed window was asked for) | |
 | | `ERRDEBL` | (records that the checkerboard was removed) | |
 
 Rule of thumb from the mocks: the statistical term dominates in smooth
@@ -36,13 +37,51 @@ noise-only part of this, `(F+H)^-1 F (F+H)^-1`, was verified at **0.996**
 one strength, which makes it optimistic: a regularised model is smoothed, so
 it is biased, and on the extended+compact mock the smoothing bias is ~2.8x the
 random scatter. The systematic term measures how far each pixel moves when the
-regularisation strength is varied over ±0.5 dex — the same construction used
-for point-source fluxes, where it turned pulls of up to 24σ into pulls under
-3. It concentrates where it should: around compact features, where the prior
-is doing the most work.
+regularisation strength is varied — the same construction used for
+point-source fluxes, where it turned pulls of up to 24σ into pulls under 3. It
+concentrates where it should: around compact features, where the prior is
+doing the most work.
 
-It does **not** cover the prior *family* being wrong, nor calibration or
-deconvolution error. Nothing cheap does.
+**How far to vary it is measured, not assumed** (`SingleFit.chi2_admissible_dex`).
+The window is the set of strengths the data cannot tell apart: those whose χ²
+is within one σ(χ²) = √(2N) of the fitted strength's, found by walking outward
+in half decades. It is floored at ±0.5 dex — the walk cannot resolve a reach
+finer than one step, and this is the fixed window the method used before — and
+capped at ±6 dex, by which point the model no longer resembles the data.
+
+A fixed window assumes the admissible range of strengths is the same whatever
+the data, and it is not. On a weakly constrained fit the prior takes over, χ²
+stops responding to the strength, and the model can be orders of magnitude
+away with no χ² penalty — while the *statistical* term shrinks, because a
+strong prior shrinks the posterior variance. The quoted error then falls as
+the data get worse, which is exactly backwards. Measured on the demo mock down
+a 60× range in noise, comparing the quoted 1σ against the actual rms error
+(coverage = actual / quoted, >1 means the map under-states the error):
+
+| peak S/N | measured window | coverage, fixed ±0.5 dex | coverage, measured |
+|---|---|---|---|
+| 300 | ±0.5 | 0.73 | 0.73 |
+| 132 | ±0.5 | 0.71 | 0.71 |
+| 58 | ±0.5 | 0.67 | 0.67 |
+| 26 | ±1.5 | 0.72 | 0.59 |
+| 11 | −5.0/+1.5 | **1.91** | 0.53 |
+| 5 | ±6.0 | **9.64** | 1.87 |
+
+Because of the floor the two are identical wherever the fit is well
+constrained; the window only ever opens. The cost is the walk: 5 extra solves
+of the n_mesh system on a well-constrained fit, at most 25 on one χ² barely
+responds to — no transforms and no refit. Passing
+`model_uncertainty_total(0.5)` restores a fixed window if you want the old
+number.
+
+**What it still misses.** It does not cover the prior *family* being wrong,
+nor calibration or deconvolution error, and it does not cover the smoothing
+bias *at* the fitted strength: on the extended+compact mock, where a resolved
+knot sits on a smooth disc, the total under-states the rms error on source
+pixels by ~4× at high S/N whichever window is used, because moving λ within
+the admissible range does not move the model but the model is biased anyway.
+Treat the map as a floor on the error near compact structure, not a complete
+account of it. Nothing cheap fixes this.
 
 ![uncertainty](../figures/uncertainty_total.png)
 

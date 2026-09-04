@@ -174,6 +174,22 @@ def model_with_points(p, pixel_scale: float) -> np.ndarray:
     return img
 
 
+def _window(terms: dict) -> tuple[float, float]:
+    """The dex window the prior systematic was probed over, for the header.
+
+    `fitting.model_uncertainty_total` reports a measured window as
+    `systematic_window_dex` and a fixed one as `systematic_spread_dex`; the
+    header carries the two edges either way, so a reader never has to know
+    which mode produced them.
+    """
+    lo, hi = (list(terms.get("systematic_window_dex") or [np.nan, np.nan])
+              + [np.nan, np.nan])[:2]
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        spread = terms.get("systematic_spread_dex")
+        lo, hi = (-float(spread), float(spread)) if spread is not None else (0.0, 0.0)
+    return float(lo), float(hi)
+
+
 def write_products(
     products: list[ProductSet],
     geometry: ImageGeometry,
@@ -285,8 +301,12 @@ def write_products(
                         "median statistical 1-sigma [Jy/pixel]"),
             "ERRSYS": (terms.get("systematic_median", 0.0),
                        "median prior-strength systematic [Jy/pixel]"),
-            "ERRSPRD": (terms.get("systematic_spread_dex", 0.0),
-                        "systematic probed over +/- this many dex"),
+            "ERRWLO": (_window(terms)[0],
+                       "systematic window, dex below fitted lambda"),
+            "ERRWHI": (_window(terms)[1],
+                       "systematic window, dex above fitted lambda"),
+            "ERRWMEA": (bool(terms) and terms.get("systematic_spread_dex") is None,
+                        "window measured from chi2, not fixed"),
             "ERRDEBL": (bool(terms.get("deblocked", False)),
                         "checkerboard replaced by its envelope"),
         }

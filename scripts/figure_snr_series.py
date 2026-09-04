@@ -259,11 +259,16 @@ def plot() -> None:
     ax_b.set_ylabel("point-source significance [$\\sigma$]", fontsize=6.5)
 
     # ---- and the question the uncertainty row raises ---------------------
-    # The quoted uncertainty *falls* as the data get worse, because a weaker
-    # dataset gets a stronger prior and a strong prior shrinks the posterior
-    # variance. The actual error does the opposite. Where the two cross is
-    # where `uncertainty.fits` stops being a usable error bar, and it is not
-    # a detail a caption can be trusted to carry.
+    # The statistical term alone *falls* as the data get worse, because a
+    # weaker dataset gets a stronger prior and a strong prior shrinks the
+    # posterior variance, while the actual error does the opposite -- so with
+    # a fixed systematic window the two crossed near 11 sigma and the map
+    # under-stated the error by 9.6x by 5 sigma. The systematic window is now
+    # measured per fit (`SingleFit.chi2_admissible_dex`) and opens as chi^2
+    # goes flat, which holds the quoted 1 sigma roughly constant across the
+    # whole 60x range instead. The actual error still catches it at the
+    # faintest point: that crossing is the honest end of the calibration, and
+    # it is not a detail a caption can be trusted to carry.
     k = ref["model"].shape[0] // truth_sb.shape[0]
     truth_img = to_fits_orientation(
         np.kron(np.load(CACHE / "truth.npy"), np.ones((k, k))) / k**2)

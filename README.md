@@ -75,7 +75,7 @@ Plus `summary.png`, `fit_parameters.json` (every parameter of the run),
 `prior_scan.json` (every hyperparameter trial), and `point_sources.json` when
 point components are fitted.
 
-![summary.png for 9io9 at 135 GHz](figures/J0209_summary.png)
+![summary.png for J0209 at 135 GHz](figures/J0209_summary.png)
 
 J0209 (9io9) at 135 GHz, an ALMA Band 4 observation of a lensed source
 (164,262 visibility samples across four spectral windows, `pyuvimage fit
@@ -150,8 +150,13 @@ The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
 with `C = (F+H)^-1`, verified against Monte Carlo at 0.996. That term alone is
 optimistic — a regularised model is smoothed, hence biased — so the systematic
 term measures how far each pixel moves when the regularisation strength is
-varied over ±0.5 dex. Neither covers the prior *family* being wrong, nor
-calibration or deconvolution error.
+varied over the range the data cannot distinguish between: the strengths whose
+χ² is within one σ(χ²) = √(2N) of the fitted one, measured per fit and
+recorded in the header as `ERRWLO`/`ERRWHI`. That window is half a decade
+either side on a well-constrained fit and opens up to six decades on a weak
+one, which is the point — where χ² stops caring about the strength, the prior
+is choosing the answer. Neither term covers the prior *family* being wrong,
+nor calibration or deconvolution error.
 
 **Do not add per-pixel errors in quadrature**: they are correlated over the
 prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which

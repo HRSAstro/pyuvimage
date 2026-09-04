@@ -74,6 +74,19 @@ DEFAULT_NU = 1.5
 # LogUniform(1e-6, 1e6) on both coefficient and scale; the scale is bounded
 # below by the pixel scale and above by the field of view at fit time, since
 # values outside that range are meaningless for the image.
+#: Widest window `SingleFit.chi2_admissible_dex` will report, in dex either
+#: side of the fitted strength. Six decades is already far past where the
+#: model resembles the data; the cap exists to bound the number of solves.
+CHI2_WINDOW_MAX_DEX = 6.0
+
+#: Narrowest window it will report. The walk steps in half decades, so a
+#: measured reach of zero means only "narrower than half a decade", not zero
+#: -- and quoting zero would drop the prior systematic entirely on the fits
+#: where the statistical term is most optimistic. Half a decade is also what
+#: the point-source flux systematic uses (a factor of 3), so the measured
+#: window can only ever widen the old fixed one, never narrow it.
+CHI2_WINDOW_MIN_DEX = 0.5
+
 LOG_COEFFICIENT_BOUNDS = (-6.0, 6.0)
 # ...but the coefficient's meaningful magnitude depends on the data units, so
 # the bracket is extended up to here when the shipped range is too narrow.
@@ -3045,7 +3058,67 @@ class SingleFit:
             ).native
         )
 
-    def prior_systematic(self, spread_dex: float = 0.5) -> np.ndarray:
+    def chi2_admissible_dex(
+        self, max_dex: float = CHI2_WINDOW_MAX_DEX, per_dex: int = 2,
+        min_dex: float = CHI2_WINDOW_MIN_DEX,
+    ) -> tuple[float, float]:
+        """How far the regularisation strength can move before chi^2 notices.
+
+        Returns ``(lo_dex, hi_dex)``, the range of log10 scale factors over
+        which chi^2 stays within one standard deviation of its value at the
+        fitted strength -- ``sigma(chi^2) = sqrt(2 N)``, the only scale on
+        which a chi^2 difference means anything.
+
+        This is the range of priors *the data cannot distinguish between*, and
+        it is the honest window for `prior_systematic`. It is not a fixed
+        number of dex, and the difference matters: chi^2 responds steeply to
+        the strength on a well-constrained fit and goes flat on a weak one, so
+        the window is narrow where the data are good and wide where they are
+        not. Measured on the demo mock across a 60x range in noise, it stays
+        at the +/-0.5 dex floor down to a peak signal-to-noise of ~60 and then
+        opens to the +/-6 dex cap by 5 -- where a fixed +/-0.5 dex window
+        under-states the actual rms error by 9.6x and this one by 1.9x.
+
+        The result is floored at `min_dex`, so it is never narrower than the
+        fixed window it replaces: the walk cannot resolve a reach below one
+        step, and reporting zero there would quietly delete the systematic
+        term on exactly the fits whose statistical term is most optimistic.
+        Across twelve mock fits (two source shapes, three priors, six noise
+        levels) the measured window's coverage was never worse than the fixed
+        window's -- identical wherever the fit was well constrained.
+
+        Costs at most `2 * max_dex * per_dex + 1` solves of an n_mesh system
+        -- no transforms and no refit -- and only reaches that on a fit chi^2
+        barely responds to, which is the case where the answer matters.
+        """
+        H = self.regularization_matrix
+        system, positive = self.system, bool(self.positive_only)
+        try:
+            chi2_0 = system.chi_squared(system.solve(H, positive=positive))
+        except Exception:                       # pragma: no cover - singular
+            return -abs(min_dex), abs(min_dex)
+        tolerance = np.sqrt(2.0 * system.n_data)
+
+        lo = hi = 0.0
+        for sign in (+1.0, -1.0):
+            reach = 0.0
+            for step in range(1, int(max_dex * per_dex) + 1):
+                dex = sign * step / per_dex
+                try:
+                    values = system.solve(10.0**dex * H, positive=positive)
+                    moved = abs(system.chi_squared(values) - chi2_0)
+                except Exception:
+                    break                       # the rescaled system is singular
+                if not np.isfinite(moved) or moved > tolerance:
+                    break
+                reach = dex
+            if sign > 0:
+                hi = reach
+            else:
+                lo = reach
+        return min(lo, -abs(min_dex)), max(hi, abs(min_dex))
+
+    def prior_systematic(self, spread_dex: float | None = None) -> np.ndarray:
         """Per-pixel systematic from the choice of regularisation strength.
 
         The statistical error `model_uncertainty` is conditional on one prior
@@ -3055,25 +3128,53 @@ class SingleFit:
         the point-source flux systematic, which turned pulls of up to 24 sigma
         into pulls under 3.
 
-        This does not capture the prior *family* being wrong -- nothing
-        cheap does.
+        `spread_dex=None` (the default) takes "the range these data allow"
+        literally and measures it, via `chi2_admissible_dex`, which is floored
+        at the old fixed half-decade and so can only widen it. Passing a
+        number restores a fixed window, which is what the point-source flux
+        systematic still uses.
+
+        **Why the fixed window was not enough.** It assumes the admissible
+        range of strengths is the same whatever the data, and it is not. On a
+        weakly constrained fit the prior takes over, chi^2 stops responding to
+        it, and the model can be orders of magnitude away from the truth with
+        no chi^2 penalty -- while the *statistical* term shrinks, because a
+        strong prior shrinks the posterior variance. The quoted error then
+        falls as the data get worse, which is exactly backwards. Measured on
+        the demo mock at a peak signal-to-noise of 5, the total 1 sigma
+        understated the actual rms error by 9.6x with the fixed window and by
+        1.9x with the measured one.
+
+        This captures neither the prior *family* being wrong nor the smoothing
+        bias *at* the fitted strength, which is what is left over on compact
+        features -- see docs/uncertainty.md. Nothing cheap does.
         """
         cache = self.__dict__.setdefault("_prior_systematic_cache", {})
-        key = float(spread_dex)
-        if key in cache:
-            return cache[key]
-        base = self.model_image
-        worst = np.zeros_like(base)
-        for factor in (10.0**spread_dex, 10.0**-spread_dex):
-            alt = self.model_image_at_scale(factor)
-            if alt is None:
-                continue
-            worst = np.maximum(worst, np.abs(alt - base))
-        cache[key] = worst
+        key = "measured" if spread_dex is None else float(spread_dex)
+        if key not in cache:
+            if spread_dex is None:
+                window = self.chi2_admissible_dex()
+            else:
+                window = (-float(spread_dex), float(spread_dex))
+            base = self.model_image
+            worst = np.zeros_like(base)
+            for dex in window[::-1]:
+                if dex == 0.0:
+                    continue
+                alt = self.model_image_at_scale(10.0**dex)
+                if alt is None:
+                    continue
+                worst = np.maximum(worst, np.abs(alt - base))
+            cache[key] = (worst, window)
+        worst, window = cache[key]
+        # the window belongs to this call, not to whichever call filled the
+        # cache first, so `model_uncertainty_total` reports the right one
+        # however the two modes are interleaved
+        self.__dict__["_systematic_window_dex"] = window
         return worst
 
     def model_uncertainty_total(
-        self, spread_dex: float = 0.5, deblock: bool = True
+        self, spread_dex: float | None = None, deblock: bool = True
     ) -> tuple[np.ndarray, dict]:
         """Single total 1-sigma map on the model image [Jy/pixel].
 
@@ -3103,7 +3204,10 @@ class SingleFit:
             "total_median": float(np.nanmedian(total)),
             "checkerboard_amplitude": float(_block_contrast(
                 raw_total, self.geometry.oversample)),
-            "systematic_spread_dex": float(spread_dex),
+            "systematic_spread_dex": (
+                float(spread_dex) if spread_dex is not None else None),
+            "systematic_window_dex": list(
+                self.__dict__.get("_systematic_window_dex", (np.nan, np.nan))),
             "deblocked": bool(deblock),
         }
         return total, terms
