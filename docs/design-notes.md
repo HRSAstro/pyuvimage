@@ -341,6 +341,20 @@ w-tilde path. Measured on Ruby (148k visibilities), it works out at about
 | 32 (0.25"/px) | ~44 s | ~6.7 GB |
 | 70 (0.11"/px, Nyquist) | ~210 s | ~32 GB |
 
+There is a second term the estimate used to ignore, and it is the one that
+bites when the mesh outgrows the data. The mapping matrix *itself* — mesh
+pixels onto the image grid, before any transform — is `n_image × n_mesh`
+float64, so ~`32 × n_mesh²` bytes at `oversample 2`. On any real dataset that
+is nothing (0.2 GB at a 50×50 mesh, against Ruby's 4.8 GB), but it does not
+scale with `n_vis` at all, so on a fine mesh over few visibilities it *is* the
+cost: 200 visibilities forced onto a 222×222 mesh by `--pixel-scale nyquist`
+on a sparse long tail estimated at 0.8 GB and asked NumPy for 78. Linux
+refuses that outright; macOS overcommits and the kernel kills the process,
+which is the failure `check_memory` exists to pre-empt. Both terms are now in
+`estimate_peak_memory_gb`, and in the mesh it recommends — the cost is
+quadratic in the mesh once the second term is counted, so solving only the
+linear one advised a mesh that still did not fit.
+
 So the field of view is the expensive parameter, quadratically. Which is why
 `--image-centre` matters: both of these sources sit 3–4″ off the phase centre,
 so reaching them from the centre forced an 8″ field. Recentred, Ruby's ring

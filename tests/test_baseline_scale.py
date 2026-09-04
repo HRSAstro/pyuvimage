@@ -127,9 +127,16 @@ def test_the_long_tail_note_does_not_advise_a_flag_already_in_use(caplog):
     from pyuvimage import api, mock
 
     uvd, _, _, _ = mock.make_demo_dataset(n_vis=200, mesh_n=12, seed=2)
-    # a long tail: one very long baseline against a compact core
+    # A long tail: one longer baseline against a compact core. 3x is enough
+    # to clear the b_max > 1.5 b_95 test this is about, and the factor has to
+    # stay modest because `--pixel-scale nyquist` sizes the mesh from b_max:
+    # at 40x it asked for a 222x222 mesh over the same 3" field, whose
+    # mesh->image mapping matrix is 72 GiB. NumPy refuses that outright, so
+    # the test passed on Linux by way of the `except Exception` below -- but
+    # macOS overcommits and the process is killed instead, taking the whole
+    # pytest run with it.
     for spw in uvd.spws:
-        spw.uvw[0] = spw.uvw[0] * 40.0
+        spw.uvw[0] = spw.uvw[0] * 3.0
 
     for scale, expect_advice in (("auto", True), ("nyquist", False)):
         caplog.clear()

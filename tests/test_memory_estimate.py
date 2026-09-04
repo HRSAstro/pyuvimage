@@ -4,9 +4,17 @@ An out-of-memory kill gives the user `Killed: 9` and nothing else -- no
 traceback, no hint which knob to turn. The estimate exists so the fit says
 what it needs while --mesh and --fov are still adjustable.
 
-The scaling is the part people get wrong, including me: peak memory goes as
-**n_vis x n_mesh**, not the image size. Ruby on a 26x26 mesh needs ~8x what
+The scaling is the part people get wrong, including me. On any real dataset
+peak memory goes as **n_vis x n_mesh**: Ruby on a 26x26 mesh needs ~8x what
 PJ0116 needs on a 50x50 one, because Ruby has 29x the visibilities.
+
+But "not the image size" was too strong, and the exception is not academic.
+The mapping matrix itself is n_image x n_mesh and does not scale with n_vis
+at all, so it takes over whenever the mesh is fine and the visibilities are
+few -- and `--pixel-scale nyquist` on a sparse long tail produces exactly
+that. 200 visibilities on a 222x222 mesh estimated at 0.8 GB and asked NumPy
+for 78. Linux refuses the allocation; macOS overcommits and the kernel kills
+the process, which is the failure this whole module exists to pre-empt.
 """
 
 import logging
@@ -29,10 +37,47 @@ def test_memory_scales_with_visibilities_not_image_size():
     visibilities. Reaching for a smaller field or mesh is the fix; reasoning
     from the image size is what makes the failure surprising.
     """
-    ruby = estimate_peak_memory_gb(148_477, 26 * 26)      # small mesh, big data
-    pj0116 = estimate_peak_memory_gb(5_158, 50 * 50)      # big mesh, small data
+    ruby = estimate_peak_memory_gb(148_477, 26 * 26, 4 * 26 * 26)
+    pj0116 = estimate_peak_memory_gb(5_158, 50 * 50, 4 * 50 * 50)
     assert 26 * 26 < 50 * 50, "Ruby really does have fewer model pixels"
     assert ruby > 4 * pj0116
+
+
+def test_the_mapping_matrix_is_counted_when_the_mesh_outgrows_the_data():
+    """A fine mesh over few visibilities: the n_vis term is not the cost.
+
+    200 visibilities forced onto a 222x222 mesh by `--pixel-scale nyquist` on
+    a sparse long tail. The mesh->image mapping matrix is 444^2 x 222^2
+    float64 = 78 GB, which NumPy reported verbatim when it refused to
+    allocate it -- while the estimate, counting only n_vis x n_mesh, said
+    0.8 GB and let the fit proceed into an OOM kill.
+    """
+    n_vis, n_mesh, n_image = 200, 222 * 222, 444 * 444
+    vis_only = estimate_peak_memory_gb(n_vis, n_mesh)
+    full = estimate_peak_memory_gb(n_vis, n_mesh, n_image)
+    assert vis_only < 1.0
+    assert 70.0 < full < 90.0            # numpy asked for 77.7 GB
+
+    # and the advice that goes with the warning has to be affordable itself:
+    # the cost is quadratic in the mesh once this term is in, so solving only
+    # the linear part would recommend a mesh that still does not fit
+    mesh = _mesh_that_fits(n_vis, 8.0, 4.0)
+    assert estimate_peak_memory_gb(n_vis, mesh * mesh, 4 * mesh * mesh) <= 8.0
+
+
+def test_the_new_term_is_negligible_on_real_datasets():
+    """It must fix the pathological case without inflating ordinary ones.
+
+    The mapping matrix is ~32 x n_mesh^2 bytes at `oversample=2`: 0.2 GB at a
+    50x50 mesh. If this term moved the real numbers materially it would be
+    wrong, because those numbers were calibrated against measured peaks.
+    """
+    for n_vis, mesh, tolerance in ((148_477, 26, 0.02), (5_158, 50, 0.25)):
+        n_mesh = mesh * mesh
+        before = estimate_peak_memory_gb(n_vis, n_mesh)
+        after = estimate_peak_memory_gb(n_vis, n_mesh, 4 * n_mesh)
+        assert after > before
+        assert (after - before) / before < tolerance
 
 
 @pytest.mark.parametrize("n_vis,n_mesh,expected", [

@@ -448,17 +448,53 @@ def _require_pynufft():
 BYTES_PER_MAPPING_ELEMENT = 44
 MEMORY_BASE_GB = 0.4
 
+# The *untransformed* mapping matrix -- mesh pixels onto the image grid --
+# is a separate float64 array of n_image_pixels x n_mesh_pixels, and it is
+# the one thing here that does not scale with n_vis at all.
+BYTES_PER_IMAGE_MAPPING_ELEMENT = 8
 
-def estimate_peak_memory_gb(n_vis: int, n_mesh_pixels: int) -> float:
+#: Image pixels per mesh pixel, for `_mesh_that_fits`, which has to guess a
+#: mesh before a geometry exists. `oversample=2` is the default and the grid
+#: trap is the reason it is not 1 (see docs/design-notes.md).
+DEFAULT_PIXELS_PER_MESH = 4
+
+
+def estimate_peak_memory_gb(
+    n_vis: int, n_mesh_pixels: int, n_image_pixels: int | None = None
+) -> float:
     """Rough peak RSS for one inversion, in GB.
 
-    Note what it scales with: **n_vis x n_mesh**, not the number of image
-    pixels. That is why a small field over a large dataset can need far more
-    memory than a large field over a small one -- Ruby at a 26x26 mesh needs
-    ~8x what PJ0116 needs at 50x50, because Ruby has 29x the visibilities.
+    Two terms, and which one dominates is not obvious:
+
+    * **n_vis x n_mesh** -- the transformed mapping matrix, at ~44 B/element.
+      This is usually the whole story, and it is why a small field over a
+      large dataset can need far more memory than a large field over a small
+      one: Ruby at a 26x26 mesh needs ~8x what PJ0116 needs at 50x50, because
+      Ruby has 29x the visibilities.
+    * **n_image x n_mesh** -- the mapping matrix itself, mesh pixels onto the
+      image grid, float64 and independent of n_vis. With `oversample=2` the
+      image grid is 4x the mesh, so this term is ~32 x n_mesh^2 bytes: 0.2 GB
+      at a 50x50 mesh, invisible next to the first term on any real dataset.
+
+    Leaving the second term out was a real blind spot, not a rounding error.
+    It dominates whenever the mesh is fine and the visibilities are few --
+    which is exactly the sparse-long-tail case the geometry code warns about.
+    A 200-visibility set forced onto a 222x222 mesh by `--pixel-scale nyquist`
+    estimated at 1.0 GB and asked NumPy for a 72 GiB array; on Linux that is a
+    clean MemoryError and on macOS it is `Killed: 9`, which is precisely the
+    outcome `check_memory` exists to prevent.
+
+    `n_image_pixels=None` keeps the old n_vis-only estimate for callers that
+    genuinely do not know the image grid.
     """
     elements = float(n_vis) * float(n_mesh_pixels)
-    return MEMORY_BASE_GB + elements * BYTES_PER_MAPPING_ELEMENT / 1e9
+    total = MEMORY_BASE_GB + elements * BYTES_PER_MAPPING_ELEMENT / 1e9
+    if n_image_pixels:
+        total += (
+            float(n_image_pixels) * float(n_mesh_pixels)
+            * BYTES_PER_IMAGE_MAPPING_ELEMENT / 1e9
+        )
+    return total
 
 
 # --------------------------------------------------------------------------
@@ -555,7 +591,11 @@ def available_memory_gb() -> float | None:
                     return float(line.split()[1]) * 1024 / 1e9
     except Exception:
         pass
-    try:  # pragma: no cover - macOS and other POSIX: total, not available
+    try:  # pragma: no cover - macOS: vm_stat, which reports pages not bytes
+        return _macos_available_gb()
+    except Exception:
+        pass
+    try:  # pragma: no cover - other POSIX: total, not available
         import os
 
         return (
@@ -563,6 +603,36 @@ def available_memory_gb() -> float | None:
         )
     except Exception:
         return None
+
+
+def _macos_available_gb() -> float | None:  # pragma: no cover - macOS only
+    """Free memory on macOS, from `vm_stat`.
+
+    Without this the POSIX fallback below returns *total* physical memory,
+    which on a laptop with a browser open overstates what is free several
+    times over -- so `check_memory` says a fit fits, the allocation succeeds
+    (macOS overcommits), and the kernel kills the process when the pages are
+    touched. `Killed: 9` with no traceback is exactly what that function
+    exists to prevent, and on macOS it could not.
+
+    Free + inactive + speculative is the usual reading of "available": macOS
+    reclaims inactive pages under pressure, and counting only `free` would
+    understate it just as badly in the other direction.
+    """
+    import re
+    import subprocess
+
+    out = subprocess.run(
+        ["vm_stat"], capture_output=True, text=True, timeout=5,
+    ).stdout
+    page = re.search(r"page size of (\d+) bytes", out)
+    page_bytes = int(page.group(1)) if page else 4096
+    pages = 0
+    for name in ("Pages free", "Pages inactive", "Pages speculative"):
+        m = re.search(rf"^{name}:\s+(\d+)\.", out, re.MULTILINE)
+        if m:
+            pages += int(m.group(1))
+    return float(pages) * page_bytes / 1e9 if pages else None
 
 
 def transformer_memory_gb(transformer_cls, n_vis: int, n_mesh_pixels: int) -> float:
@@ -699,7 +769,7 @@ def check_memory(
 
     def _need(nv):
         return (
-            estimate_peak_memory_gb(nv, n_mesh_pixels)
+            estimate_peak_memory_gb(nv, n_mesh_pixels, n_image_pixels)
             + transformer_memory_gb(transformer_cls, nv, n_mesh_pixels)
         )
 
@@ -744,13 +814,17 @@ def check_memory(
                     per_chan, full, have,
                 )
     if need > have:
+        ratio = (
+            float(n_image_pixels) / max(n_mesh_pixels, 1)
+            if n_image_pixels else DEFAULT_PIXELS_PER_MESH
+        )
         logger.warning(
             "estimated peak memory (%.1f GB) exceeds what looks available "
             "(%.1f GB), so this fit may be killed outright -- an OOM kill "
-            "prints nothing useful. Memory scales as n_vis x n_mesh, so the "
-            "levers are --mesh (or a coarser --pixel-scale) and --fov, not "
-            "the image size. A mesh of %d per side would fit.",
-            need, have, _mesh_that_fits(n_vis, have),
+            "prints nothing useful. Memory scales as n_vis x n_mesh plus "
+            "n_image x n_mesh, and --mesh (or a coarser --pixel-scale) is "
+            "the lever on both. A mesh of %d per side would fit.",
+            need, have, _mesh_that_fits(n_vis, have, ratio),
         )
     elif need > 0.8 * have:
         logger.info(
@@ -759,10 +833,27 @@ def check_memory(
         )
 
 
-def _mesh_that_fits(n_vis: int, available_gb: float) -> int:
-    """Largest square mesh whose estimate stays under 80% of `available_gb`."""
+def _mesh_that_fits(
+    n_vis: int,
+    available_gb: float,
+    pixels_per_mesh: float = DEFAULT_PIXELS_PER_MESH,
+) -> int:
+    """Largest square mesh whose estimate stays under 80% of `available_gb`.
+
+    Both terms of `estimate_peak_memory_gb` are in here, so the advice is not
+    self-defeating: the image grid grows with the mesh (`pixels_per_mesh` of
+    them per mesh pixel), which makes the cost quadratic in n_mesh, and on a
+    fine mesh with few visibilities that term is the binding one. Solving only
+    the linear term would recommend a mesh that is still unaffordable.
+    """
     budget = max(0.8 * available_gb - MEMORY_BASE_GB, 0.0) * 1e9
-    n_pix = budget / (BYTES_PER_MAPPING_ELEMENT * max(n_vis, 1))
+    # a.n + b.n^2 = budget, with n the mesh pixel count
+    a = BYTES_PER_MAPPING_ELEMENT * max(n_vis, 1)
+    b = BYTES_PER_IMAGE_MAPPING_ELEMENT * max(float(pixels_per_mesh), 0.0)
+    if b <= 0:
+        n_pix = budget / a
+    else:
+        n_pix = (-a + math.sqrt(a * a + 4.0 * b * budget)) / (2.0 * b)
     return max(int(np.sqrt(max(n_pix, 1.0))), 1)
 
 
