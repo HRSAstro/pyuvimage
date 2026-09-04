@@ -162,7 +162,8 @@ def sky_axes(ax, extent, *, ticks=(-1.0, 0.0, 1.0)):
     ax.set_ylabel(r"$\Delta$Dec [arcsec]", fontsize=6.0, color=INK, labelpad=1.5)
 
 
-def hcolorbar(fig, im, cells, label, height=0.014, *, pad=0.030, ticks=None):
+def hcolorbar(fig, im, cells, label, height=0.014, *, pad=0.030, ticks=None,
+              shrink=1.0):
     """A horizontal colourbar under the column that `cells` spans.
 
     Positioned from the gridspec cell rather than from a rendered axes, so it
@@ -174,6 +175,9 @@ def hcolorbar(fig, im, cells, label, height=0.014, *, pad=0.030, ticks=None):
     x0 = min(b.x0 for b in boxes)
     x1 = max(b.x1 for b in boxes)
     y0 = min(b.y0 for b in boxes)
+    if shrink != 1.0:      # inset, so neighbouring bars' end labels cannot collide
+        mid, half = 0.5 * (x0 + x1), 0.5 * (x1 - x0) * shrink
+        x0, x1 = mid - half, mid + half
     cax = fig.add_axes([x0, y0 - pad, x1 - x0, height])
     cb = fig.colorbar(im, cax=cax, orientation="horizontal", ticks=ticks)
     if ticks is not None:
