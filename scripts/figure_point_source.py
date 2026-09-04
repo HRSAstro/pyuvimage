@@ -34,6 +34,24 @@ logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
 CACHE = Path("/tmp/pyuvimage_fig_point")
 
+#: The prior for both rows. Measured on this mock, with the point component
+#: fitted and everything else fixed (peak residual, model roughness, and the
+#: recovered point flux against a 4.00 mJy truth):
+#:
+#:     matern     14.3 sigma   smooth   3.99 mJy
+#:     gaussian    4.2 sigma   smooth   4.03 mJy
+#:     gibbs      11.7 sigma   smooth   3.99 mJy
+#:     adaptive    3.2 sigma   mottled  3.88 mJy
+#:
+#: `matern` and `gibbs` over-smooth the exponential disc's central cusp and
+#: leave it in the residual; `adaptive` reaches the lowest residual but its
+#: amplitude-following prior lets pixel-scale noise into the bright centre,
+#: which is visible as a checkerboard in the model. The envelope prior does
+#: both jobs here -- and this source, a single centrally peaked disc, is
+#: exactly what it is for, so this is not evidence that it wins generally.
+#: On the three real lensed arcs `adaptive` is the better choice.
+REG = "gaussian"
+
 N_VIS = 4000
 MESH_N = 32
 FOV = 3.0
@@ -77,7 +95,7 @@ def fit_all() -> None:
         t = time.time()
         pyuvimage.run(
             uvd, fov=FOV, out=CACHE / tag, mesh_shape=(MESH_N, MESH_N),
-            reg="adaptive", criterion="discrepancy",
+            reg=REG, criterion="discrepancy",
             point_sources=bool(points),
             uncertainty_map=True, pb_correction=False, mask_shape="square",
         )
@@ -218,7 +236,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--plot", action="store_true",
                     help="skip fitting and re-plot from the cache")
+    ap.add_argument("--reg", default=REG,
+                    help=f"source prior for both rows (default {REG})")
     args = ap.parse_args()
+    REG = args.reg          # module-level, so fit_all() and plot() see it
     if not args.plot:
         fit_all()
     plot()
