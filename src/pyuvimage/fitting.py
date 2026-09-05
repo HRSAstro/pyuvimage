@@ -1941,6 +1941,22 @@ def repair_sparse_dirty_image(sparse_dataset, dataset, tolerance: float = 1e-6):
     return sparse_dataset
 
 
+def make_mask(geometry: ImageGeometry, mask_shape: str = "square"):
+    """The real-space mask a dataset (or a streamed stub) is built on."""
+    if mask_shape == "square":
+        return ag.Mask2D.all_false(
+            shape_native=geometry.shape_native,
+            pixel_scales=geometry.pixel_scale,
+        )
+    if mask_shape == "circular":
+        return ag.Mask2D.circular(
+            shape_native=geometry.shape_native,
+            pixel_scales=geometry.pixel_scale,
+            radius=geometry.mask_radius * 1.001,  # keep boundary pixels
+        )
+    raise ValueError("mask_shape must be 'square' or 'circular'")
+
+
 def make_dataset(
     uv_wavelengths: np.ndarray,
     data: np.ndarray,
@@ -1957,19 +1973,7 @@ def make_dataset(
     their value -- which showed up as bright spurious blobs in the corners of
     the restored image, carrying ~29% of the source flux on one test mock.
     """
-    if mask_shape == "square":
-        mask = ag.Mask2D.all_false(
-            shape_native=geometry.shape_native,
-            pixel_scales=geometry.pixel_scale,
-        )
-    elif mask_shape == "circular":
-        mask = ag.Mask2D.circular(
-            shape_native=geometry.shape_native,
-            pixel_scales=geometry.pixel_scale,
-            radius=geometry.mask_radius * 1.001,  # keep boundary pixels
-        )
-    else:
-        raise ValueError("mask_shape must be 'square' or 'circular'")
+    mask = make_mask(geometry, mask_shape)
     cls = resolve_transformer(
         n_vis=len(data),
         transformer=transformer,
@@ -2156,6 +2160,50 @@ class Trial:
     regularization_matrix: np.ndarray = field(repr=False)
 
 
+#: Attribute a stub dataset carries when the fit was fed from streamed terms
+#: (`streaming.stub_dataset_from_terms`). Everything that would otherwise read
+#: the data or noise arrays -- the visibility count, d^T N^-1 d, the noise
+#: normalisation -- reads the terms instead; the stub's own eight visibilities
+#: exist only because autoarray's `Interferometer` constructor wants some.
+STREAMED_TERMS_ATTR = "pyuvimage_streamed_terms"
+
+
+def streamed_terms_of(dataset):
+    """The `streaming.SparseTerms` a dataset was built from, or None."""
+    return getattr(dataset, STREAMED_TERMS_ATTR, None) if dataset is not None else None
+
+
+def imager_for(dataset):
+    """A dirty imager for `dataset`, whichever way the data are held.
+
+    A stub built from streamed terms has eight placeholder visibilities;
+    imaging *them* would give a beam and rms of nothing. The kernel imager
+    carries the accumulated beam, data dirty image and sum of weights
+    instead, and images a model through the w-tilde kernel.
+    """
+    terms = streamed_terms_of(dataset)
+    if terms is not None:
+        from .streaming import KernelDirtyImager
+
+        imager = KernelDirtyImager(terms, dataset.real_space_mask)
+        imager.dataset = dataset
+        return imager
+    return DirtyImager(dataset)
+
+
+def n_data_of(dataset) -> int:
+    """Real plus imaginary parts of every visibility the fit describes.
+
+    On the streaming path the dataset object is a stub and the count comes
+    from the terms; getting this wrong makes the discrepancy criterion aim
+    chi^2 at the stub's sixteen numbers instead of the data's hundred million.
+    """
+    terms = streamed_terms_of(dataset)
+    if terms is not None:
+        return int(2 * terms.n_vis)
+    return int(2 * len(np.asarray(dataset.data)))
+
+
 class LinearSystem:
     """F, D and the constant terms of one (dataset, mesh), solved per prior.
 
@@ -2229,12 +2277,19 @@ class LinearSystem:
         keep = None
         if settings.use_edge_zeroed_pixels and inversion.has(cls=Mapper):
             keep = np.asarray(inversion.zeroed_ids_to_keep)
-        data = inversion.dataset.data.array
-        noise = inversion.dataset.noise_map.array
-        # the same expression `fast_chi_squared` evaluates, on the same arrays
-        data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
-            data.imag**2.0 / noise.imag**2.0
-        )
+        terms = streamed_terms_of(dataset) or streamed_terms_of(inversion.dataset)
+        if terms is not None:
+            # the dataset is a stub; the constants were accumulated in the
+            # streaming pass, on the same expressions, over every visibility
+            data_term = float(terms.data_term)
+            noise_normalization = float(terms.noise_normalization)
+        else:
+            data = inversion.dataset.data.array
+            noise = inversion.dataset.noise_map.array
+            # the same expression `fast_chi_squared` evaluates, on the same arrays
+            data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
+                data.imag**2.0 / noise.imag**2.0
+            )
         return cls(
             F=inversion.curvature_matrix,
             D=inversion.data_vector,
@@ -2262,9 +2317,9 @@ class LinearSystem:
     @property
     def n_data(self) -> int:
         """Real plus imaginary parts: two data points per visibility."""
-        return int(2 * self.D.shape[0]) if self.dataset is None else int(
-            2 * len(np.asarray(self.dataset.data))
-        )
+        if self.dataset is None:
+            return int(2 * self.D.shape[0])
+        return n_data_of(self.dataset)
 
     def regularization_matrix(self, regularization) -> np.ndarray:
         """H for a regularisation scheme, exactly as the inversion forms it.
@@ -2393,6 +2448,12 @@ class LinearSystem:
         does; there is no A_t to cache and one NUFFT of one image is the cost
         the path is designed around.
         """
+        if streamed_terms_of(self.dataset) is not None:
+            raise RuntimeError(
+                "no visibilities are held on the streaming path, so there are "
+                "no model visibilities to form; the products use the w-tilde "
+                "kernel instead (`residual_dirty_image`)"
+            )
         s = np.asarray(reconstruction)
         A_t = self.operated_mapping_matrix
         if A_t is not None:
@@ -2411,6 +2472,29 @@ class LinearSystem:
         return np.asarray(self.dataset.data) - self.model_visibilities(
             reconstruction
         )
+
+    def model_image_native(self, reconstruction: np.ndarray) -> np.ndarray:
+        """The mapped model on the native image grid, for the kernel."""
+        inv = self.inversion
+        if inv is None:
+            raise RuntimeError("the model image needs the template inversion's mask")
+        image = ag.Array2D(
+            values=self.mapping_matrix @ np.asarray(reconstruction), mask=inv.mask)
+        return np.asarray(image.native)
+
+    def residual_dirty_image(self, reconstruction: np.ndarray, imager) -> np.ndarray:
+        """The residual dirty image [Jy/beam], however the data are held.
+
+        Dense path: image the residual visibilities. Streaming path: there
+        are none, and there need not be -- the dirty image of the model's
+        visibilities is the w-tilde kernel applied to the model image, so the
+        residual map is dirty(data) - W~ * (M s). Same numbers, to ~1e-15 on
+        the mocks, and not one visibility touched.
+        """
+        if hasattr(imager, "dirty_image_of_model"):
+            return (imager.dirty_image_of_data()
+                    - imager.dirty_image_of_model(self.model_image_native(reconstruction)))
+        return np.asarray(imager.dirty_image(self.residual_visibilities(reconstruction)))
 
 
 def _log_det_cholesky(matrix: np.ndarray) -> float:
@@ -2685,20 +2769,31 @@ def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
     if not np.isfinite(chi2) or chi2 <= 0 or not n_data:
         return float("nan")
     try:
-        resid = system_for(fit).residual_visibilities(fit.inversion.reconstruction)
+        resid_map = system_for(fit).residual_dirty_image(
+            fit.inversion.reconstruction, imager)
     except Exception as e:  # pragma: no cover - diagnostic only
         logger.debug("structure ratio failed: %s", e)
         return float("nan")
-    return _structure_ratio(resid, chi2, imager, n_data)
+    return _structure_ratio_from_map(resid_map, chi2, imager, n_data)
 
 
 def _structure_ratio(resid: np.ndarray, chi2: float, imager, n_data: int) -> float:
     """`structure_ratio` from the residual visibilities and chi^2 themselves."""
     try:
+        resid_map = np.asarray(imager.dirty_image(resid), dtype=float)
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.debug("structure ratio failed: %s", e)
+        return float("nan")
+    return _structure_ratio_from_map(resid_map, chi2, imager, n_data)
+
+
+def _structure_ratio_from_map(resid_map: np.ndarray, chi2: float, imager, n_data: int) -> float:
+    """`structure_ratio` from the residual dirty image [Jy/beam] itself."""
+    try:
         rms = imager.rms
         if not np.isfinite(rms) or rms <= 0:
             return float("nan")
-        resid_map = np.asarray(imager.dirty_image(resid), dtype=float) / rms
+        resid_map = np.asarray(resid_map, dtype=float) / rms
         # the transformer returns zeros outside the real-space mask, which
         # would drag the rms down; measure only where the image is defined
         inside = imager.inside
@@ -2784,7 +2879,7 @@ def optimise_prior(
     """
     mesh_shape = geometry.mesh_shape
     if n_data is None:
-        n_data = 2 * len(np.asarray(dataset.data))
+        n_data = n_data_of(dataset)
     if system is None:
         system = build_linear_system(dataset, mesh_shape)
     # a kernel prior whose correlation length is pinned has only one free
@@ -2821,7 +2916,7 @@ def optimise_prior(
 
     # The structure criterion is measured in the image plane, so it needs a
     # dirty imager; build it once and reuse it across every evaluation.
-    imager = DirtyImager(dataset) if criterion == "structure" else None
+    imager = imager_for(dataset) if criterion == "structure" else None
     # positivity changes the residual map, so the structure search has to run
     # on the solver the delivered fit uses; the other criteria stay on the
     # fast unconstrained solve (the evidence is defined for it).
@@ -2855,8 +2950,8 @@ def optimise_prior(
             )
             ev, chi2 = trial.log_evidence, trial.chi_squared
             ratio = (
-                _structure_ratio(
-                    system.residual_visibilities(trial.reconstruction),
+                _structure_ratio_from_map(
+                    system.residual_dirty_image(trial.reconstruction, imager),
                     chi2, imager, n_data,
                 )
                 if imager is not None else float("nan")
@@ -3673,7 +3768,7 @@ def fit_dataset(
     to the second so F and D are built once per fit, not once per stage.
     """
     mesh_shape = geometry.mesh_shape
-    n_data = 2 * len(np.asarray(dataset.data))
+    n_data = n_data_of(dataset)
 
     # F and D once. Everything below -- the probes, the search, the
     # constrained re-bisection -- is a solve on this; only the delivered fit

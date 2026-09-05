@@ -355,6 +355,39 @@ which is the failure `check_memory` exists to pre-empt. Both terms are now in
 quadratic in the mesh once the second term is counted, so solving only the
 linear one advised a mesh that still did not fit.
 
+**And a third, which is the data itself.** On the sparse path the *inversion*
+is independent of the visibility count — F comes from the kernel, D from one
+adjoint — but the load path held every visibility resident for the whole run:
+`UVData`, its `flattened()` copy, autoarray's `Interferometer` and the
+per-likelihood model and residual vectors, ~136 bytes each. On a 202-million
+sample MFS cube that was 27 GB on a model of 324 pixels, and the memory report
+said the fit was "independent of the visibilities" as the kernel killed it.
+
+`streaming.py` removes the dependence rather than counting it. Every quantity
+the sparse fit consumes is a sum over visibilities — the kernel
+`Σ w cos(dx·ku + dy·kv)`, the dirty image (adjoint of d/σ²), the dirty beam
+(adjoint of w), Σw, dᵀN⁻¹d, Σ log 2πσ² — so it reads the file once in channel
+blocks (zipfile-streamed for a deflated `.npz`, memory-mapped for a FITS
+directory), folds each block in, and discards it. The fit then runs on a stub
+`Interferometer` carrying the operator and eight placeholder visibilities;
+everything that would otherwise read the data or noise arrays goes through
+`fitting.streamed_terms_of` / `n_data_of` and reads the terms. The residual
+map needs no model visibilities either: the dirty image of the model's
+visibilities *is* `W̃ ⋆ (M s)` — that is the w-tilde identity — so it is
+`dirty(data) − W̃⋆model`, exact to ~1e-15 against imaging the visibilities.
+The terms are cached beside the output, keyed on the file's identity (path,
+size, mtime) and the geometry — a hash of the arrays would be the pass the
+cache exists to skip — so a re-fit reads no visibilities at all.
+
+Measured: peak RSS of the accumulation is flat at 0.18 GB from 0.5M to 2M
+samples (the delta over baseline is 36 MB, one chunk and its transformer),
+where holding the data would have grown 4×. The cost moves to time — one
+pass through every sample, ~60 µs each with a DFT per chunk on the 2-core
+container. What is not streamed yet: cube mode (one kernel per channel, a
+loop over this), point components (dense-only anyway), recentring (a
+chunk-local phase ramp, unwired). MFS + sparse, opt-in with
+`run(..., streaming=True)`.
+
 So the field of view is the expensive parameter, quadratically. Which is why
 `--image-centre` matters: both of these sources sit 3–4″ off the phase centre,
 so reaching them from the centre forced an 8″ field. Recentred, Ruby's ring

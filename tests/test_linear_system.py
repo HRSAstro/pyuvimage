@@ -405,6 +405,11 @@ class _FakeSystem:
     def residual_visibilities(self, reconstruction):
         return np.zeros(self.n_vis, dtype=complex)
 
+    def residual_dirty_image(self, reconstruction, imager):
+        # what the search now asks for: the residual map, however the data
+        # are held (`LinearSystem.residual_dirty_image`)
+        return np.zeros((8, 8))
+
 
 class _FakeFit:
     def __init__(self, chi2, rec):
@@ -477,7 +482,7 @@ def test_structure_handing_back_to_chi2_is_then_rebisected(monkeypatch, small):
     dataset, geom = small
     n_data = 2 * len(np.asarray(dataset.data))
     # the ratio never reaches 1, so structure gives up and hands to chi^2
-    monkeypatch.setattr(fitting, "_structure_ratio", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fitting, "_structure_ratio_from_map", lambda *a, **k: 0.5)
 
     def chi2_of(c, positive):
         floor = 1.02 if positive else 0.95
@@ -506,7 +511,7 @@ def test_an_inner_evidence_fallback_is_not_lost_in_the_chain(
     a chi^2 target it had already given up on."""
     dataset, geom = small
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(fitting, "_structure_ratio", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fitting, "_structure_ratio_from_map", lambda *a, **k: 0.5)
     _install(
         monkeypatch, lambda c, positive: n_data * (2.0 + 0.5 * c / (c + 1e3))
     )
