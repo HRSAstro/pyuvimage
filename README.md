@@ -325,8 +325,8 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 | **sparse, streamed** (`streaming=True`, experimental) | `--mesh` only: the data are read once in chunks and never held | the model's ~1 GB whatever the visibility count |
 | **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
 
-The streamed variant (`pyuvimage.run(..., streaming=True)`; MFS and sparse
-only, no point components or recentring yet) accumulates the w-tilde kernel,
+The streamed variant (`--streaming`, or `pyuvimage.run(..., streaming=True)`;
+MFS and sparse only, no point components or recentring yet) accumulates the w-tilde kernel,
 the dirty images and the χ² constants in one pass over the file, caches them
 beside the output, and fits on those alone — every quantity the fit and the
 products need is a sum over visibilities, including the residual map, which

@@ -288,6 +288,24 @@ def main(argv: list[str] | None = None) -> int:
         "step -- the same trick as CASA's cfcache",
     )
     p_fit.add_argument(
+        "--streaming", action="store_true",
+        help="read the visibilities once, in chunks, and hold nothing per "
+        "visibility: the w-tilde kernel, the dirty images and the chi^2 "
+        "constants are accumulated in one pass (cached beside the output, or "
+        "in --kernel-cache) and the fit runs on them alone, so memory does "
+        "not depend on the number of visibilities -- a 200-million-sample "
+        "MFS cube fits in about a gigabyte. The cost is time: one pass over "
+        "every sample, and a cached re-fit reads none. MFS + sparse only; "
+        "cube mode, --point-sources and --image-centre off the phase centre "
+        "refuse rather than approximate",
+    )
+    p_fit.add_argument(
+        "--chunk-k", type=int, default=None, metavar="N",
+        help="--streaming only: visibilities per chunk (default 4096). "
+        "Larger is faster and uses more memory per chunk; the per-chunk DFT "
+        "is n_image_pixels x N complex",
+    )
+    p_fit.add_argument(
         "--cube-prior", default="channel", choices=["channel", "mfs"],
         help="cube mode only: what the shared prior is fitted on. channel "
         "(default) uses a random 1-in-n_chan subset -- the same amount of "
@@ -441,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
             cube_prior=args.cube_prior,
             inversion=args.inversion,
             kernel_cache=args.kernel_cache,
+            streaming=args.streaming,
+            chunk_k=args.chunk_k,
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
             enforce_positive=args.enforce_positive,
