@@ -398,6 +398,43 @@ negligible over a few arcsec. `CRVAL` moves with the grid, so the astrometry
 is unchanged — that is the one way this could do real damage silently, and
 `tests/test_image_centre.py` covers it.
 
+## Where the time goes once the data are out of the way
+
+With the visibilities streamed and the kernel cached, a fit is a sequence
+of solves of one n_mesh × n_mesh system, and on a real field the
+non-negative ones dominate everything else. The unconstrained solve is a
+Cholesky, 0.3 s on a 50×50 mesh. The non-negative solve is an active-set
+iteration (autoarray's fnnls) whose cost is the number of times the active
+set changes on the way from its starting guess to the answer; autoarray
+starts it from the sign of the unconstrained solution, and on a field that
+is mostly empty sky half of those signs are wrong. Measured on a 50×50
+mesh: 20–40 s per solve here, ~100 s on the laptop that ran J0116 — and a
+positive-only fit with the uncertainty map made about fifteen of them per
+adaptive pass (the reachability probe, the three solver checks, the
+re-bisection gate, the delivered fit, and every step of the systematic
+window walk). That was the ten-minute silence after "the constrained fit
+cannot go below…" on J0116.
+
+The optimum is unique — F + H is positive definite — and its support moves
+slowly with the prior's strength, so a solve seeded from the support of a
+previous non-negative solution at a nearby strength converges in a few
+iterations: 0.2–4 s for half-decade steps, agreeing with the cold solve to
+~1e-11 relative. It also carries across *priors* at the same weak strength:
+the second adaptive pass's reachability probe seeded from the first pass's
+takes 0.2 s instead of 35. `LinearSystem` pools every non-negative solution
+it produces, keyed by log10 trace(H) — a scalar that scales with the
+coefficient and is comparable across priors — and any solve asked for with
+`warm_start=True` seeds from the nearest one. A seed whose support is
+singular at the new strength (a jump from a strong prior to a weak one can
+do that) fails inside fnnls in milliseconds and falls back to the cold path,
+so a warm start is never slower than the framework's solve by more than
+that. The searches, probes and the window walk opt in; `Trial` itself and
+the delivered fit do not, because a `Trial` is meant to reproduce the
+framework fit to the bit and the seed changes the last digits. The
+remaining cold solves per pass are the first pass's reachability probe, the
+first solver check at the chosen coefficient, and the delivered fit — the
+last is the framework's own and cannot be seeded from outside.
+
 ## Known issue: the mask edge
 
 On the mocks the largest residual is usually at the circular mask boundary

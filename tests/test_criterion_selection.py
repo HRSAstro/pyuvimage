@@ -133,7 +133,7 @@ class _FakeSystem:
         self.solution = solution
         self.seen: list[tuple[float, bool]] = []
 
-    def trial(self, regularization, positive):
+    def trial(self, regularization, positive, warm_start=False):
         c = float(regularization.coefficient)
         self.seen.append((c, bool(positive)))
         chi2, rec = self.solution(c, positive)

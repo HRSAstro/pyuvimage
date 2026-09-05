@@ -2336,7 +2336,13 @@ class LinearSystem:
             )
         )
 
-    def solve(self, H: np.ndarray, positive: bool) -> np.ndarray:
+    #: how many constrained solutions are kept as warm-start seeds; each is
+    #: one n_mesh vector, so this is kilobytes
+    WARM_START_POOL = 64
+
+    def solve(
+        self, H: np.ndarray, positive: bool, warm_start: bool = False
+    ) -> np.ndarray:
         """s = (F + H)^-1 D, unconstrained or non-negative.
 
         The two solver functions are autoarray's own
@@ -2346,6 +2352,34 @@ class LinearSystem:
         prior are the same solve. Both raise on failure -- a `LinAlgError` for
         a singular unconstrained system, an `InversionException` from the
         non-negative solver -- and the caller decides what a failed trial means.
+
+        **Warm starts.** The non-negative solve is an active-set iteration
+        (Bro & de Jong's fnnls, on a Cholesky factor it updates in place), and
+        its cost is the number of times the active set changes on the way from
+        its starting guess to the answer. Autoarray starts it from the sign of
+        the unconstrained solution, which on a real field -- half the mesh
+        empty sky, so half the unconstrained pixels negative -- is a poor
+        guess: on a 50x50 mesh one solve takes 20-40 s against 0.3 s
+        unconstrained, and a fit makes a dozen or more of them. The optimum,
+        however, is unique (F + H is positive definite) and its support moves
+        slowly with the prior's strength, so a solve seeded from the support
+        of a *previous* constrained solution at a nearby strength converges in
+        a few iterations: measured 0.2-4 s for half-decade steps, agreeing
+        with the cold solve to ~1e-11 relative, and 0.2 s across *priors* at
+        the same weak strength (the second adaptive pass's reachability probe
+        seeded from the first pass's). Every constrained solution this system
+        produces is pooled, and `warm_start=True` seeds from the one whose
+        strength -- log10 trace(H), a scalar that scales with the coefficient
+        and is comparable across priors -- is nearest. A seed that fails
+        (its support singular at the new strength, which a jump from a strong
+        prior to a weak one can do) costs milliseconds and falls back to the
+        cold path, so a warm start is never slower than the framework's solve
+        by more than that.
+
+        `warm_start` is off by default because the seed changes the last bits
+        of the answer, and a `Trial` is meant to be the framework fit to the
+        bit. The searches, probes and the systematic-window walk opt in: they
+        ask where chi^2 or the model sits, and 1e-11 is not a place.
         """
         from autoarray.inversion.inversion import inversion_util
 
@@ -2354,15 +2388,97 @@ class LinearSystem:
             return inversion_util.reconstruction_positive_negative_from(
                 data_vector=self.D, curvature_reg_matrix=curvature_reg, xp=np
             )
+        key = self._strength_key(H)
+        counts = self.__dict__.setdefault(
+            "solve_counts", {"cold": 0, "warm": 0, "warm_failed": 0}
+        )
+        if warm_start:
+            seed = self._warm_seed(key)
+            if seed is not None:
+                try:
+                    reconstruction = self._solve_positive_seeded(
+                        curvature_reg, seed
+                    )
+                except (RuntimeError, np.linalg.LinAlgError, ValueError):
+                    counts["warm_failed"] += 1
+                else:
+                    counts["warm"] += 1
+                    self._pool_solution(key, reconstruction)
+                    return reconstruction
         if self.keep is None:
-            return inversion_util.reconstruction_positive_only_from(
+            reconstruction = inversion_util.reconstruction_positive_only_from(
                 data_vector=self.D, curvature_reg_matrix=curvature_reg,
                 settings=self.settings, xp=np,
             )
-        partial = inversion_util.reconstruction_positive_only_from(
-            data_vector=self.D[self.keep],
-            curvature_reg_matrix=curvature_reg[self.keep][:, self.keep],
-            settings=self.settings, xp=np,
+        else:
+            partial = inversion_util.reconstruction_positive_only_from(
+                data_vector=self.D[self.keep],
+                curvature_reg_matrix=curvature_reg[self.keep][:, self.keep],
+                settings=self.settings, xp=np,
+            )
+            reconstruction = np.zeros(self.D.shape[0])
+            reconstruction[self.keep] = partial
+        counts["cold"] += 1
+        self._pool_solution(key, reconstruction)
+        return reconstruction
+
+    # -- warm-start pool ------------------------------------------------
+    @staticmethod
+    def _strength_key(H: np.ndarray) -> float:
+        """log10 trace(H): the prior's strength on one scalar, across priors."""
+        trace = float(np.trace(H))
+        return float(np.log10(trace)) if trace > 0 else -np.inf
+
+    #: how far (in dex of trace(H)) a pooled solution may be from the strength
+    #: asked for and still be used as a seed. Measured on a 50x50 mesh: a seed
+    #: half a decade away converges in 0.2-4 s, three decades away in about
+    #: the cold time, and one 18 decades away took 60 s where the cold solve
+    #: took 7 -- a strong-prior solve starts well from the unconstrained
+    #: signs, and a weak-prior seed only misleads it.
+    WARM_START_MAX_DEX = 3.0
+
+    def _warm_seed(self, key: float) -> np.ndarray | None:
+        pool = self.__dict__.get("_constrained_pool")
+        if not pool:
+            return None
+        nearest, seed = min(pool, key=lambda entry: abs(entry[0] - key))
+        if abs(nearest - key) > self.WARM_START_MAX_DEX:
+            return None
+        return seed
+
+    def remember_constrained(self, H: np.ndarray, reconstruction: np.ndarray) -> None:
+        """Offer a non-negative solution solved elsewhere as a warm-start seed.
+
+        The delivered fit is the framework's own solve, made outside this
+        class; the systematic-window walk starts from it, and the walk's first
+        step is a half-decade away from it.
+        """
+        self._pool_solution(self._strength_key(H), reconstruction)
+
+    def _pool_solution(self, key: float, reconstruction: np.ndarray) -> None:
+        pool = self.__dict__.setdefault("_constrained_pool", [])
+        pool.append((key, np.asarray(reconstruction)))
+        del pool[: max(0, len(pool) - self.WARM_START_POOL)]
+
+    def _solve_positive_seeded(
+        self, curvature_reg: np.ndarray, seed: np.ndarray
+    ) -> np.ndarray:
+        """Autoarray's fnnls, started from the support of `seed`.
+
+        The same function the framework calls (`fnnls_cholesky`), with
+        `P_initial` set from the seed instead of from the unconstrained
+        solution. Raises what fnnls raises; `solve` falls back to the cold
+        path on any of it.
+        """
+        from autoarray.util.fnnls import fnnls_cholesky
+
+        if self.keep is None:
+            return fnnls_cholesky(
+                curvature_reg, self.D, P_initial=np.asarray(seed) > 0
+            )
+        partial = fnnls_cholesky(
+            curvature_reg[self.keep][:, self.keep], self.D[self.keep],
+            P_initial=np.asarray(seed)[self.keep] > 0,
         )
         reconstruction = np.zeros(self.D.shape[0])
         reconstruction[self.keep] = partial
@@ -2397,10 +2513,12 @@ class LinearSystem:
             )
         )
 
-    def trial(self, regularization, positive: bool) -> Trial:
-        """Solve at one prior and score it."""
+    def trial(
+        self, regularization, positive: bool, warm_start: bool = False
+    ) -> Trial:
+        """Solve at one prior and score it (`warm_start`: see `solve`)."""
         H = self.regularization_matrix(regularization)
-        s = self.solve(H, positive=positive)
+        s = self.solve(H, positive=positive, warm_start=warm_start)
         chi2 = self.chi_squared(s)
         try:
             ev = self.log_evidence(s, H)
@@ -2944,9 +3062,11 @@ def optimise_prior(
         if second == "envelope_fwhm":
             env = {**(envelope or {}), "fwhm": 10.0 ** float(log_params[1])}
         try:
+            # a probe, not the delivered fit: constrained solves may be
+            # seeded from earlier ones (`LinearSystem.solve`)
             trial = system.trial(
                 make_regularization(reg_kind, coefficient, scale, nu, env),
-                positive=positive,
+                positive=positive, warm_start=True,
             )
             ev, chi2 = trial.log_evidence, trial.chi_squared
             ratio = (
@@ -3030,6 +3150,12 @@ def optimise_prior(
         probe = [LOG_COEFFICIENT_BOUNDS[0]]
         if two_d:
             probe.append(float(np.mean(log_scale_bounds)))
+        if positive_only:
+            logger.info(
+                "probing the weakest prior with the non-negative solver (the "
+                "slow solve of the search; a second pass seeds it from the "
+                "first)..."
+            )
         _, chi2_weakest, ratio_weakest = evaluate(
             np.array(probe), positive=positive_only
         )
@@ -3429,7 +3555,7 @@ class SingleFit:
         try:
             values = self.system.solve(
                 float(factor) * self.regularization_matrix,
-                positive=bool(self.positive_only),
+                positive=bool(self.positive_only), warm_start=True,
             )
         except Exception:  # LinAlgError, InversionException
             return None
@@ -3470,18 +3596,40 @@ class SingleFit:
         H = self.regularization_matrix
         system, positive = self.system, bool(self.positive_only)
         floor = abs(min_dex)
+        started = time.perf_counter()
+        n_solves = 0
 
         def solved(dex):
+            nonlocal n_solves
+            n_solves += 1
             try:
-                return system.solve(10.0**dex * H, positive=positive)
+                # each step is seeded from the nearest solved strength -- the
+                # previous step, half a decade away -- which is what makes a
+                # constrained walk affordable (see `LinearSystem.solve`)
+                return system.solve(
+                    10.0**dex * H, positive=positive, warm_start=True
+                )
             except Exception:                   # LinAlgError, InversionException
                 return None
 
+        # The walk starts from the delivered solution, which is already in
+        # hand: solving it again cost one more constrained solve for the same
+        # numbers. Offered to the system as the seed for the first steps.
+        base = self.reconstruction
+        if positive:
+            system.remember_constrained(H, base)
         try:
-            chi2_0 = system.chi_squared(system.solve(H, positive=positive))
+            chi2_0 = system.chi_squared(base)
         except Exception:                       # pragma: no cover - singular
             return -floor, floor, []
+        if not np.isfinite(chi2_0):             # pragma: no cover - singular
+            return -floor, floor, []
         tolerance = np.sqrt(2.0 * system.n_data)
+        logger.info(
+            "measuring the prior-systematic window (%s solves in half-decade "
+            "steps, up to +/-%g dex)...",
+            "non-negative" if positive else "unconstrained", max_dex,
+        )
 
         lo = hi = 0.0
         steps: list[tuple[float, np.ndarray]] = []
@@ -3511,6 +3659,10 @@ class SingleFit:
                 values = solved(dex)
                 if values is not None:
                     steps.append((dex, values))
+        logger.info(
+            "  window %+.1f to %+.1f dex, %d solves, %.0f s",
+            lo, hi, n_solves, time.perf_counter() - started,
+        )
         return lo, hi, sorted(steps, key=lambda s: s[0])
 
     def chi2_admissible_dex(
@@ -3546,9 +3698,12 @@ class SingleFit:
         `prior_systematic` samples the steps and not just the edges -- see
         `_admissible_scan`.
 
-        Costs at most `2 * max_dex * per_dex + 1` solves of an n_mesh system
-        -- no transforms and no refit -- and only reaches that on a fit chi^2
-        barely responds to, which is the case where the answer matters.
+        Costs at most `2 * max_dex * per_dex` solves of an n_mesh system --
+        no transforms and no refit; the walk starts from the delivered
+        solution -- and only reaches that on a fit chi^2 barely responds to,
+        which is the case where the answer matters. On a non-negative fit each
+        step is seeded from the last (`LinearSystem.solve`), without which a
+        24-step constrained walk on a 50x50 mesh took a quarter of an hour.
         """
         lo, hi, _ = self._admissible_scan(max_dex, per_dex, min_dex)
         return lo, hi
@@ -3820,10 +3975,16 @@ def fit_dataset(
         )
 
     def _probe_model(coefficient, positive, prior_=None):
-        """The reconstruction itself, which is what the prior acts on."""
+        """The reconstruction itself, which is what the prior acts on.
+
+        Probes are seeded from earlier constrained solutions (`warm_start`):
+        on a 50x50 mesh that is the difference between 0.2-4 s and 20-40 s
+        per constrained solve, and this function is called a dozen times.
+        """
         try:
             return system.trial(
-                regularization_for(coefficient, prior_), positive=positive
+                regularization_for(coefficient, prior_), positive=positive,
+                warm_start=True,
             )
         except Exception:
             return None
@@ -3854,8 +4015,16 @@ def fit_dataset(
     # data's, and 1.0 can sit six decades from where the fit will actually
     # run, where "fits far worse than the unconstrained solve" says nothing
     # about the solver the delivered model will use.
+    # The constrained trial at the chosen coefficient, kept for the
+    # re-bisection gate below, which used to solve it a second time.
+    constrained_t = None
     if positive_only and needs_search:
         chosen = float(prior["coefficient"])
+        logger.info(
+            "checking the non-negative solver at coefficient %.4g (three "
+            "constrained solves)...", chosen,
+        )
+        started = time.perf_counter()
         free_t = _probe_model(chosen, False, prior)
         constrained_t = _probe_model(chosen, True, prior)
         free = free_t.chi_squared if free_t is not None else np.nan
@@ -3891,7 +4060,9 @@ def fit_dataset(
             # the prior returns the same model at both ends; a working one
             # cannot.
             change = _model_response(
-                lambda c: system.trial(regularization_for(c, prior), positive=True),
+                lambda c: system.trial(
+                    regularization_for(c, prior), positive=True, warm_start=True
+                ),
                 1e-3, 1e9,
             )
             if change is not None and change < POSITIVITY_PRIOR_RESPONSE:
@@ -3900,6 +4071,10 @@ def fit_dataset(
                     f"between regularisation strengths twelve decades "
                     f"apart, so it is ignoring the prior entirely"
                 )
+        logger.info(
+            "  solver check done in %.0f s%s", time.perf_counter() - started,
+            "" if reason is None else " -- unreliable",
+        )
         if reason is not None and enforce_positive:
             logger.warning(
                 "the non-negative solver looks unreliable on this data: %s. "
@@ -3967,7 +4142,14 @@ def fit_dataset(
                 "coefficient is chosen against %.4g rather than %.4g.",
                 scan.chi2_floor / n_data, target / n_data, chi2_target,
             )
-        first_trial = _probe_model(prior["coefficient"], True, prior)
+        # the solver check above already solved this exact trial when the
+        # prior it chose is the one still in hand
+        first_trial = (
+            constrained_t
+            if constrained_t is not None
+            and constrained_t.coefficient == float(prior["coefficient"])
+            else _probe_model(prior["coefficient"], True, prior)
+        )
         chi2 = first_trial.chi_squared if first_trial is not None else np.nan
         # A few per cent, not the 50%% this used to allow: chi^2 is nearly
         # flat in the coefficient near the floor, so a loose gate lets a
@@ -4076,9 +4258,17 @@ def fit_dataset(
                     if reg_kind in KERNEL_REGULARIZATIONS:
                         prior.setdefault("nu", nu)
 
+    logger.info(
+        "solving the delivered fit at coefficient %.4g%s...",
+        prior["coefficient"],
+        " (non-negative; this solve is not seeded)" if positive_only else "",
+    )
+    started = time.perf_counter()
     fit = _fit(prior["coefficient"])
-
+    # the framework inversion is lazy: reading chi^2 is what runs the solve
     chi2_final = _chi_squared(fit)
+    logger.info("  delivered fit solved in %.0f s", time.perf_counter() - started)
+
     if np.isfinite(chi2_final) and warn_on_chi2:
         ratio = chi2_final / (chi2_target * n_data)
         if ratio > CHI2_UNREACHABLE_FACTOR:

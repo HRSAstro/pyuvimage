@@ -99,6 +99,76 @@ def test_positivity_zeroes_the_edge_as_the_framework_does(small, system):
     assert np.all(constrained >= 0)
 
 
+def test_a_warm_started_constrained_solve_reaches_the_same_optimum(small):
+    """`warm_start=True` seeds fnnls from the nearest pooled non-negative
+    solution instead of from the unconstrained sign pattern. The optimum is
+    unique, so the answer must be the cold one to solver precision, must stay
+    non-negative and keep the zero border, and -- the point of it -- the
+    delivered fit's own solve must not be touched: `warm_start` is opt-in."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 10.0, 0.5, 1.5, None)
+    )
+    cold = system.solve(H, positive=True)
+    assert system.solve_counts == {"cold": 1, "warm": 0, "warm_failed": 0}
+    # a half-decade away, seeded from the solve above
+    warm = system.solve(10.0**0.5 * H, positive=True, warm_start=True)
+    assert system.solve_counts["warm"] == 1
+    reference = fitting.build_linear_system(dataset, geom.mesh_shape).solve(
+        10.0**0.5 * H, positive=True
+    )
+    np.testing.assert_allclose(warm, reference, rtol=1e-8, atol=1e-13)
+    assert np.all(warm >= 0)
+    mesh = warm.reshape(geom.mesh_shape)
+    assert np.all(mesh[0, :] == 0) and np.all(mesh[:, -1] == 0)
+    # without the flag the pool is ignored and the solve is the framework's
+    again = system.solve(H, positive=True)
+    assert np.array_equal(again, cold)
+    assert system.solve_counts["cold"] == 2
+
+
+def test_a_seed_that_fails_falls_back_to_the_cold_solve(small, monkeypatch):
+    """A seed whose support is singular at the new strength raises inside
+    fnnls; the solve must then run the cold path and still return the framework
+    answer, and count the failure so it can be seen."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 10.0, 0.5, 1.5, None)
+    )
+    cold = system.solve(H, positive=True)
+
+    def broken(curvature_reg, seed):
+        raise np.linalg.LinAlgError("singular seed")
+
+    monkeypatch.setattr(system, "_solve_positive_seeded", broken)
+    warm = system.solve(H, positive=True, warm_start=True)
+    assert np.array_equal(warm, cold)
+    assert system.solve_counts == {"cold": 2, "warm": 0, "warm_failed": 1}
+
+
+def test_the_pool_seeds_from_the_nearest_strength(small):
+    """The seed is chosen by log10 trace(H), so a walk in half-decade steps is
+    seeded from its previous step, not from wherever the pool began."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 1.0, 0.5, 1.5, None)
+    )
+    a = system.solve(H, positive=True)
+    b = system.solve(1e3 * H, positive=True)
+    assert system._warm_seed(system._strength_key(2.0 * H)) is a
+    assert system._warm_seed(system._strength_key(500.0 * H)) is b
+    # a seed too far away misleads the active set more than it helps, so a
+    # solve six decades from anything pooled starts cold
+    assert system._warm_seed(system._strength_key(1e9 * H)) is None
+    # the pool is bounded
+    for k in range(fitting.LinearSystem.WARM_START_POOL + 5):
+        system._pool_solution(float(k), a)
+    assert len(system._constrained_pool) == fitting.LinearSystem.WARM_START_POOL
+
+
 def test_the_evidence_fails_where_the_framework_fails(small, system, caplog):
     """A singular H (the constant scheme's) raises in autoarray's Cholesky and
     `_safe_evidence` has always turned that into -inf with a log line. A trial
@@ -337,7 +407,15 @@ def test_the_prior_systematic_of_a_positive_fit_uses_the_positive_solver(small):
         unconstrained = sf.system.solve(H, positive=False)
         assert np.all(positive >= 0) and np.any(unconstrained < 0)
         want = np.asarray(ag.Array2D(values=M @ positive, mask=mask).native)
-        np.testing.assert_allclose(alt, want, rtol=0, atol=1e-15)
+        # `model_image_at_scale` seeds its solve from the pool of earlier
+        # constrained solutions, the cold solve here does not: same optimum,
+        # reached by a different active-set path, so they agree to ~1e-11
+        # relative rather than to the bit (see `LinearSystem.solve`)
+        np.testing.assert_allclose(alt, want, rtol=1e-8, atol=1e-13)
+        assert not np.allclose(
+            alt, np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native),
+            rtol=1e-6, atol=0,
+        )
         wrong = np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native)
         assert np.abs(alt - wrong).max() > 1e-6
     free = fitting.fit_dataset(
@@ -391,7 +469,7 @@ class _FakeSystem:
         self.n_pixels = n_pixels
         self.n_vis = n_vis
 
-    def trial(self, regularization, positive):
+    def trial(self, regularization, positive, warm_start=False):
         c = float(regularization.coefficient)
         self.seen.append((c, bool(positive)))
         chi2 = self.chi2_of(c, positive)
