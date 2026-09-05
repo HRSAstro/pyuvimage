@@ -238,6 +238,31 @@ def test_terms_round_trip_and_the_cache_is_reused(ragged, flat, terms, tmp_path,
     assert np.array_equal(again.kernel, terms.kernel)
 
 
+def test_reload_streams_again_and_replaces_the_cache(ragged, flat, terms, tmp_path, caplog):
+    """`--reload`: the cache is keyed on path, size and mtime, which a file
+    rewritten in place can defeat, so there has to be a way to say "read it
+    again". A poisoned cache entry must be replaced by the fresh terms."""
+    import logging
+
+    uvd, _, geom = ragged
+    _, _, _, ds = flat
+    key = stm.terms_key(uvd, geom, pool_noise=True)   # the fixture's terms are pooled
+    path = stm.terms_cache_path(tmp_path, key)
+    from dataclasses import replace
+
+    poisoned = replace(terms, kernel=0.0 * terms.kernel)
+    poisoned.save(path, key)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        fresh = stm.sparse_terms_for(uvd, geom, ds.real_space_mask, ag.TransformerDFT,
+                                     cache_dir=tmp_path, pool_noise=True, reuse_cache=False,
+                                     chunk_k=CHUNK)
+    assert "no data read this run" not in caplog.text
+    assert "streaming the visibilities once" in caplog.text
+    assert np.array_equal(fresh.kernel, terms.kernel)
+    back, _ = stm.SparseTerms.load(path)
+    assert np.array_equal(back.kernel, terms.kernel), "the cache entry was replaced"
+
+
 def test_the_key_tracks_geometry_pooling_and_source(ragged, npz_path):
     uvd, _, geom = ragged
     from dataclasses import replace
@@ -270,6 +295,104 @@ def test_run_streamed_refuses_what_it_cannot_do_yet(ragged, kwargs, exc):
     uvd, _, _ = ragged
     with pytest.raises(exc):
         api.run_streamed(uvd, fov=3.0, write=False, **kwargs)
+
+
+# --- streaming="auto": the default, and when it holds back ---------------------
+
+def test_auto_streams_a_file_on_the_mfs_sparse_path(npz_path, monkeypatch, caplog):
+    """The default. A dataset on disk, MFS, sparse available, no points, no
+    recentring: stream, and hand back the header so it is not scanned twice."""
+    import logging
+    from pyuvimage import api
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    monkeypatch.setattr(fitting, "SPARSE_AUTO_MIN_VISIBILITIES", 1)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        stream, header = api.resolve_streaming("auto", str(npz_path))
+    assert stream is True
+    assert header is not None and header.n_samples > 0
+    assert "streaming auto -> streamed" in caplog.text
+
+
+@pytest.mark.parametrize("kwargs, why", [
+    (dict(mode="cube"), "cube mode"),
+    (dict(point_sources=True), "point components"),
+    (dict(image_centre="auto"), "recentring"),
+    (dict(image_centre=(1.0, 0.0)), "recentring"),
+    (dict(inversion="dense"), "dense"),
+])
+def test_auto_holds_the_data_where_streaming_is_not_supported(
+    npz_path, monkeypatch, caplog, kwargs, why
+):
+    """Under `auto` an unsupported combination is a reason to run in memory,
+    logged -- not a refusal. Refusing is what naming `--streaming` buys."""
+    import logging
+    from pyuvimage import api
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        stream, header = api.resolve_streaming("auto", str(npz_path), **kwargs)
+    assert stream is False and header is None
+    assert "streaming auto -> in memory" in caplog.text
+    assert why in caplog.text
+
+
+def test_auto_holds_an_in_memory_dataset_and_a_small_file(ragged, npz_path, monkeypatch, caplog):
+    import logging
+    from pyuvimage import api
+
+    uvd, _, _ = ragged
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        assert api.resolve_streaming("auto", uvd) == (False, None)
+        assert "already in memory" in caplog.text
+        # the same visibility threshold `resolve_inversion` applies under auto
+        monkeypatch.setattr(fitting, "SPARSE_AUTO_MIN_VISIBILITIES", 10**9)
+        assert api.resolve_streaming("auto", str(npz_path)) == (False, None)
+        assert "below the" in caplog.text
+        # ...unless sparse was asked for by name
+        stream, _ = api.resolve_streaming("auto", str(npz_path), inversion="sparse")
+        assert stream is True
+
+
+def test_auto_holds_without_jax(npz_path, monkeypatch):
+    from pyuvimage import api
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: "no JAX here")
+    assert api.resolve_streaming("auto", str(npz_path)) == (False, None)
+
+
+def test_explicit_streaming_is_the_users_word(ragged):
+    from pyuvimage import api
+
+    uvd, _, _ = ragged
+    assert api.resolve_streaming(True, uvd, mode="cube") == (True, None)
+    assert api.resolve_streaming(False, "some/file.npz") == (False, None)
+    with pytest.raises(ValueError, match="unknown streaming"):
+        api.resolve_streaming("maybe", uvd)
+    with pytest.raises(ValueError, match="unknown inversion"):
+        api.resolve_streaming("auto", "some/file.npz", inversion="wtilde")
+
+
+def test_the_cli_defaults_to_auto_and_has_both_switches(monkeypatch):
+    """`--streaming` and `--no-streaming` are the two words; nothing said
+    means `auto`. `--reload` rides along as a plain flag."""
+    from pyuvimage import api, cli
+
+    seen = []
+    monkeypatch.setattr(api, "run", lambda *a, **k: seen.append(k))
+    base = ["fit", "d.npz", "--fov", "1"]
+    for extra, streaming, reload in (
+        ([], "auto", False),
+        (["--streaming"], True, False),
+        (["--no-streaming"], False, False),
+        (["--reload"], "auto", True),
+        (["--streaming", "--reload"], True, True),
+    ):
+        cli.main(base + extra)
+        got = seen[-1]["streaming"]
+        assert got is streaming if isinstance(streaming, bool) else got == "auto"
+        assert seen[-1]["reload"] is reload
 
 
 # --- JAX-only: the fit itself ----------------------------------------------------

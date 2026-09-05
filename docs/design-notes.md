@@ -385,8 +385,10 @@ where holding the data would have grown 4×. The cost moves to time — one
 pass through every sample, ~60 µs each with a DFT per chunk on the 2-core
 container. What is not streamed yet: cube mode (one kernel per channel, a
 loop over this), point components (dense-only anyway), recentring (a
-chunk-local phase ramp, unwired). MFS + sparse, opt-in with
-`run(..., streaming=True)`.
+chunk-local phase ramp, unwired). MFS + sparse; the default
+(`streaming="auto"`) wherever those hold and the dataset is a file, in memory
+otherwise with the reason logged; `--no-streaming` and `--reload` are the two
+overrides.
 
 So the field of view is the expensive parameter, quadratically. Which is why
 `--image-centre` matters: both of these sources sit 3–4″ off the phase centre,

@@ -322,11 +322,15 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 | | limited by | Ruby at 200 GHz (148k samples, 26×26 mesh) |
 |---|---|---|
 | **sparse** (≥5000 vis) | `--mesh`, as `n_mesh²` — plus ~136 B per visibility just to hold the data | ~1.1 GB; the inversion is independent of visibility count, the dataset is not |
-| **sparse, streamed** (`streaming=True`, experimental) | `--mesh` only: the data are read once in chunks and never held | the model's ~1 GB whatever the visibility count |
+| **sparse, streamed** (the default for a file on disk, MFS, ≥5000 vis) | `--mesh` only: the data are read once in chunks and never held | the model's ~1 GB whatever the visibility count |
 | **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
 
-The streamed variant (`--streaming`, or `pyuvimage.run(..., streaming=True)`;
-MFS and sparse only, no point components or recentring yet) accumulates the w-tilde kernel,
+The streamed variant (`streaming="auto"`, the default: taken whenever the
+dataset is a file, the mode is MFS, the inversion is sparse and there are no
+point components or recentring — `--no-streaming` holds the data in memory
+instead, `--streaming` refuses an unsupported combination rather than falling
+back, and `--reload` re-reads a file whose cached terms should not be trusted)
+accumulates the w-tilde kernel,
 the dirty images and the χ² constants in one pass over the file, caches them
 beside the output, and fits on those alone — every quantity the fit and the
 products need is a sum over visibilities, including the residual map, which

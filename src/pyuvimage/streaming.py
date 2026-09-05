@@ -593,11 +593,17 @@ def sparse_terms_for(
     use_jax: bool = False,
     mask_shape: str = "square",
     pool_noise: bool = False,
+    reuse_cache: bool = True,
 ) -> SparseTerms:
-    """The terms for `source`, from the cache when it has them, else one pass."""
+    """The terms for `source`, from the cache when it has them, else one pass.
+
+    `reuse_cache=False` streams again regardless and overwrites the entry --
+    the cache is keyed on path, size and mtime, which a file rewritten in
+    place with the same size can defeat.
+    """
     key = terms_key(source, geometry, mask_shape, pool_noise)
     path = terms_cache_path(cache_dir, key)
-    if path is not None and path.exists():
+    if reuse_cache and path is not None and path.exists():
         try:
             terms, stored = SparseTerms.load(path)
             if stored == key and terms.shape_native == tuple(int(s) for s in geometry.shape_native):

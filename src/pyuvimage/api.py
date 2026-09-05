@@ -69,6 +69,99 @@ class RunResult:
         return self.products[0].rms
 
 
+#: `image_centre` values that mean "the phase centre" -- the only place the
+#: streaming path can fit yet
+_PHASE_CENTRE = ("0,0", "centre", (0.0, 0.0), (0, 0))
+
+
+def resolve_streaming(
+    streaming,
+    dataset,
+    *,
+    mode: str = "mfs",
+    inversion: str = "auto",
+    point_sources=False,
+    image_centre="0,0",
+    chunk_k: int | None = None,
+):
+    """Turn `streaming="auto"` into a decision, and say why.
+
+    Returns ``(stream, header)``: whether to run `run_streamed`, and -- when
+    the decision needed the file's header -- the `StreamHeader` already
+    scanned, so `run_streamed` does not read it twice.
+
+    `auto` streams whenever streaming can give the same answer as the
+    in-memory path, which since parity was established on JAX is every case
+    `run_streamed` supports: a dataset on disk (an in-memory UVData is
+    already held, so there is nothing to save), MFS, no point components, the
+    image centred on the phase centre, and the sparse inversion -- which
+    under `inversion="auto"` means the same visibility threshold
+    `resolve_inversion` applies, so a small dataset still takes the dense
+    path it always did. Each `auto` that does not stream logs its reason.
+
+    True and False are the user's word: True hands an unsupported
+    combination to `run_streamed`, which refuses it rather than
+    approximating; False is the in-memory path whatever the data.
+    """
+    if streaming is True or streaming is False:
+        return bool(streaming), None
+    if streaming != "auto":
+        raise ValueError(
+            f"unknown streaming {streaming!r}: 'auto', True or False"
+        )
+    if inversion not in ("auto", "dense", "sparse"):
+        # the same refusal `resolve_inversion` gives, before a file is read
+        raise ValueError(
+            f"unknown inversion {inversion!r}: 'auto', 'dense' or 'sparse'"
+        )
+
+    def _hold(why):
+        logger.info("streaming auto -> in memory: %s", why)
+        return False, None
+
+    if not isinstance(dataset, (str, Path)):
+        return _hold(
+            "the dataset is already in memory, so streaming it would save "
+            "nothing"
+        )
+    if mode != "mfs":
+        return _hold("cube mode is not streamed yet (one kernel per channel)")
+    if point_sources:
+        return _hold(
+            "point components need the dense mapping matrix, which the "
+            "streaming (sparse) path never forms"
+        )
+    if image_centre not in _PHASE_CENTRE:
+        return _hold(
+            "recentring is not streamed yet; the fit runs in memory at "
+            f"image_centre={image_centre!r}"
+        )
+    if inversion == "dense":
+        return _hold("--inversion dense was asked for")
+    reason = fitting.sparse_inversion_diagnosis()
+    if reason is not None:
+        return _hold(reason)
+    from . import streaming as stm
+
+    header = stm.scan_header(dataset, int(chunk_k or stm.STREAM_CHUNK_K))
+    if (
+        inversion == "auto"
+        and header.n_samples < fitting.SPARSE_AUTO_MIN_VISIBILITIES
+    ):
+        return _hold(
+            f"only {header.n_samples} visibilities, below the "
+            f"{fitting.SPARSE_AUTO_MIN_VISIBILITIES} at which the w-tilde path "
+            "pays for its kernel build, so the dense in-memory path is used. "
+            "Pass --streaming (or --inversion sparse) to stream anyway"
+        )
+    logger.info(
+        "streaming auto -> streamed: %d visibilities on the MFS sparse path, "
+        "read once and never held. Pass --no-streaming for the in-memory path.",
+        header.n_samples,
+    )
+    return True, header
+
+
 def run(
     dataset: str | Path | UVData,
     fov: float,
@@ -104,8 +197,9 @@ def run(
     max_points: int = 5,
     point_retune: bool = True,
     write: bool = True,
-    streaming: bool = False,
+    streaming: bool | str = "auto",
     chunk_k: int | None = None,
+    reload: bool = False,
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -166,16 +260,29 @@ def run(
             chi^2 constants are accumulated in one pass (and cached), and the
             fit runs on them alone. Memory then does not depend on the number
             of visibilities at all -- a 200-million-sample MFS cube fits in
-            about a gigabyte. MFS + sparse only, no point components and no
-            recentring yet; see `run_streamed`.
+            about a gigabyte. "auto" (default) streams whenever the run can be
+            streamed -- a dataset on disk, MFS, the sparse inversion, no point
+            components, no recentring -- and otherwise holds the data as
+            before, saying which and why (`resolve_streaming`). True refuses
+            an unsupported combination rather than falling back; False is
+            the in-memory path regardless. See `run_streamed`.
         chunk_k: visibilities per streamed chunk (streaming only).
+        reload: read the visibilities again even when the streamed terms (or
+            the w-tilde kernel) for this file and geometry are cached, and
+            replace the cache. The cache is keyed on the file's path, size
+            and modification time, so this is for a file rewritten in place
+            with both unchanged, or for ruling the cache out.
     """
     from ._jax_guard import report_if_disabled
 
     report_if_disabled()
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
-    if streaming:
+    stream, header = resolve_streaming(
+        streaming, dataset, mode=mode, inversion=inversion,
+        point_sources=point_sources, image_centre=image_centre, chunk_k=chunk_k,
+    )
+    if stream:
         return run_streamed(
             dataset, fov, out=out, pixel_scale=pixel_scale, mesh_shape=mesh_shape,
             reg=reg, coefficient=coefficient, reg_scale=reg_scale, nu=nu,
@@ -187,7 +294,8 @@ def run(
             pb_correction=pb_correction, dish_diameter=dish_diameter,
             pb_factor=pb_factor, uncertainty_map=uncertainty_map, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
-            point_sources=point_sources, chunk_k=chunk_k,
+            point_sources=point_sources, chunk_k=chunk_k, reload=reload,
+            header=header,
         )
     uvd = (
         dataset
@@ -457,6 +565,7 @@ def run(
     if inversion == "sparse":
         mfs_dataset = fitting.with_sparse_operator(
             mfs_dataset, uv, n, geometry, cache_dir=kernel_cache_dir,
+            reuse_cache=not reload,
         )
     logger.info("fitting MFS image (%d visibility samples)...", len(d))
     # The natural correlation length of a Gaussian-process source prior is
@@ -802,6 +911,7 @@ def run(
                 # their own and the cache needs no channel index.
                 ds_c = fitting.with_sparse_operator(
                     ds_c, uv_c, n_c, geometry, cache_dir=kernel_cache_dir,
+                    reuse_cache=not reload,
                 )
             sf = fitting.fit_dataset(
                 ds_c, geometry, reg_kind=reg, prior=frozen,
@@ -856,6 +966,9 @@ def run(
         channel_chi2_per_datum=channel_chi2 if mode == "cube" else None,
         transformer_requested=transformer,
     )
+    # the record says which path ran; `run_streamed` writes a dict here
+    parameters["streaming"] = False
+    parameters["reload"] = bool(reload)
     written = {}
     if write:
         written = write_products(
@@ -901,6 +1014,8 @@ def run_streamed(
     point_sources=False,
     chunk_k: int | None = None,
     use_jax_kernel: bool = False,
+    reload: bool = False,
+    header=None,
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
 
@@ -922,7 +1037,10 @@ def run_streamed(
 
     `use_jax_kernel` hands the per-chunk kernel accumulation to autoarray's
     JAX backend; the default NumPy backend is bit-identical to the in-memory
-    build, which is what the equivalence tests check.
+    build, which is what the equivalence tests check. `reload` streams the
+    file again even when its terms are cached, and replaces the cache;
+    `header` is a `StreamHeader` already scanned by `resolve_streaming`, so
+    the flags are not read twice.
     """
     from . import streaming as stm
     from .uvdata import describe_pooling, reim_asymmetry
@@ -948,7 +1066,8 @@ def run_streamed(
     chunk_k = int(chunk_k or stm.STREAM_CHUNK_K)
 
     # ---- the header: everything but the data --------------------------
-    header = stm.scan_header(dataset, chunk_k)
+    if header is None:
+        header = stm.scan_header(dataset, chunk_k)
     if header.n_spw > 1:
         logger.info(
             "dataset: %d spectral windows, %d channels and %d samples in "
@@ -1018,10 +1137,13 @@ def run_streamed(
         "path they are not, and the resident total is the model's terms plus "
         "one chunk of %d", header.n_samples, chunk_k,
     )
+    if reload:
+        logger.info("--reload: the visibilities are streamed again whether or "
+                    "not their terms are cached")
     terms = stm.sparse_terms_for(
         dataset, geometry, mask, chunk_transformer, cache_dir=kernel_cache_dir,
         chunk_k=chunk_k, use_jax=use_jax_kernel, mask_shape=mask_shape,
-        pool_noise=pool,
+        pool_noise=pool, reuse_cache=not reload,
     )
     if terms.n_vis:
         mean_asym = terms.reim_asymmetry_sum / terms.n_vis
@@ -1107,7 +1229,7 @@ def run_streamed(
     )
     parameters["streaming"] = {
         "chunk_k": chunk_k, "n_visibilities_streamed": int(terms.n_vis),
-        "seconds_streaming": float(terms.seconds),
+        "seconds_streaming": float(terms.seconds), "reload": bool(reload),
         "terms_cache": str(kernel_cache_dir) if kernel_cache_dir else None,
         "noise_pooled": bool(pool),
     }

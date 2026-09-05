@@ -1618,8 +1618,12 @@ def with_sparse_operator(
     cache_dir=None,
     chunk_k: int | None = None,
     batch_size: int = SPARSE_BATCH_SIZE,
+    reuse_cache: bool = True,
 ):
     """Attach the w-tilde operator, building or reusing its kernel.
+
+    `reuse_cache=False` rebuilds the kernel even when one is cached under
+    this key, and replaces it.
 
     The kernel depends only on the uv coverage, the noise and the geometry --
     never on the data values or the source prior -- so it is the one expensive
@@ -1670,7 +1674,7 @@ def with_sparse_operator(
     key = sparse_kernel_key(uv_wavelengths, noise, geometry)
     path = sparse_kernel_cache_path(cache_dir, key)
     kernel = None
-    if path is not None and path.exists():
+    if reuse_cache and path is not None and path.exists():
         try:
             kernel = np.load(path)
             logger.info("reusing the cached w-tilde kernel %s", path.name)
