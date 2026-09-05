@@ -96,9 +96,18 @@ def test_splitting_a_dataset_into_spws_changes_nothing():
     rb = pyuvimage.run(split, fov=3.0, mesh_shape=(16, 16),
                        uncertainty_map=False, write=False)
     pa, pb = ra.products[0], rb.products[0]
-    assert pa.chi_squared == pytest.approx(pb.chi_squared, rel=1e-12)
-    assert np.array_equal(np.nan_to_num(pa.model_image),
-                          np.nan_to_num(pb.model_image))
+    # The samples above are compared bit for bit, because producing the same
+    # samples in the same order *is* the multi-spw code's job. The fits are
+    # not: two runs on identical inputs are bit-reproducible on Linux/OpenBLAS
+    # and not on macOS/Accelerate, whose threaded reductions can order
+    # themselves differently between two otherwise identical calls (the
+    # constant-scheme NNLS test hit the same thing). 1e-10 relative is far
+    # below anything the multi-spw path could plausibly change and far above
+    # what a BLAS reordering does.
+    assert pa.chi_squared == pytest.approx(pb.chi_squared, rel=1e-10)
+    a_img, b_img = np.nan_to_num(pa.model_image), np.nan_to_num(pb.model_image)
+    np.testing.assert_allclose(a_img, b_img, rtol=1e-10,
+                               atol=1e-10 * np.abs(b_img).max())
 
 
 def test_round_trip_on_disk(multi, tmp_path):
