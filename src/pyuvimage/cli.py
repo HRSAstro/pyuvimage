@@ -288,6 +288,40 @@ def main(argv: list[str] | None = None) -> int:
         "step -- the same trick as CASA's cfcache",
     )
     p_fit.add_argument(
+        "--streaming", dest="streaming", action="store_const", const=True,
+        default="auto",
+        help="read the visibilities once, in chunks, and hold nothing per "
+        "visibility: the w-tilde kernel, the dirty images and the chi^2 "
+        "constants are accumulated in one pass (cached beside the output, or "
+        "in --kernel-cache) and the fit runs on them alone, so memory does "
+        "not depend on the number of visibilities -- a 200-million-sample "
+        "MFS cube fits in about a gigabyte. The cost is time: one pass over "
+        "every sample, and a cached re-fit reads none. This is the DEFAULT "
+        "whenever it applies (a dataset on disk, the sparse inversion, no "
+        "--point-sources); cube mode and --image-centre stream too. Naming it "
+        "makes an unsupported combination refuse rather than fall back to the "
+        "in-memory path",
+    )
+    p_fit.add_argument(
+        "--no-streaming", dest="streaming", action="store_const", const=False,
+        help="hold the visibilities in memory for the whole run (the path "
+        "every result before 2026-09 came from)",
+    )
+    p_fit.add_argument(
+        "--reload", action="store_true",
+        help="read the visibilities again even when the w-tilde terms (or "
+        "kernel) for this file and geometry are already cached, and replace "
+        "the cache. The cache is keyed on the file's path, size and "
+        "modification time, so this is only needed when a file was rewritten "
+        "in place with the same size and mtime, or to rule the cache out",
+    )
+    p_fit.add_argument(
+        "--chunk-k", type=int, default=None, metavar="N",
+        help="streaming only: visibilities per chunk (default 4096). "
+        "Larger is faster and uses more memory per chunk; the per-chunk DFT "
+        "is n_image_pixels x N complex",
+    )
+    p_fit.add_argument(
         "--cube-prior", default="channel", choices=["channel", "mfs"],
         help="cube mode only: what the shared prior is fitted on. channel "
         "(default) uses a random 1-in-n_chan subset -- the same amount of "
@@ -441,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
             cube_prior=args.cube_prior,
             inversion=args.inversion,
             kernel_cache=args.kernel_cache,
+            streaming=args.streaming,
+            chunk_k=args.chunk_k,
+            reload=args.reload,
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
             enforce_positive=args.enforce_positive,

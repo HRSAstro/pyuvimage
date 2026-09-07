@@ -1618,8 +1618,12 @@ def with_sparse_operator(
     cache_dir=None,
     chunk_k: int | None = None,
     batch_size: int = SPARSE_BATCH_SIZE,
+    reuse_cache: bool = True,
 ):
     """Attach the w-tilde operator, building or reusing its kernel.
+
+    `reuse_cache=False` rebuilds the kernel even when one is cached under
+    this key, and replaces it.
 
     The kernel depends only on the uv coverage, the noise and the geometry --
     never on the data values or the source prior -- so it is the one expensive
@@ -1670,7 +1674,7 @@ def with_sparse_operator(
     key = sparse_kernel_key(uv_wavelengths, noise, geometry)
     path = sparse_kernel_cache_path(cache_dir, key)
     kernel = None
-    if path is not None and path.exists():
+    if reuse_cache and path is not None and path.exists():
         try:
             kernel = np.load(path)
             logger.info("reusing the cached w-tilde kernel %s", path.name)
@@ -1941,6 +1945,22 @@ def repair_sparse_dirty_image(sparse_dataset, dataset, tolerance: float = 1e-6):
     return sparse_dataset
 
 
+def make_mask(geometry: ImageGeometry, mask_shape: str = "square"):
+    """The real-space mask a dataset (or a streamed stub) is built on."""
+    if mask_shape == "square":
+        return ag.Mask2D.all_false(
+            shape_native=geometry.shape_native,
+            pixel_scales=geometry.pixel_scale,
+        )
+    if mask_shape == "circular":
+        return ag.Mask2D.circular(
+            shape_native=geometry.shape_native,
+            pixel_scales=geometry.pixel_scale,
+            radius=geometry.mask_radius * 1.001,  # keep boundary pixels
+        )
+    raise ValueError("mask_shape must be 'square' or 'circular'")
+
+
 def make_dataset(
     uv_wavelengths: np.ndarray,
     data: np.ndarray,
@@ -1957,19 +1977,7 @@ def make_dataset(
     their value -- which showed up as bright spurious blobs in the corners of
     the restored image, carrying ~29% of the source flux on one test mock.
     """
-    if mask_shape == "square":
-        mask = ag.Mask2D.all_false(
-            shape_native=geometry.shape_native,
-            pixel_scales=geometry.pixel_scale,
-        )
-    elif mask_shape == "circular":
-        mask = ag.Mask2D.circular(
-            shape_native=geometry.shape_native,
-            pixel_scales=geometry.pixel_scale,
-            radius=geometry.mask_radius * 1.001,  # keep boundary pixels
-        )
-    else:
-        raise ValueError("mask_shape must be 'square' or 'circular'")
+    mask = make_mask(geometry, mask_shape)
     cls = resolve_transformer(
         n_vis=len(data),
         transformer=transformer,
@@ -2156,6 +2164,50 @@ class Trial:
     regularization_matrix: np.ndarray = field(repr=False)
 
 
+#: Attribute a stub dataset carries when the fit was fed from streamed terms
+#: (`streaming.stub_dataset_from_terms`). Everything that would otherwise read
+#: the data or noise arrays -- the visibility count, d^T N^-1 d, the noise
+#: normalisation -- reads the terms instead; the stub's own eight visibilities
+#: exist only because autoarray's `Interferometer` constructor wants some.
+STREAMED_TERMS_ATTR = "pyuvimage_streamed_terms"
+
+
+def streamed_terms_of(dataset):
+    """The `streaming.SparseTerms` a dataset was built from, or None."""
+    return getattr(dataset, STREAMED_TERMS_ATTR, None) if dataset is not None else None
+
+
+def imager_for(dataset):
+    """A dirty imager for `dataset`, whichever way the data are held.
+
+    A stub built from streamed terms has eight placeholder visibilities;
+    imaging *them* would give a beam and rms of nothing. The kernel imager
+    carries the accumulated beam, data dirty image and sum of weights
+    instead, and images a model through the w-tilde kernel.
+    """
+    terms = streamed_terms_of(dataset)
+    if terms is not None:
+        from .streaming import KernelDirtyImager
+
+        imager = KernelDirtyImager(terms, dataset.real_space_mask)
+        imager.dataset = dataset
+        return imager
+    return DirtyImager(dataset)
+
+
+def n_data_of(dataset) -> int:
+    """Real plus imaginary parts of every visibility the fit describes.
+
+    On the streaming path the dataset object is a stub and the count comes
+    from the terms; getting this wrong makes the discrepancy criterion aim
+    chi^2 at the stub's sixteen numbers instead of the data's hundred million.
+    """
+    terms = streamed_terms_of(dataset)
+    if terms is not None:
+        return int(2 * terms.n_vis)
+    return int(2 * len(np.asarray(dataset.data)))
+
+
 class LinearSystem:
     """F, D and the constant terms of one (dataset, mesh), solved per prior.
 
@@ -2229,12 +2281,19 @@ class LinearSystem:
         keep = None
         if settings.use_edge_zeroed_pixels and inversion.has(cls=Mapper):
             keep = np.asarray(inversion.zeroed_ids_to_keep)
-        data = inversion.dataset.data.array
-        noise = inversion.dataset.noise_map.array
-        # the same expression `fast_chi_squared` evaluates, on the same arrays
-        data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
-            data.imag**2.0 / noise.imag**2.0
-        )
+        terms = streamed_terms_of(dataset) or streamed_terms_of(inversion.dataset)
+        if terms is not None:
+            # the dataset is a stub; the constants were accumulated in the
+            # streaming pass, on the same expressions, over every visibility
+            data_term = float(terms.data_term)
+            noise_normalization = float(terms.noise_normalization)
+        else:
+            data = inversion.dataset.data.array
+            noise = inversion.dataset.noise_map.array
+            # the same expression `fast_chi_squared` evaluates, on the same arrays
+            data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
+                data.imag**2.0 / noise.imag**2.0
+            )
         return cls(
             F=inversion.curvature_matrix,
             D=inversion.data_vector,
@@ -2262,9 +2321,9 @@ class LinearSystem:
     @property
     def n_data(self) -> int:
         """Real plus imaginary parts: two data points per visibility."""
-        return int(2 * self.D.shape[0]) if self.dataset is None else int(
-            2 * len(np.asarray(self.dataset.data))
-        )
+        if self.dataset is None:
+            return int(2 * self.D.shape[0])
+        return n_data_of(self.dataset)
 
     def regularization_matrix(self, regularization) -> np.ndarray:
         """H for a regularisation scheme, exactly as the inversion forms it.
@@ -2281,7 +2340,13 @@ class LinearSystem:
             )
         )
 
-    def solve(self, H: np.ndarray, positive: bool) -> np.ndarray:
+    #: how many constrained solutions are kept as warm-start seeds; each is
+    #: one n_mesh vector, so this is kilobytes
+    WARM_START_POOL = 64
+
+    def solve(
+        self, H: np.ndarray, positive: bool, warm_start: bool = False
+    ) -> np.ndarray:
         """s = (F + H)^-1 D, unconstrained or non-negative.
 
         The two solver functions are autoarray's own
@@ -2291,6 +2356,34 @@ class LinearSystem:
         prior are the same solve. Both raise on failure -- a `LinAlgError` for
         a singular unconstrained system, an `InversionException` from the
         non-negative solver -- and the caller decides what a failed trial means.
+
+        **Warm starts.** The non-negative solve is an active-set iteration
+        (Bro & de Jong's fnnls, on a Cholesky factor it updates in place), and
+        its cost is the number of times the active set changes on the way from
+        its starting guess to the answer. Autoarray starts it from the sign of
+        the unconstrained solution, which on a real field -- half the mesh
+        empty sky, so half the unconstrained pixels negative -- is a poor
+        guess: on a 50x50 mesh one solve takes 20-40 s against 0.3 s
+        unconstrained, and a fit makes a dozen or more of them. The optimum,
+        however, is unique (F + H is positive definite) and its support moves
+        slowly with the prior's strength, so a solve seeded from the support
+        of a *previous* constrained solution at a nearby strength converges in
+        a few iterations: measured 0.2-4 s for half-decade steps, agreeing
+        with the cold solve to ~1e-11 relative, and 0.2 s across *priors* at
+        the same weak strength (the second adaptive pass's reachability probe
+        seeded from the first pass's). Every constrained solution this system
+        produces is pooled, and `warm_start=True` seeds from the one whose
+        strength -- log10 trace(H), a scalar that scales with the coefficient
+        and is comparable across priors -- is nearest. A seed that fails
+        (its support singular at the new strength, which a jump from a strong
+        prior to a weak one can do) costs milliseconds and falls back to the
+        cold path, so a warm start is never slower than the framework's solve
+        by more than that.
+
+        `warm_start` is off by default because the seed changes the last bits
+        of the answer, and a `Trial` is meant to be the framework fit to the
+        bit. The searches, probes and the systematic-window walk opt in: they
+        ask where chi^2 or the model sits, and 1e-11 is not a place.
         """
         from autoarray.inversion.inversion import inversion_util
 
@@ -2299,15 +2392,101 @@ class LinearSystem:
             return inversion_util.reconstruction_positive_negative_from(
                 data_vector=self.D, curvature_reg_matrix=curvature_reg, xp=np
             )
+        key = self._strength_key(H)
+        counts = self.__dict__.setdefault(
+            "solve_counts", {"cold": 0, "warm": 0, "warm_failed": 0}
+        )
+        if warm_start:
+            seed = self._warm_seed(key)
+            if seed is not None:
+                try:
+                    reconstruction = self._solve_positive_seeded(
+                        curvature_reg, seed
+                    )
+                except (RuntimeError, np.linalg.LinAlgError, ValueError):
+                    counts["warm_failed"] += 1
+                else:
+                    counts["warm"] += 1
+                    self._pool_solution(key, reconstruction)
+                    return reconstruction
         if self.keep is None:
-            return inversion_util.reconstruction_positive_only_from(
+            reconstruction = inversion_util.reconstruction_positive_only_from(
                 data_vector=self.D, curvature_reg_matrix=curvature_reg,
                 settings=self.settings, xp=np,
             )
-        partial = inversion_util.reconstruction_positive_only_from(
-            data_vector=self.D[self.keep],
-            curvature_reg_matrix=curvature_reg[self.keep][:, self.keep],
-            settings=self.settings, xp=np,
+        else:
+            partial = inversion_util.reconstruction_positive_only_from(
+                data_vector=self.D[self.keep],
+                curvature_reg_matrix=curvature_reg[self.keep][:, self.keep],
+                settings=self.settings, xp=np,
+            )
+            reconstruction = np.zeros(self.D.shape[0])
+            reconstruction[self.keep] = partial
+        counts["cold"] += 1
+        self._pool_solution(key, reconstruction)
+        return reconstruction
+
+    # -- warm-start pool ------------------------------------------------
+    @staticmethod
+    def _strength_key(H: np.ndarray) -> float:
+        """log10 trace(H): the prior's strength on one scalar, across priors."""
+        trace = float(np.trace(H))
+        return float(np.log10(trace)) if trace > 0 else -np.inf
+
+    #: how far (in dex of trace(H)) a pooled solution may be from the strength
+    #: asked for and still be used as a seed. Measured on a 50x50 mesh: a seed
+    #: half a decade away converges in 0.2-4 s and one a decade away in ~4 s,
+    #: where the cold solve takes 20-40 s; three decades away it is about the
+    #: cold time; eighteen decades away it took 60 s where the cold solve
+    #: took 7. On J0116 a 3-dex cap let two far seeds in and the three-solve
+    #: solver check took 18 minutes -- a seed from the wrong regime leads the
+    #: active set through more changes than the unconstrained signs do. One
+    #: decade covers everything that gains: the half-decade window walk, the
+    #: re-bisection's midpoints, and the same strength under another prior.
+    WARM_START_MAX_DEX = 1.0
+
+    def _warm_seed(self, key: float) -> np.ndarray | None:
+        pool = self.__dict__.get("_constrained_pool")
+        if not pool:
+            return None
+        nearest, seed = min(pool, key=lambda entry: abs(entry[0] - key))
+        if abs(nearest - key) > self.WARM_START_MAX_DEX:
+            return None
+        return seed
+
+    def remember_constrained(self, H: np.ndarray, reconstruction: np.ndarray) -> None:
+        """Offer a non-negative solution solved elsewhere as a warm-start seed.
+
+        The delivered fit is the framework's own solve, made outside this
+        class; the systematic-window walk starts from it, and the walk's first
+        step is a half-decade away from it.
+        """
+        self._pool_solution(self._strength_key(H), reconstruction)
+
+    def _pool_solution(self, key: float, reconstruction: np.ndarray) -> None:
+        pool = self.__dict__.setdefault("_constrained_pool", [])
+        pool.append((key, np.asarray(reconstruction)))
+        del pool[: max(0, len(pool) - self.WARM_START_POOL)]
+
+    def _solve_positive_seeded(
+        self, curvature_reg: np.ndarray, seed: np.ndarray
+    ) -> np.ndarray:
+        """Autoarray's fnnls, started from the support of `seed`.
+
+        The same function the framework calls (`fnnls_cholesky`), with
+        `P_initial` set from the seed instead of from the unconstrained
+        solution. Raises what fnnls raises; `solve` falls back to the cold
+        path on any of it.
+        """
+        from autoarray.util.fnnls import fnnls_cholesky
+
+        if self.keep is None:
+            return fnnls_cholesky(
+                curvature_reg, self.D, P_initial=np.asarray(seed) > 0
+            )
+        partial = fnnls_cholesky(
+            curvature_reg[self.keep][:, self.keep], self.D[self.keep],
+            P_initial=np.asarray(seed)[self.keep] > 0,
         )
         reconstruction = np.zeros(self.D.shape[0])
         reconstruction[self.keep] = partial
@@ -2342,10 +2521,12 @@ class LinearSystem:
             )
         )
 
-    def trial(self, regularization, positive: bool) -> Trial:
-        """Solve at one prior and score it."""
+    def trial(
+        self, regularization, positive: bool, warm_start: bool = False
+    ) -> Trial:
+        """Solve at one prior and score it (`warm_start`: see `solve`)."""
         H = self.regularization_matrix(regularization)
-        s = self.solve(H, positive=positive)
+        s = self.solve(H, positive=positive, warm_start=warm_start)
         chi2 = self.chi_squared(s)
         try:
             ev = self.log_evidence(s, H)
@@ -2393,6 +2574,12 @@ class LinearSystem:
         does; there is no A_t to cache and one NUFFT of one image is the cost
         the path is designed around.
         """
+        if streamed_terms_of(self.dataset) is not None:
+            raise RuntimeError(
+                "no visibilities are held on the streaming path, so there are "
+                "no model visibilities to form; the products use the w-tilde "
+                "kernel instead (`residual_dirty_image`)"
+            )
         s = np.asarray(reconstruction)
         A_t = self.operated_mapping_matrix
         if A_t is not None:
@@ -2411,6 +2598,29 @@ class LinearSystem:
         return np.asarray(self.dataset.data) - self.model_visibilities(
             reconstruction
         )
+
+    def model_image_native(self, reconstruction: np.ndarray) -> np.ndarray:
+        """The mapped model on the native image grid, for the kernel."""
+        inv = self.inversion
+        if inv is None:
+            raise RuntimeError("the model image needs the template inversion's mask")
+        image = ag.Array2D(
+            values=self.mapping_matrix @ np.asarray(reconstruction), mask=inv.mask)
+        return np.asarray(image.native)
+
+    def residual_dirty_image(self, reconstruction: np.ndarray, imager) -> np.ndarray:
+        """The residual dirty image [Jy/beam], however the data are held.
+
+        Dense path: image the residual visibilities. Streaming path: there
+        are none, and there need not be -- the dirty image of the model's
+        visibilities is the w-tilde kernel applied to the model image, so the
+        residual map is dirty(data) - W~ * (M s). Same numbers, to ~1e-15 on
+        the mocks, and not one visibility touched.
+        """
+        if hasattr(imager, "dirty_image_of_model"):
+            return (imager.dirty_image_of_data()
+                    - imager.dirty_image_of_model(self.model_image_native(reconstruction)))
+        return np.asarray(imager.dirty_image(self.residual_visibilities(reconstruction)))
 
 
 def _log_det_cholesky(matrix: np.ndarray) -> float:
@@ -2549,6 +2759,11 @@ class PriorScan:
     #: uses. With positivity on this is a floor the fit cannot go below, so
     #: the discrepancy target has to respect it (see `effective_chi2_target`).
     chi2_floor: float = float("nan")
+    #: the weakest prior's constrained solution, when the probe ran on the
+    #: non-negative solver: one end of the "does the solver respond to the
+    #: prior at all" comparison, already paid for
+    floor_coefficient: float = float("nan")
+    floor_reconstruction: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def effective_criterion(self) -> str:
@@ -2685,20 +2900,31 @@ def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
     if not np.isfinite(chi2) or chi2 <= 0 or not n_data:
         return float("nan")
     try:
-        resid = system_for(fit).residual_visibilities(fit.inversion.reconstruction)
+        resid_map = system_for(fit).residual_dirty_image(
+            fit.inversion.reconstruction, imager)
     except Exception as e:  # pragma: no cover - diagnostic only
         logger.debug("structure ratio failed: %s", e)
         return float("nan")
-    return _structure_ratio(resid, chi2, imager, n_data)
+    return _structure_ratio_from_map(resid_map, chi2, imager, n_data)
 
 
 def _structure_ratio(resid: np.ndarray, chi2: float, imager, n_data: int) -> float:
     """`structure_ratio` from the residual visibilities and chi^2 themselves."""
     try:
+        resid_map = np.asarray(imager.dirty_image(resid), dtype=float)
+    except Exception as e:  # pragma: no cover - diagnostic only
+        logger.debug("structure ratio failed: %s", e)
+        return float("nan")
+    return _structure_ratio_from_map(resid_map, chi2, imager, n_data)
+
+
+def _structure_ratio_from_map(resid_map: np.ndarray, chi2: float, imager, n_data: int) -> float:
+    """`structure_ratio` from the residual dirty image [Jy/beam] itself."""
+    try:
         rms = imager.rms
         if not np.isfinite(rms) or rms <= 0:
             return float("nan")
-        resid_map = np.asarray(imager.dirty_image(resid), dtype=float) / rms
+        resid_map = np.asarray(resid_map, dtype=float) / rms
         # the transformer returns zeros outside the real-space mask, which
         # would drag the rms down; measure only where the image is defined
         inside = imager.inside
@@ -2784,7 +3010,7 @@ def optimise_prior(
     """
     mesh_shape = geometry.mesh_shape
     if n_data is None:
-        n_data = 2 * len(np.asarray(dataset.data))
+        n_data = n_data_of(dataset)
     if system is None:
         system = build_linear_system(dataset, mesh_shape)
     # a kernel prior whose correlation length is pinned has only one free
@@ -2821,7 +3047,7 @@ def optimise_prior(
 
     # The structure criterion is measured in the image plane, so it needs a
     # dirty imager; build it once and reuse it across every evaluation.
-    imager = DirtyImager(dataset) if criterion == "structure" else None
+    imager = imager_for(dataset) if criterion == "structure" else None
     # positivity changes the residual map, so the structure search has to run
     # on the solver the delivered fit uses; the other criteria stay on the
     # fast unconstrained solve (the evidence is defined for it).
@@ -2840,8 +3066,13 @@ def optimise_prior(
         return optimise_prior(dataset, geometry, **kwargs)
 
     def evaluate(
-        log_params: np.ndarray, positive: bool | None = None
+        log_params: np.ndarray, positive: bool | None = None, collect=None,
     ) -> tuple[float, float, float]:
+        """(log evidence, chi^2, structure ratio) at one point.
+
+        `collect`, a list, receives the `Trial` itself -- for the one caller
+        (the reachability probe) whose reconstruction is wanted afterwards.
+        """
         positive = search_positive if positive is None else bool(positive)
         coefficient = 10.0 ** float(log_params[0])
         scale = 10.0 ** float(log_params[1]) if kernel else fixed_scale
@@ -2849,18 +3080,22 @@ def optimise_prior(
         if second == "envelope_fwhm":
             env = {**(envelope or {}), "fwhm": 10.0 ** float(log_params[1])}
         try:
+            # a probe, not the delivered fit: constrained solves may be
+            # seeded from earlier ones (`LinearSystem.solve`)
             trial = system.trial(
                 make_regularization(reg_kind, coefficient, scale, nu, env),
-                positive=positive,
+                positive=positive, warm_start=True,
             )
             ev, chi2 = trial.log_evidence, trial.chi_squared
             ratio = (
-                _structure_ratio(
-                    system.residual_visibilities(trial.reconstruction),
+                _structure_ratio_from_map(
+                    system.residual_dirty_image(trial.reconstruction, imager),
                     chi2, imager, n_data,
                 )
                 if imager is not None else float("nan")
             )
+            if collect is not None:
+                collect.append(trial)
         except Exception as e:
             logger.debug("prior evaluation failed: %s", e)
             return -np.inf, float("nan"), float("nan")
@@ -2935,11 +3170,23 @@ def optimise_prior(
         probe = [LOG_COEFFICIENT_BOUNDS[0]]
         if two_d:
             probe.append(float(np.mean(log_scale_bounds)))
+        if positive_only:
+            logger.info(
+                "probing the weakest prior with the non-negative solver (the "
+                "slow solve of the search; a second pass seeds it from the "
+                "first)..."
+            )
+        probed: list = []
         _, chi2_weakest, ratio_weakest = evaluate(
-            np.array(probe), positive=positive_only
+            np.array(probe), positive=positive_only, collect=probed,
         )
         if not structure:
             scan.chi2_floor = chi2_weakest
+        if positive_only and probed:
+            # kept for `fit_dataset`'s solver check, which used to solve two
+            # more constrained systems to ask what this one already answers
+            scan.floor_coefficient = 10.0 ** probe[0]
+            scan.floor_reconstruction = np.asarray(probed[0].reconstruction)
         floor = ratio_weakest if structure else chi2_weakest
         hopeless = target * (1.0 if structure else CHI2_UNREACHABLE_FACTOR)
 
@@ -3334,7 +3581,7 @@ class SingleFit:
         try:
             values = self.system.solve(
                 float(factor) * self.regularization_matrix,
-                positive=bool(self.positive_only),
+                positive=bool(self.positive_only), warm_start=True,
             )
         except Exception:  # LinAlgError, InversionException
             return None
@@ -3375,18 +3622,40 @@ class SingleFit:
         H = self.regularization_matrix
         system, positive = self.system, bool(self.positive_only)
         floor = abs(min_dex)
+        started = time.perf_counter()
+        n_solves = 0
 
         def solved(dex):
+            nonlocal n_solves
+            n_solves += 1
             try:
-                return system.solve(10.0**dex * H, positive=positive)
+                # each step is seeded from the nearest solved strength -- the
+                # previous step, half a decade away -- which is what makes a
+                # constrained walk affordable (see `LinearSystem.solve`)
+                return system.solve(
+                    10.0**dex * H, positive=positive, warm_start=True
+                )
             except Exception:                   # LinAlgError, InversionException
                 return None
 
+        # The walk starts from the delivered solution, which is already in
+        # hand: solving it again cost one more constrained solve for the same
+        # numbers. Offered to the system as the seed for the first steps.
+        base = self.reconstruction
+        if positive:
+            system.remember_constrained(H, base)
         try:
-            chi2_0 = system.chi_squared(system.solve(H, positive=positive))
+            chi2_0 = system.chi_squared(base)
         except Exception:                       # pragma: no cover - singular
             return -floor, floor, []
+        if not np.isfinite(chi2_0):             # pragma: no cover - singular
+            return -floor, floor, []
         tolerance = np.sqrt(2.0 * system.n_data)
+        logger.info(
+            "measuring the prior-systematic window (%s solves in half-decade "
+            "steps, up to +/-%g dex)...",
+            "non-negative" if positive else "unconstrained", max_dex,
+        )
 
         lo = hi = 0.0
         steps: list[tuple[float, np.ndarray]] = []
@@ -3416,6 +3685,10 @@ class SingleFit:
                 values = solved(dex)
                 if values is not None:
                     steps.append((dex, values))
+        logger.info(
+            "  window %+.1f to %+.1f dex, %d solves, %.0f s",
+            lo, hi, n_solves, time.perf_counter() - started,
+        )
         return lo, hi, sorted(steps, key=lambda s: s[0])
 
     def chi2_admissible_dex(
@@ -3451,9 +3724,12 @@ class SingleFit:
         `prior_systematic` samples the steps and not just the edges -- see
         `_admissible_scan`.
 
-        Costs at most `2 * max_dex * per_dex + 1` solves of an n_mesh system
-        -- no transforms and no refit -- and only reaches that on a fit chi^2
-        barely responds to, which is the case where the answer matters.
+        Costs at most `2 * max_dex * per_dex` solves of an n_mesh system --
+        no transforms and no refit; the walk starts from the delivered
+        solution -- and only reaches that on a fit chi^2 barely responds to,
+        which is the case where the answer matters. On a non-negative fit each
+        step is seeded from the last (`LinearSystem.solve`), without which a
+        24-step constrained walk on a 50x50 mesh took a quarter of an hour.
         """
         lo, hi, _ = self._admissible_scan(max_dex, per_dex, min_dex)
         return lo, hi
@@ -3673,7 +3949,7 @@ def fit_dataset(
     to the second so F and D are built once per fit, not once per stage.
     """
     mesh_shape = geometry.mesh_shape
-    n_data = 2 * len(np.asarray(dataset.data))
+    n_data = n_data_of(dataset)
 
     # F and D once. Everything below -- the probes, the search, the
     # constrained re-bisection -- is a solve on this; only the delivered fit
@@ -3725,10 +4001,16 @@ def fit_dataset(
         )
 
     def _probe_model(coefficient, positive, prior_=None):
-        """The reconstruction itself, which is what the prior acts on."""
+        """The reconstruction itself, which is what the prior acts on.
+
+        Probes are seeded from earlier constrained solutions (`warm_start`):
+        on a 50x50 mesh that is the difference between 0.2-4 s and 20-40 s
+        per constrained solve, and this function is called a dozen times.
+        """
         try:
             return system.trial(
-                regularization_for(coefficient, prior_), positive=positive
+                regularization_for(coefficient, prior_), positive=positive,
+                warm_start=True,
             )
         except Exception:
             return None
@@ -3759,14 +4041,77 @@ def fit_dataset(
     # data's, and 1.0 can sit six decades from where the fit will actually
     # run, where "fits far worse than the unconstrained solve" says nothing
     # about the solver the delivered model will use.
+    if "envelope_fwhm" in prior:
+        envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
+    prior = dict(prior)
+    if reg_kind in KERNEL_REGULARIZATIONS:
+        prior.setdefault("nu", nu)
+
+    def _fit(coefficient: float) -> ag.FitInterferometer:
+        """The delivered fit: a real framework fit at one coefficient."""
+        fit = fit_at(
+            dataset, mesh_shape, reg_kind, coefficient,
+            positive_only=positive_only, reg_scale=prior.get("scale"),
+            nu=prior.get("nu", nu), envelope=envelope,
+        )
+        if system is not None:
+            attach_system(fit, system)
+        return fit
+
+    # The framework fit in hand: [fit, coefficient, positivity, chi^2]. Solved
+    # once and kept while nothing about it changes, because on a real field
+    # its non-negative solve is the most expensive thing this function does
+    # -- 20-40 s on a 50x50 mesh here, minutes on a laptop -- and the solver
+    # check below used to make the identical solve a second time as a probe.
+    delivered: list = []
+
+    def _delivered_at(coefficient: float) -> ag.FitInterferometer:
+        if not (
+            delivered and delivered[1] == float(coefficient)
+            and delivered[2] == bool(positive_only)
+        ):
+            logger.info(
+                "solving the delivered fit at coefficient %.4g%s...",
+                coefficient,
+                " (non-negative; this solve is not seeded)" if positive_only else "",
+            )
+            started = time.perf_counter()
+            fit = _fit(float(coefficient))
+            # the framework inversion is lazy: reading chi^2 runs the solve
+            chi2 = _chi_squared(fit)
+            logger.info(
+                "  delivered fit solved in %.0f s", time.perf_counter() - started
+            )
+            delivered[:] = [fit, float(coefficient), bool(positive_only), chi2]
+        return delivered[0]
+
+    # The constrained solution at the chosen coefficient, kept for the
+    # re-bisection gate below (which used to solve it a third time).
+    constrained_t = None
     if positive_only and needs_search:
         chosen = float(prior["coefficient"])
-        free_t = _probe_model(chosen, False, prior)
-        constrained_t = _probe_model(chosen, True, prior)
-        free = free_t.chi_squared if free_t is not None else np.nan
-        constrained = (
-            constrained_t.chi_squared if constrained_t is not None else np.nan
+        logger.info(
+            "checking the non-negative solver at coefficient %.4g (on the "
+            "delivered fit's own solve)...", chosen,
         )
+        started = time.perf_counter()
+        free_t = _probe_model(chosen, False, prior)
+        # The constrained solution at the chosen coefficient IS the delivered
+        # fit, so solve that and read it, rather than solving the same system
+        # as a probe and then again as the fit. Kept if nothing changes below.
+        fit = _delivered_at(chosen)
+        constrained_rec = np.asarray(fit.inversion.reconstruction, dtype=float)
+        constrained = delivered[3]
+        H_chosen = None
+        if isinstance(system, LinearSystem):
+            H_chosen = system.regularization_matrix(regularization_for(chosen, prior))
+            system.remember_constrained(H_chosen, constrained_rec)
+        constrained_t = Trial(
+            coefficient=chosen, positive=True, reconstruction=constrained_rec,
+            chi_squared=float(constrained), log_evidence=float("nan"),
+            regularization_matrix=H_chosen,
+        )
+        free = free_t.chi_squared if free_t is not None else np.nan
         n_vis = n_data // 2
         reason = None
         if (
@@ -3779,7 +4124,7 @@ def fit_dataset(
             )
         else:
             # Second, independent symptom: the solver *ignores* the prior.
-            # Compare two strengths twelve decades apart -- but compare the
+            # Compare two strengths many decades apart -- but compare the
             # **reconstruction**, not chi^2.
             #
             # This used to test chi^2, and that was wrong. chi^2 being
@@ -3795,16 +4140,56 @@ def fit_dataset(
             # solution, so measure that. A solver that is genuinely ignoring
             # the prior returns the same model at both ends; a working one
             # cannot.
-            change = _model_response(
-                lambda c: system.trial(regularization_for(c, prior), positive=True),
-                1e-3, 1e9,
-            )
+            #
+            # The two ends used to be fresh solves at 1e-3 and 1e9 -- two
+            # more constrained solves, and on J0116 the three together took
+            # 18 minutes. The search already solved the weakest prior on this
+            # solver (its reachability probe), and the chosen coefficient is
+            # in hand, so when those sit three or more decades apart they are
+            # the two ends and the check costs one cheap unconstrained solve:
+            # the *unconstrained* models at the same two strengths have to
+            # differ too, or the two are simply both too weak for the prior
+            # to show and no verdict on the solver follows. A coefficient
+            # chosen within three decades of the weakest tried, or a pair
+            # the prior does not separate, gets the old two-ended check with
+            # one more constrained solve, six decades up.
+            weak_rec = getattr(scan, "floor_reconstruction", None) if scan else None
+            weak_c = getattr(scan, "floor_coefficient", np.nan) if scan else np.nan
+            change = None
+            decades = np.nan
+            if (
+                weak_rec is not None and np.isfinite(weak_c) and weak_c > 0
+                and np.log10(chosen / weak_c) >= 3.0
+            ):
+                free_weak = _probe_model(weak_c, False, prior)
+                free_change = (
+                    _relative_change(free_weak.reconstruction, free_t.reconstruction)
+                    if free_weak is not None and free_t is not None else None
+                )
+                if free_change is not None and free_change >= POSITIVITY_PRIOR_RESPONSE:
+                    decades = np.log10(chosen / weak_c)
+                    change = _relative_change(weak_rec, constrained_rec)
+            if not np.isfinite(decades):
+                # six decades above the chosen strength, and never below the
+                # top of the search's own range, so "strong" means strong
+                # whatever the data's units put the coefficient at
+                strong_c = max(chosen * 1e6, 10.0 ** LOG_COEFFICIENT_BOUNDS[1])
+                decades = np.log10(strong_c / chosen)
+                strong_t = _probe_model(strong_c, True, prior)
+                change = (
+                    _relative_change(constrained_rec, strong_t.reconstruction)
+                    if strong_t is not None else None
+                )
             if change is not None and change < POSITIVITY_PRIOR_RESPONSE:
                 reason = (
                     f"the reconstruction changes by only {100 * change:.2g}% "
-                    f"between regularisation strengths twelve decades "
+                    f"between regularisation strengths {decades:.0f} decades "
                     f"apart, so it is ignoring the prior entirely"
                 )
+        logger.info(
+            "  solver check done in %.0f s%s", time.perf_counter() - started,
+            "" if reason is None else " -- unreliable",
+        )
         if reason is not None and enforce_positive:
             logger.warning(
                 "the non-negative solver looks unreliable on this data: %s. "
@@ -3825,23 +4210,11 @@ def fit_dataset(
                 # reachability floor, or throughout under `structure` -- so
                 # its answer was conditional on a solver that is now off
                 prior, scan = search(False)
-
-    if "envelope_fwhm" in prior:
-        envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
-    prior = dict(prior)
-    if reg_kind in KERNEL_REGULARIZATIONS:
-        prior.setdefault("nu", nu)
-
-    def _fit(coefficient: float) -> ag.FitInterferometer:
-        """The delivered fit: a real framework fit at one coefficient."""
-        fit = fit_at(
-            dataset, mesh_shape, reg_kind, coefficient,
-            positive_only=positive_only, reg_scale=prior.get("scale"),
-            nu=prior.get("nu", nu), envelope=envelope,
-        )
-        if system is not None:
-            attach_system(fit, system)
-        return fit
+                if "envelope_fwhm" in prior:
+                    envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
+                prior = dict(prior)
+                if reg_kind in KERNEL_REGULARIZATIONS:
+                    prior.setdefault("nu", nu)
 
     # The hyperparameter search uses the fast unconstrained solver, but the
     # final fit may impose positivity, which raises chi^2. When that shifts
@@ -3872,7 +4245,14 @@ def fit_dataset(
                 "coefficient is chosen against %.4g rather than %.4g.",
                 scan.chi2_floor / n_data, target / n_data, chi2_target,
             )
-        first_trial = _probe_model(prior["coefficient"], True, prior)
+        # the solver check above already solved this exact trial when the
+        # prior it chose is the one still in hand
+        first_trial = (
+            constrained_t
+            if constrained_t is not None
+            and constrained_t.coefficient == float(prior["coefficient"])
+            else _probe_model(prior["coefficient"], True, prior)
+        )
         chi2 = first_trial.chi_squared if first_trial is not None else np.nan
         # A few per cent, not the 50%% this used to allow: chi^2 is nearly
         # flat in the coefficient near the floor, so a loose gate lets a
@@ -3981,9 +4361,9 @@ def fit_dataset(
                     if reg_kind in KERNEL_REGULARIZATIONS:
                         prior.setdefault("nu", nu)
 
-    fit = _fit(prior["coefficient"])
+    fit = _delivered_at(prior["coefficient"])
+    chi2_final = delivered[3]
 
-    chi2_final = _chi_squared(fit)
     if np.isfinite(chi2_final) and warn_on_chi2:
         ratio = chi2_final / (chi2_target * n_data)
         if ratio > CHI2_UNREACHABLE_FACTOR:

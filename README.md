@@ -13,9 +13,10 @@ prior whose hyperparameters are optimised automatically with nothing to tune by 
 ## Install
 
 ```bash
-pip install -e .            # core (numpy backend)
-pip install -e ".[ms]"      # + python-casacore, to read measurement sets
-pip install -e ".[jax]"     # + JAX/nufftax (optional)
+pip install -e .                    # core (numpy backend; includes numba)
+pip install -e ".[ms]"              # + python-casacore, to read measurement sets
+pip install -e ".[jax]"             # + JAX/nufftax (optional)
+pip install -e ".[autoarray-main]"  # + autoarray's faster non-negative solver (see docs/install.md)
 ```
 
 Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but on
@@ -322,7 +323,22 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 | | limited by | Ruby at 200 GHz (148k samples, 26×26 mesh) |
 |---|---|---|
 | **sparse** (≥5000 vis) | `--mesh`, as `n_mesh²` — plus ~136 B per visibility just to hold the data | ~1.1 GB; the inversion is independent of visibility count, the dataset is not |
+| **sparse, streamed** (the default for a file on disk, ≥5000 vis) | `--mesh` only: the data are read once in chunks and never held | the model's ~1 GB whatever the visibility count |
 | **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
+
+The streamed variant (`streaming="auto"`, the default: taken whenever the
+dataset is a file, the inversion is sparse and there are no point components
+— `--no-streaming` holds the data in memory instead, `--streaming` refuses an
+unsupported combination rather than falling back, and `--reload` re-reads a
+file whose cached terms should not be trusted) accumulates the w-tilde kernel,
+the dirty images and the χ² constants in one pass over the file, caches them
+beside the output, and fits on those alone — every quantity the fit and the
+products need is a sum over visibilities, including the residual map, which
+is dirty(data) − W̃⋆model. A 200-million-sample MFS cube that needs 33 GB
+in memory needs about a gigabyte streamed; a cached re-fit reads no
+visibilities at all. The cost moves to time: one pass through every sample.
+Cube mode streams the same pass one channel at a time into one set of terms
+per channel, and `--image-centre` is the same phase ramp applied per chunk.
 
 Sparse needs JAX; `auto` falls back to dense and says so when it is missing,
 when `--point-sources` is requested, or when the real and imaginary noise

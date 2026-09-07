@@ -80,6 +80,20 @@ def test_a_trial_reproduces_the_framework_fit_bitwise(
             float(fit.inversion.fast_chi_squared), rel=1e-6)
         assert np.all(trial.reconstruction >= 0)
         assert trial.reconstruction.shape == framework.shape
+    elif positive:
+        # Same solver, same inputs -- but autoarray (main, Sep 2026) seeds the
+        # framework's non-negative solve from a process-wide memo of earlier
+        # passive sets (`nnls_memo`), and a `Trial` passes no fingerprint, so
+        # the two may start from different active sets. The optimum is unique;
+        # the path is not. Agreement to solver precision is the invariant.
+        np.testing.assert_allclose(
+            trial.reconstruction, framework, rtol=1e-9,
+            atol=1e-12 * np.abs(framework).max(),
+        )
+        assert trial.chi_squared == pytest.approx(
+            float(fit.inversion.fast_chi_squared), rel=1e-10)
+        assert trial.log_evidence == pytest.approx(_framework_evidence(fit), rel=1e-10)
+        return
     else:
         assert np.array_equal(trial.reconstruction, framework)
         assert trial.chi_squared == float(fit.inversion.fast_chi_squared)
@@ -97,6 +111,76 @@ def test_positivity_zeroes_the_edge_as_the_framework_does(small, system):
     assert np.all(constrained[0, :] == 0) and np.all(constrained[:, -1] == 0)
     assert np.any(free[0, :] != 0)
     assert np.all(constrained >= 0)
+
+
+def test_a_warm_started_constrained_solve_reaches_the_same_optimum(small):
+    """`warm_start=True` seeds fnnls from the nearest pooled non-negative
+    solution instead of from the unconstrained sign pattern. The optimum is
+    unique, so the answer must be the cold one to solver precision, must stay
+    non-negative and keep the zero border, and -- the point of it -- the
+    delivered fit's own solve must not be touched: `warm_start` is opt-in."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 10.0, 0.5, 1.5, None)
+    )
+    cold = system.solve(H, positive=True)
+    assert system.solve_counts == {"cold": 1, "warm": 0, "warm_failed": 0}
+    # a half-decade away, seeded from the solve above
+    warm = system.solve(10.0**0.5 * H, positive=True, warm_start=True)
+    assert system.solve_counts["warm"] == 1
+    reference = fitting.build_linear_system(dataset, geom.mesh_shape).solve(
+        10.0**0.5 * H, positive=True
+    )
+    np.testing.assert_allclose(warm, reference, rtol=1e-8, atol=1e-13)
+    assert np.all(warm >= 0)
+    mesh = warm.reshape(geom.mesh_shape)
+    assert np.all(mesh[0, :] == 0) and np.all(mesh[:, -1] == 0)
+    # without the flag the pool is ignored and the solve is the framework's
+    again = system.solve(H, positive=True)
+    assert np.array_equal(again, cold)
+    assert system.solve_counts["cold"] == 2
+
+
+def test_a_seed_that_fails_falls_back_to_the_cold_solve(small, monkeypatch):
+    """A seed whose support is singular at the new strength raises inside
+    fnnls; the solve must then run the cold path and still return the framework
+    answer, and count the failure so it can be seen."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 10.0, 0.5, 1.5, None)
+    )
+    cold = system.solve(H, positive=True)
+
+    def broken(curvature_reg, seed):
+        raise np.linalg.LinAlgError("singular seed")
+
+    monkeypatch.setattr(system, "_solve_positive_seeded", broken)
+    warm = system.solve(H, positive=True, warm_start=True)
+    assert np.array_equal(warm, cold)
+    assert system.solve_counts == {"cold": 2, "warm": 0, "warm_failed": 1}
+
+
+def test_the_pool_seeds_from_the_nearest_strength(small):
+    """The seed is chosen by log10 trace(H), so a walk in half-decade steps is
+    seeded from its previous step, not from wherever the pool began."""
+    dataset, geom = small
+    system = fitting.build_linear_system(dataset, geom.mesh_shape)
+    H = system.regularization_matrix(
+        fitting.make_regularization("matern", 1.0, 0.5, 1.5, None)
+    )
+    a = system.solve(H, positive=True)
+    b = system.solve(1e3 * H, positive=True)
+    assert system._warm_seed(system._strength_key(2.0 * H)) is a
+    assert system._warm_seed(system._strength_key(500.0 * H)) is b
+    # a seed too far away misleads the active set more than it helps, so a
+    # solve six decades from anything pooled starts cold
+    assert system._warm_seed(system._strength_key(1e9 * H)) is None
+    # the pool is bounded
+    for k in range(fitting.LinearSystem.WARM_START_POOL + 5):
+        system._pool_solution(float(k), a)
+    assert len(system._constrained_pool) == fitting.LinearSystem.WARM_START_POOL
 
 
 def test_the_evidence_fails_where_the_framework_fails(small, system, caplog):
@@ -337,7 +421,15 @@ def test_the_prior_systematic_of_a_positive_fit_uses_the_positive_solver(small):
         unconstrained = sf.system.solve(H, positive=False)
         assert np.all(positive >= 0) and np.any(unconstrained < 0)
         want = np.asarray(ag.Array2D(values=M @ positive, mask=mask).native)
-        np.testing.assert_allclose(alt, want, rtol=0, atol=1e-15)
+        # `model_image_at_scale` seeds its solve from the pool of earlier
+        # constrained solutions, the cold solve here does not: same optimum,
+        # reached by a different active-set path, so they agree to ~1e-11
+        # relative rather than to the bit (see `LinearSystem.solve`)
+        np.testing.assert_allclose(alt, want, rtol=1e-8, atol=1e-13)
+        assert not np.allclose(
+            alt, np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native),
+            rtol=1e-6, atol=0,
+        )
         wrong = np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native)
         assert np.abs(alt - wrong).max() > 1e-6
     free = fitting.fit_dataset(
@@ -391,7 +483,7 @@ class _FakeSystem:
         self.n_pixels = n_pixels
         self.n_vis = n_vis
 
-    def trial(self, regularization, positive):
+    def trial(self, regularization, positive, warm_start=False):
         c = float(regularization.coefficient)
         self.seen.append((c, bool(positive)))
         chi2 = self.chi2_of(c, positive)
@@ -404,6 +496,11 @@ class _FakeSystem:
 
     def residual_visibilities(self, reconstruction):
         return np.zeros(self.n_vis, dtype=complex)
+
+    def residual_dirty_image(self, reconstruction, imager):
+        # what the search now asks for: the residual map, however the data
+        # are held (`LinearSystem.residual_dirty_image`)
+        return np.zeros((8, 8))
 
 
 class _FakeFit:
@@ -453,7 +550,10 @@ def test_the_positivity_probe_runs_at_the_chosen_coefficient(monkeypatch, small)
     assert any(
         c == pytest.approx(chosen) and not pos for c, pos in system.seen
     ), "the unconstrained probe never ran at the chosen coefficient"
-    assert any(c == pytest.approx(chosen) and pos for c, pos in system.seen)
+    # the constrained side of the check is the delivered fit's own solve now
+    # (`fit_at`, which the fake pops from `seen`), not a second probe; what
+    # must not happen is a constrained probe at the old arbitrary c = 1
+    assert not any(abs(np.log10(c)) < 0.5 and pos for c, pos in system.seen)
 
 
 def test_a_solver_that_fails_at_the_chosen_coefficient_is_caught(monkeypatch, small):
@@ -477,7 +577,7 @@ def test_structure_handing_back_to_chi2_is_then_rebisected(monkeypatch, small):
     dataset, geom = small
     n_data = 2 * len(np.asarray(dataset.data))
     # the ratio never reaches 1, so structure gives up and hands to chi^2
-    monkeypatch.setattr(fitting, "_structure_ratio", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fitting, "_structure_ratio_from_map", lambda *a, **k: 0.5)
 
     def chi2_of(c, positive):
         floor = 1.02 if positive else 0.95
@@ -506,7 +606,7 @@ def test_an_inner_evidence_fallback_is_not_lost_in_the_chain(
     a chi^2 target it had already given up on."""
     dataset, geom = small
     n_data = 2 * len(np.asarray(dataset.data))
-    monkeypatch.setattr(fitting, "_structure_ratio", lambda *a, **k: 0.5)
+    monkeypatch.setattr(fitting, "_structure_ratio_from_map", lambda *a, **k: 0.5)
     _install(
         monkeypatch, lambda c, positive: n_data * (2.0 + 0.5 * c / (c + 1e3))
     )
@@ -644,19 +744,36 @@ def test_the_kernel_flag_can_be_switched_off(sparse_allowed, monkeypatch):
 
 def test_current_memory_is_current():
     """`ru_maxrss` is the process's peak; a released mapping matrix must stop
-    counting against the budget once it is gone."""
-    import resource
+    counting against the budget once it is gone.
 
-    before = fitting.current_memory_gb()
-    big = np.ones(int(3e7))          # 240 MB
-    big += 1.0
-    during = fitting.current_memory_gb()
-    del big
-    import gc
+    Measured in a fresh interpreter: inside the test process the allocator
+    hands a 240 MB array pages it already holds from earlier tests, so the
+    resident size need not grow by the array's size (75 MB of 240 on macOS,
+    once the suite had run for a minute) -- and that is not what this test
+    is about. A clean process has nothing to recycle.
+    """
+    import json
+    import subprocess
+    import sys
 
-    gc.collect()
-    after = fitting.current_memory_gb()
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
-    assert during - before > 0.15
-    assert after < during - 0.15, "the freed array is still being counted"
-    assert after <= peak + 1e-3
+    script = """
+import gc, json, resource
+import numpy as np
+from pyuvimage import fitting
+before = fitting.current_memory_gb()
+big = np.ones(int(3e7))          # 240 MB
+big += 1.0
+during = fitting.current_memory_gb()
+del big
+gc.collect()
+after = fitting.current_memory_gb()
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+print(json.dumps(dict(before=before, during=during, after=after, peak=peak)))
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    m = json.loads(out)
+    assert m["during"] - m["before"] > 0.15, m
+    assert m["after"] < m["during"] - 0.15, f"the freed array is still being counted: {m}"
+    assert m["after"] <= m["peak"] + 1e-3, m

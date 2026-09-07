@@ -3,13 +3,41 @@
 [← back to the README](../README.md)
 
 ```bash
-pip install -e .            # core (numpy backend)
-pip install -e ".[ms]"      # + python-casacore, to read measurement sets
-pip install -e ".[jax]"     # + JAX/nufftax
+pip install -e .                    # core (numpy backend; includes numba)
+pip install -e ".[ms]"              # + python-casacore, to read measurement sets
+pip install -e ".[jax]"             # + JAX/nufftax
+pip install -e ".[autoarray-main]"  # + autoarray's development head (see below)
 ```
 
 Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
 `version: python_version_check: False` in a local `config/general.yaml`).
+
+## numba, and autoarray's development head
+
+Two things decide how long a positivity-on fit takes, and neither is
+pyuvimage's code. Both concern autoarray's non-negative least-squares solver
+(`fnnls_cholesky`), which on a real field is the most expensive step of a fit
+by a wide margin — 20–40 s per cold solve on a 50×50 mesh in a 2-core
+container, minutes on a laptop without the two items below.
+
+**numba** is a core dependency since 2026-09. autoarray updates the solver's
+Cholesky factor with `numba_util.jit()` kernels, and without numba that
+decorator is a no-op and the kernels run as pure Python — 9 s of a 44 s cold
+solve when profiled. pyuvimage warns at the start of a run if numba is
+missing; `pip install numba` is the whole fix.
+
+**autoarray `main`** (September 2026) rewrote the same solver: the factor is
+updated in place instead of being copied with `np.insert`/`np.delete` on every
+iteration (17 s of that same 44 s), the warm-start repair is correct, and a
+process-wide memo seeds each framework solve from the passive set of the
+previous one with the same mesh — so the delivered fit of a second adaptive
+pass, or of each cube channel, starts from the last one's answer. None of it
+is in a release yet and the version string was not bumped, so
+`pip install -U autoarray` does nothing; `pip install -e ".[autoarray-main]"`
+installs the head. `AUTOARRAY_NNLS_WARM_START=0` switches the memo off if
+it ever needs ruling out. pyuvimage's own seeding of its probe solves
+(`LinearSystem.solve(warm_start=True)`) is independent of the memo and works
+with either version.
 
 JAX is optional, and it is **not** what makes the transform fast — `pynufft`
 is (see [parameters.md](parameters.md#why-auto-never-picks-the-jax-nufft): the

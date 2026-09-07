@@ -80,10 +80,14 @@ a 60× range in noise, comparing the quoted 1σ against the actual rms error
 | 5 | ±6.0 | **9.64** | 1.23 |
 
 Because of the floor the two are identical wherever the fit is well
-constrained; the window only ever opens. The cost is the walk: 5 extra solves
-of the n_mesh system on a well-constrained fit, at most 25 on one χ² barely
+constrained; the window only ever opens. The cost is the walk: 4 extra solves
+of the n_mesh system on a well-constrained fit, at most 24 on one χ² barely
 responds to — no transforms and no refit — plus one mesh→image mapping per
-accepted step. Passing
+accepted step. On a non-negative fit each step is seeded from the previous
+one's support, which is what keeps a constrained walk affordable: on a
+50×50 mesh a weakly regularised fit opened the window to ±6 dex and made all
+24 solves in 26 s seeded, against roughly 35 s *per solve* cold (see
+"Where the time goes" in design-notes.md). Passing
 `model_uncertainty_total(0.5)` restores a fixed window if you want the old
 number.
 

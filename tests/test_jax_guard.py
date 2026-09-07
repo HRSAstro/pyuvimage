@@ -110,3 +110,38 @@ def test_a_working_environment_is_left_alone():
         print("REASON", DISABLED_REASON)
     ''', Path("."))
     assert "REASON None" in out.stdout, out.stdout + out.stderr
+
+
+def test_a_missing_numba_is_reported_once(monkeypatch, caplog):
+    """autoarray's non-negative solver runs its Cholesky-update kernels as pure
+    Python without numba -- 9 s of a 44 s cold solve -- so a run says so, once,
+    and says nothing when numba is there."""
+    import builtins
+    import logging
+
+    from pyuvimage import _jax_guard
+
+    real_import = builtins.__import__
+
+    def no_numba(name, *args, **kwargs):
+        if name == "numba":
+            raise ImportError("no numba")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_numba)
+    monkeypatch.setattr(_jax_guard, "_NUMBA_REPORTED", False)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        _jax_guard.report_if_numba_missing()
+        _jax_guard.report_if_numba_missing()
+    assert caplog.text.count("numba is not installed") == 1
+
+    monkeypatch.setattr(builtins, "__import__", real_import)
+    monkeypatch.setattr(_jax_guard, "_NUMBA_REPORTED", False)
+    caplog.clear()
+    try:
+        import numba  # noqa: F401
+    except ImportError:
+        pytest.skip("numba absent here; the silent branch needs it")
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        _jax_guard.report_if_numba_missing()
+    assert "numba" not in caplog.text

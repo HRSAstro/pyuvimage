@@ -131,6 +131,34 @@ def report_if_disabled() -> None:
     logger.warning(MESSAGE, kind, detail)
 
 
+_NUMBA_REPORTED = False
+
+
+def report_if_numba_missing() -> None:
+    """Say once, where logging is configured, that numba is absent.
+
+    autoarray's non-negative solver updates its Cholesky factor with
+    `numba_util.jit()` kernels, and without numba that decorator is a no-op:
+    the kernels run as pure Python. On a 50x50 mesh that was 9 s of a 44 s
+    cold solve here, and every positive-only fit makes several of them. Not
+    an error -- everything still runs -- but it is the single cheapest
+    speed-up available, so a run should not stay quiet about it.
+    """
+    global _NUMBA_REPORTED
+    if _NUMBA_REPORTED:
+        return
+    _NUMBA_REPORTED = True
+    try:
+        import numba  # noqa: F401
+    except ImportError:
+        logger.warning(
+            "numba is not installed, so autoarray's non-negative solver runs "
+            "its Cholesky-update kernels as pure Python: every positive-only "
+            "solve is several times slower than it need be. `pip install "
+            "numba` (a core dependency since 2026-09) fixes it."
+        )
+
+
 def enable_double_precision() -> None:
     """Ask JAX for float64, before anything imports it.
 
