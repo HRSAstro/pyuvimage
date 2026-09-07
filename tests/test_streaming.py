@@ -111,6 +111,47 @@ def test_the_npz_reader_never_materialises_a_member(npz_path, monkeypatch):
     assert total > 0
 
 
+def test_fortran_ordered_members_are_read_whole_and_still_bit_for_bit(ragged, tmp_path, caplog):
+    """The first real export (Ruby, CO 7-6) had a Fortran-ordered `flags`
+    member -- casatools hands its columns back column-major -- and the reader
+    refused the file. A Fortran member's channel blocks are not contiguous in
+    the file, so it is held whole instead; flags are a byte a sample, so that
+    is cheap, and the samples must come out exactly as from a C-ordered file."""
+    import logging
+
+    uvd, _, _ = ragged
+    p = tmp_path / "fortran.npz"
+    payload = {"n_spw": np.array(len(uvd.spws)), "meta": json.dumps({})}
+    for i, spw in enumerate(uvd.spws):
+        pre = f"spw{i:03d}_"
+        payload.update({
+            pre + "uvw": spw.uvw, pre + "frequencies": spw.frequencies,
+            pre + "data_re": np.asfortranarray(spw.data.real),     # data too, once
+            pre + "data_im": spw.data.imag,
+            pre + "noise_re": spw.noise.real, pre + "noise_im": spw.noise.imag,
+            pre + "flags": np.asfortranarray(spw.flags.astype(np.uint8)),
+        })
+    np.savez_compressed(p, **payload)
+    with np.load(p) as z:
+        assert np.isfortran(z["spw000_flags"]) and np.isfortran(z["spw000_data_re"])
+    uv0, d0, n0 = uvd.flattened()
+    chunks = list(stm.iter_npz_chunks(p, CHUNK))
+    assert np.array_equal(np.concatenate([c.uv for c in chunks]), uv0)
+    assert np.array_equal(np.concatenate([c.data for c in chunks]), d0)
+    assert np.array_equal(np.concatenate([c.noise for c in chunks]), n0)
+    header = stm.scan_header(p, CHUNK)
+    assert header.n_samples == uvd.n_samples
+    # a large Fortran member is still read, but says so
+    monkey_limit = stm.FORTRAN_MEMBER_WARN_BYTES
+    stm.FORTRAN_MEMBER_WARN_BYTES = 0
+    try:
+        with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+            list(stm.iter_npz_chunks(p, CHUNK))
+    finally:
+        stm.FORTRAN_MEMBER_WARN_BYTES = monkey_limit
+    assert "Fortran-ordered" in caplog.text and "C order" in caplog.text
+
+
 # --- the accumulated terms -----------------------------------------------------
 
 @pytest.fixture(scope="module")

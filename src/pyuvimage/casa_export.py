@@ -249,12 +249,17 @@ def _export_one(ms_path, field, spw, data_column):
         "telescope": telescope,
         "noise_estimate": "difference",
     }
+    # C order throughout: casatools hands its columns back column-major and
+    # reductions over them stay that way, and a Fortran-ordered member cannot
+    # be streamed in channel blocks (pyuvimage.streaming reads it whole).
     arrays = {
-        "uvw": np.asarray(uvw, dtype=np.float64),
+        "uvw": np.ascontiguousarray(uvw, dtype=np.float64),
         "frequencies": frequencies,
-        "data_re": vis.real, "data_im": vis.imag,
-        "noise_re": sigma.real, "noise_im": sigma.imag,
-        "flags": flags.astype(np.uint8),
+        "data_re": np.ascontiguousarray(vis.real),
+        "data_im": np.ascontiguousarray(vis.imag),
+        "noise_re": np.ascontiguousarray(sigma.real),
+        "noise_im": np.ascontiguousarray(sigma.imag),
+        "flags": np.ascontiguousarray(flags.astype(np.uint8)),
         # kept so the noise can be re-estimated later without re-reading the
         # MS -- the first real export had an unusable noise map and nothing
         # in the file to rebuild it from

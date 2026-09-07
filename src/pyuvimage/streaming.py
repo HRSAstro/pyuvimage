@@ -193,6 +193,12 @@ def iter_uvdata_chunks(uvd: UVData | MultiSpwUVData, chunk_k: int = STREAM_CHUNK
         yield from _with_row_lengths(gen(), uvw, spw.frequencies)
 
 
+#: a Fortran-ordered member larger than this is held whole with a warning:
+#: it cannot be streamed in channel blocks, since its file order is rows
+#: outermost
+FORTRAN_MEMBER_WARN_BYTES = 256 * 1024 ** 2
+
+
 class _NpyMemberStream:
     """Sequential row-block reader for one .npy member inside a .npz.
 
@@ -202,6 +208,15 @@ class _NpyMemberStream:
     reading, and a C-order (n_chan, n_rows) array is exactly rows-of-channels
     in file order. So: parse the .npy header, then read `n_block x n_rows x
     itemsize` bytes at a time.
+
+    A **Fortran-ordered** member is stored the other way round -- every
+    channel of row 0, then row 1 -- so a channel block is not contiguous in
+    the file and the member has to be read whole. casatools returns its
+    columns column-major, and a `flags` array derived from them by reductions
+    stayed that way in the first real exports (`casa_export` now writes C
+    order, but the files already on disk do not change). Flags are a byte per
+    sample, so holding them is cheap; a Fortran-ordered *data* member above
+    `FORTRAN_MEMBER_WARN_BYTES` is still read, with a warning naming the fix.
     """
 
     def __init__(self, zf: zipfile.ZipFile, name: str):
@@ -211,16 +226,26 @@ class _NpyMemberStream:
             shape, fortran, dtype = np.lib.format.read_array_header_1_0(self._f)
         else:
             shape, fortran, dtype = np.lib.format.read_array_header_2_0(self._f)
-        if fortran:
-            raise ValueError(f"{name} is Fortran-ordered; streaming needs C order")
         self.shape = tuple(int(s) for s in shape)
         self.dtype = np.dtype(dtype)
         self._row_bytes = int(np.prod(self.shape[1:], dtype=np.int64)) * self.dtype.itemsize
         self._rows_read = 0
+        self._whole: np.ndarray | None = None
+        if fortran and len(self.shape) >= 2:
+            nbytes = int(np.prod(self.shape, dtype=np.int64)) * self.dtype.itemsize
+            if nbytes > FORTRAN_MEMBER_WARN_BYTES:
+                logger.warning(
+                    "%s is Fortran-ordered, so it cannot be streamed in channel "
+                    "blocks and is held whole (%.0f MB). Re-exporting the file "
+                    "with the current casa_export writes it in C order.",
+                    name, nbytes / 1e6,
+                )
+            raw = self._read_exactly(nbytes)
+            # file order is the transposed C array; `.T` gives the declared
+            # shape as an F-ordered view, no copy
+            self._whole = np.frombuffer(raw, dtype=self.dtype).reshape(self.shape[::-1]).T
 
-    def read_rows(self, n: int) -> np.ndarray:
-        n = int(min(n, self.shape[0] - self._rows_read))
-        want = n * self._row_bytes
+    def _read_exactly(self, want: int) -> bytearray:
         buf = bytearray(want)
         view = memoryview(buf)
         got = 0
@@ -229,7 +254,15 @@ class _NpyMemberStream:
             if not k:
                 raise EOFError("unexpected end of npz member")
             got += k
+        return buf
+
+    def read_rows(self, n: int) -> np.ndarray:
+        n = int(min(n, self.shape[0] - self._rows_read))
+        r0 = self._rows_read
         self._rows_read += n
+        if self._whole is not None:
+            return self._whole[r0:r0 + n]
+        buf = self._read_exactly(n * self._row_bytes)
         return np.frombuffer(buf, dtype=self.dtype).reshape((n,) + self.shape[1:])
 
     def read_all(self) -> np.ndarray:
