@@ -205,6 +205,38 @@ def test_the_floor_is_measured_on_the_solver_in_use(monkeypatch, demo_geometry):
     assert any(probes), "the reachability probe never used the constrained solver"
 
 
+def test_the_solver_check_reuses_the_delivered_fit_and_the_floor_probe(
+    monkeypatch, demo_geometry
+):
+    """On J0116 the three constrained solves of the solver check took 18
+    minutes. The constrained solution at the chosen coefficient *is* the
+    delivered fit, and the weakest prior was already solved constrained by the
+    reachability probe, so with the prior visibly acting between those two
+    the check needs no constrained solve of its own -- and the fit made for
+    it must be the one delivered, not solved again."""
+    dataset, geometry = demo_geometry
+    n_data = 2 * len(np.asarray(dataset.data))
+    # positivity changes nothing here, so no re-bisection follows the check
+    system = _install(monkeypatch, n_data, floor_free=0.98, floor_positive=0.98)
+    fits = []
+    real_fit_at = fitting.fit_at
+
+    def counting_fit_at(*args, **kwargs):
+        fits.append((args[3], kwargs.get("positive_only", True)))
+        return real_fit_at(*args, **kwargs)
+
+    monkeypatch.setattr(fitting, "fit_at", counting_fit_at)
+    sf = fitting.fit_dataset(dataset, geometry, reg_kind="constant", positive_only=True)
+    assert sf.positive_only
+    constrained_probes = [c for c, pos in system.seen if pos]
+    weakest = 10.0 ** LOG_COEFFICIENT_BOUNDS[0]
+    # the reachability probe is the only constrained probe; the check itself
+    # added none (its two ends are the probe and the delivered fit)
+    assert [c for c in constrained_probes if c != pytest.approx(weakest)] == []
+    # and the delivered fit was solved exactly once, at the chosen coefficient
+    assert len(fits) == 1 and fits[0] == (pytest.approx(sf.coefficient), True)
+
+
 def test_a_reachable_target_still_lands_on_it(monkeypatch, demo_geometry):
     """The fix must not disturb the ordinary case."""
     dataset, geometry = demo_geometry

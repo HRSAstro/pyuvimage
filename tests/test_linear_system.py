@@ -536,7 +536,10 @@ def test_the_positivity_probe_runs_at_the_chosen_coefficient(monkeypatch, small)
     assert any(
         c == pytest.approx(chosen) and not pos for c, pos in system.seen
     ), "the unconstrained probe never ran at the chosen coefficient"
-    assert any(c == pytest.approx(chosen) and pos for c, pos in system.seen)
+    # the constrained side of the check is the delivered fit's own solve now
+    # (`fit_at`, which the fake pops from `seen`), not a second probe; what
+    # must not happen is a constrained probe at the old arbitrary c = 1
+    assert not any(abs(np.log10(c)) < 0.5 and pos for c, pos in system.seen)
 
 
 def test_a_solver_that_fails_at_the_chosen_coefficient_is_caught(monkeypatch, small):

@@ -2435,11 +2435,15 @@ class LinearSystem:
 
     #: how far (in dex of trace(H)) a pooled solution may be from the strength
     #: asked for and still be used as a seed. Measured on a 50x50 mesh: a seed
-    #: half a decade away converges in 0.2-4 s, three decades away in about
-    #: the cold time, and one 18 decades away took 60 s where the cold solve
-    #: took 7 -- a strong-prior solve starts well from the unconstrained
-    #: signs, and a weak-prior seed only misleads it.
-    WARM_START_MAX_DEX = 3.0
+    #: half a decade away converges in 0.2-4 s and one a decade away in ~4 s,
+    #: where the cold solve takes 20-40 s; three decades away it is about the
+    #: cold time; eighteen decades away it took 60 s where the cold solve
+    #: took 7. On J0116 a 3-dex cap let two far seeds in and the three-solve
+    #: solver check took 18 minutes -- a seed from the wrong regime leads the
+    #: active set through more changes than the unconstrained signs do. One
+    #: decade covers everything that gains: the half-decade window walk, the
+    #: re-bisection's midpoints, and the same strength under another prior.
+    WARM_START_MAX_DEX = 1.0
 
     def _warm_seed(self, key: float) -> np.ndarray | None:
         pool = self.__dict__.get("_constrained_pool")
@@ -2755,6 +2759,11 @@ class PriorScan:
     #: uses. With positivity on this is a floor the fit cannot go below, so
     #: the discrepancy target has to respect it (see `effective_chi2_target`).
     chi2_floor: float = float("nan")
+    #: the weakest prior's constrained solution, when the probe ran on the
+    #: non-negative solver: one end of the "does the solver respond to the
+    #: prior at all" comparison, already paid for
+    floor_coefficient: float = float("nan")
+    floor_reconstruction: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def effective_criterion(self) -> str:
@@ -3057,8 +3066,13 @@ def optimise_prior(
         return optimise_prior(dataset, geometry, **kwargs)
 
     def evaluate(
-        log_params: np.ndarray, positive: bool | None = None
+        log_params: np.ndarray, positive: bool | None = None, collect=None,
     ) -> tuple[float, float, float]:
+        """(log evidence, chi^2, structure ratio) at one point.
+
+        `collect`, a list, receives the `Trial` itself -- for the one caller
+        (the reachability probe) whose reconstruction is wanted afterwards.
+        """
         positive = search_positive if positive is None else bool(positive)
         coefficient = 10.0 ** float(log_params[0])
         scale = 10.0 ** float(log_params[1]) if kernel else fixed_scale
@@ -3080,6 +3094,8 @@ def optimise_prior(
                 )
                 if imager is not None else float("nan")
             )
+            if collect is not None:
+                collect.append(trial)
         except Exception as e:
             logger.debug("prior evaluation failed: %s", e)
             return -np.inf, float("nan"), float("nan")
@@ -3160,11 +3176,17 @@ def optimise_prior(
                 "slow solve of the search; a second pass seeds it from the "
                 "first)..."
             )
+        probed: list = []
         _, chi2_weakest, ratio_weakest = evaluate(
-            np.array(probe), positive=positive_only
+            np.array(probe), positive=positive_only, collect=probed,
         )
         if not structure:
             scan.chi2_floor = chi2_weakest
+        if positive_only and probed:
+            # kept for `fit_dataset`'s solver check, which used to solve two
+            # more constrained systems to ask what this one already answers
+            scan.floor_coefficient = 10.0 ** probe[0]
+            scan.floor_reconstruction = np.asarray(probed[0].reconstruction)
         floor = ratio_weakest if structure else chi2_weakest
         hopeless = target * (1.0 if structure else CHI2_UNREACHABLE_FACTOR)
 
@@ -4019,22 +4041,77 @@ def fit_dataset(
     # data's, and 1.0 can sit six decades from where the fit will actually
     # run, where "fits far worse than the unconstrained solve" says nothing
     # about the solver the delivered model will use.
-    # The constrained trial at the chosen coefficient, kept for the
-    # re-bisection gate below, which used to solve it a second time.
+    if "envelope_fwhm" in prior:
+        envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
+    prior = dict(prior)
+    if reg_kind in KERNEL_REGULARIZATIONS:
+        prior.setdefault("nu", nu)
+
+    def _fit(coefficient: float) -> ag.FitInterferometer:
+        """The delivered fit: a real framework fit at one coefficient."""
+        fit = fit_at(
+            dataset, mesh_shape, reg_kind, coefficient,
+            positive_only=positive_only, reg_scale=prior.get("scale"),
+            nu=prior.get("nu", nu), envelope=envelope,
+        )
+        if system is not None:
+            attach_system(fit, system)
+        return fit
+
+    # The framework fit in hand: [fit, coefficient, positivity, chi^2]. Solved
+    # once and kept while nothing about it changes, because on a real field
+    # its non-negative solve is the most expensive thing this function does
+    # -- 20-40 s on a 50x50 mesh here, minutes on a laptop -- and the solver
+    # check below used to make the identical solve a second time as a probe.
+    delivered: list = []
+
+    def _delivered_at(coefficient: float) -> ag.FitInterferometer:
+        if not (
+            delivered and delivered[1] == float(coefficient)
+            and delivered[2] == bool(positive_only)
+        ):
+            logger.info(
+                "solving the delivered fit at coefficient %.4g%s...",
+                coefficient,
+                " (non-negative; this solve is not seeded)" if positive_only else "",
+            )
+            started = time.perf_counter()
+            fit = _fit(float(coefficient))
+            # the framework inversion is lazy: reading chi^2 runs the solve
+            chi2 = _chi_squared(fit)
+            logger.info(
+                "  delivered fit solved in %.0f s", time.perf_counter() - started
+            )
+            delivered[:] = [fit, float(coefficient), bool(positive_only), chi2]
+        return delivered[0]
+
+    # The constrained solution at the chosen coefficient, kept for the
+    # re-bisection gate below (which used to solve it a third time).
     constrained_t = None
     if positive_only and needs_search:
         chosen = float(prior["coefficient"])
         logger.info(
-            "checking the non-negative solver at coefficient %.4g (three "
-            "constrained solves)...", chosen,
+            "checking the non-negative solver at coefficient %.4g (on the "
+            "delivered fit's own solve)...", chosen,
         )
         started = time.perf_counter()
         free_t = _probe_model(chosen, False, prior)
-        constrained_t = _probe_model(chosen, True, prior)
-        free = free_t.chi_squared if free_t is not None else np.nan
-        constrained = (
-            constrained_t.chi_squared if constrained_t is not None else np.nan
+        # The constrained solution at the chosen coefficient IS the delivered
+        # fit, so solve that and read it, rather than solving the same system
+        # as a probe and then again as the fit. Kept if nothing changes below.
+        fit = _delivered_at(chosen)
+        constrained_rec = np.asarray(fit.inversion.reconstruction, dtype=float)
+        constrained = delivered[3]
+        H_chosen = None
+        if isinstance(system, LinearSystem):
+            H_chosen = system.regularization_matrix(regularization_for(chosen, prior))
+            system.remember_constrained(H_chosen, constrained_rec)
+        constrained_t = Trial(
+            coefficient=chosen, positive=True, reconstruction=constrained_rec,
+            chi_squared=float(constrained), log_evidence=float("nan"),
+            regularization_matrix=H_chosen,
         )
+        free = free_t.chi_squared if free_t is not None else np.nan
         n_vis = n_data // 2
         reason = None
         if (
@@ -4047,7 +4124,7 @@ def fit_dataset(
             )
         else:
             # Second, independent symptom: the solver *ignores* the prior.
-            # Compare two strengths twelve decades apart -- but compare the
+            # Compare two strengths many decades apart -- but compare the
             # **reconstruction**, not chi^2.
             #
             # This used to test chi^2, and that was wrong. chi^2 being
@@ -4063,16 +4140,50 @@ def fit_dataset(
             # solution, so measure that. A solver that is genuinely ignoring
             # the prior returns the same model at both ends; a working one
             # cannot.
-            change = _model_response(
-                lambda c: system.trial(
-                    regularization_for(c, prior), positive=True, warm_start=True
-                ),
-                1e-3, 1e9,
-            )
+            #
+            # The two ends used to be fresh solves at 1e-3 and 1e9 -- two
+            # more constrained solves, and on J0116 the three together took
+            # 18 minutes. The search already solved the weakest prior on this
+            # solver (its reachability probe), and the chosen coefficient is
+            # in hand, so when those sit three or more decades apart they are
+            # the two ends and the check costs one cheap unconstrained solve:
+            # the *unconstrained* models at the same two strengths have to
+            # differ too, or the two are simply both too weak for the prior
+            # to show and no verdict on the solver follows. A coefficient
+            # chosen within three decades of the weakest tried, or a pair
+            # the prior does not separate, gets the old two-ended check with
+            # one more constrained solve, six decades up.
+            weak_rec = getattr(scan, "floor_reconstruction", None) if scan else None
+            weak_c = getattr(scan, "floor_coefficient", np.nan) if scan else np.nan
+            change = None
+            decades = np.nan
+            if (
+                weak_rec is not None and np.isfinite(weak_c) and weak_c > 0
+                and np.log10(chosen / weak_c) >= 3.0
+            ):
+                free_weak = _probe_model(weak_c, False, prior)
+                free_change = (
+                    _relative_change(free_weak.reconstruction, free_t.reconstruction)
+                    if free_weak is not None and free_t is not None else None
+                )
+                if free_change is not None and free_change >= POSITIVITY_PRIOR_RESPONSE:
+                    decades = np.log10(chosen / weak_c)
+                    change = _relative_change(weak_rec, constrained_rec)
+            if not np.isfinite(decades):
+                # six decades above the chosen strength, and never below the
+                # top of the search's own range, so "strong" means strong
+                # whatever the data's units put the coefficient at
+                strong_c = max(chosen * 1e6, 10.0 ** LOG_COEFFICIENT_BOUNDS[1])
+                decades = np.log10(strong_c / chosen)
+                strong_t = _probe_model(strong_c, True, prior)
+                change = (
+                    _relative_change(constrained_rec, strong_t.reconstruction)
+                    if strong_t is not None else None
+                )
             if change is not None and change < POSITIVITY_PRIOR_RESPONSE:
                 reason = (
                     f"the reconstruction changes by only {100 * change:.2g}% "
-                    f"between regularisation strengths twelve decades "
+                    f"between regularisation strengths {decades:.0f} decades "
                     f"apart, so it is ignoring the prior entirely"
                 )
         logger.info(
@@ -4099,23 +4210,11 @@ def fit_dataset(
                 # reachability floor, or throughout under `structure` -- so
                 # its answer was conditional on a solver that is now off
                 prior, scan = search(False)
-
-    if "envelope_fwhm" in prior:
-        envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
-    prior = dict(prior)
-    if reg_kind in KERNEL_REGULARIZATIONS:
-        prior.setdefault("nu", nu)
-
-    def _fit(coefficient: float) -> ag.FitInterferometer:
-        """The delivered fit: a real framework fit at one coefficient."""
-        fit = fit_at(
-            dataset, mesh_shape, reg_kind, coefficient,
-            positive_only=positive_only, reg_scale=prior.get("scale"),
-            nu=prior.get("nu", nu), envelope=envelope,
-        )
-        if system is not None:
-            attach_system(fit, system)
-        return fit
+                if "envelope_fwhm" in prior:
+                    envelope = {**envelope, "fwhm": float(prior["envelope_fwhm"])}
+                prior = dict(prior)
+                if reg_kind in KERNEL_REGULARIZATIONS:
+                    prior.setdefault("nu", nu)
 
     # The hyperparameter search uses the fast unconstrained solver, but the
     # final fit may impose positivity, which raises chi^2. When that shifts
@@ -4262,16 +4361,8 @@ def fit_dataset(
                     if reg_kind in KERNEL_REGULARIZATIONS:
                         prior.setdefault("nu", nu)
 
-    logger.info(
-        "solving the delivered fit at coefficient %.4g%s...",
-        prior["coefficient"],
-        " (non-negative; this solve is not seeded)" if positive_only else "",
-    )
-    started = time.perf_counter()
-    fit = _fit(prior["coefficient"])
-    # the framework inversion is lazy: reading chi^2 is what runs the solve
-    chi2_final = _chi_squared(fit)
-    logger.info("  delivered fit solved in %.0f s", time.perf_counter() - started)
+    fit = _delivered_at(prior["coefficient"])
+    chi2_final = delivered[3]
 
     if np.isfinite(chi2_final) and warn_on_chi2:
         ratio = chi2_final / (chi2_target * n_data)
