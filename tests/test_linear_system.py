@@ -744,19 +744,36 @@ def test_the_kernel_flag_can_be_switched_off(sparse_allowed, monkeypatch):
 
 def test_current_memory_is_current():
     """`ru_maxrss` is the process's peak; a released mapping matrix must stop
-    counting against the budget once it is gone."""
-    import resource
+    counting against the budget once it is gone.
 
-    before = fitting.current_memory_gb()
-    big = np.ones(int(3e7))          # 240 MB
-    big += 1.0
-    during = fitting.current_memory_gb()
-    del big
-    import gc
+    Measured in a fresh interpreter: inside the test process the allocator
+    hands a 240 MB array pages it already holds from earlier tests, so the
+    resident size need not grow by the array's size (75 MB of 240 on macOS,
+    once the suite had run for a minute) -- and that is not what this test
+    is about. A clean process has nothing to recycle.
+    """
+    import json
+    import subprocess
+    import sys
 
-    gc.collect()
-    after = fitting.current_memory_gb()
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
-    assert during - before > 0.15
-    assert after < during - 0.15, "the freed array is still being counted"
-    assert after <= peak + 1e-3
+    script = """
+import gc, json, resource
+import numpy as np
+from pyuvimage import fitting
+before = fitting.current_memory_gb()
+big = np.ones(int(3e7))          # 240 MB
+big += 1.0
+during = fitting.current_memory_gb()
+del big
+gc.collect()
+after = fitting.current_memory_gb()
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+print(json.dumps(dict(before=before, during=during, after=after, peak=peak)))
+"""
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True,
+    ).stdout.strip().splitlines()[-1]
+    m = json.loads(out)
+    assert m["during"] - m["before"] > 0.15, m
+    assert m["after"] < m["during"] - 0.15, f"the freed array is still being counted: {m}"
+    assert m["after"] <= m["peak"] + 1e-3, m
