@@ -13,10 +13,9 @@ prior whose hyperparameters are optimised automatically with nothing to tune by 
 ## Install
 
 ```bash
-pip install -e .                    # core (numpy backend; includes numba)
-pip install -e ".[ms]"              # + python-casacore, to read measurement sets
-pip install -e ".[jax]"             # + JAX/nufftax (optional)
-pip install -e ".[autoarray-main]"  # + autoarray's faster non-negative solver (see docs/install.md)
+pip install -e .            # core (numpy backend; numba and autoarray's git head, see docs/install.md)
+pip install -e ".[ms]"      # + python-casacore, to read measurement sets
+pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
 
 Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but on

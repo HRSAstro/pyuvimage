@@ -3,10 +3,9 @@
 [← back to the README](../README.md)
 
 ```bash
-pip install -e .                    # core (numpy backend; includes numba)
-pip install -e ".[ms]"              # + python-casacore, to read measurement sets
-pip install -e ".[jax]"             # + JAX/nufftax
-pip install -e ".[autoarray-main]"  # + autoarray's development head (see below)
+pip install -e .            # core (numpy backend; numba and autoarray's git head, see below)
+pip install -e ".[ms]"      # + python-casacore, to read measurement sets
+pip install -e ".[jax]"     # + JAX/nufftax
 ```
 
 Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
@@ -33,8 +32,11 @@ process-wide memo seeds each framework solve from the passive set of the
 previous one with the same mesh — so the delivered fit of a second adaptive
 pass, or of each cube channel, starts from the last one's answer. None of it
 is in a release yet and the version string was not bumped, so
-`pip install -U autoarray` does nothing; `pip install -e ".[autoarray-main]"`
-installs the head. `AUTOARRAY_NNLS_WARM_START=0` switches the memo off if
+`pip install -U autoarray` does nothing; the core dependency therefore
+points at the git head (`autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray`)
+until the next release, and `pip install -e .` installs it. Measured on
+J0116 (50×50 mesh): delivered fits 72 s and 109 s → 1 s and 2 s; the test
+suite 920 s → 92 s. `AUTOARRAY_NNLS_WARM_START=0` switches the memo off if
 it ever needs ruling out. pyuvimage's own seeding of its probe solves
 (`LinearSystem.solve(warm_start=True)`) is independent of the memo and works
 with either version.
