@@ -676,7 +676,7 @@ def test_run_streamed_cube_flow(ragged, npz_path, tmp_path, faked_sparse_fit):
     res = api.run(str(npz_path), fov=3.0, mode="cube", out=tmp_path / "cube",
                   reg="matern", coefficient=10.0, reg_scale=0.5, pb_correction=False,
                   uncertainty_map=False, chunk_k=CHUNK, kernel_cache=str(tmp_path / "cache"),
-                  streaming=True)
+                  streaming=True, cube_prior="channel")
     assert len(res.products) == uvd.n_chan
     # the MFS/prior fit, then one per channel with the frozen prior
     fits = faked_sparse_fit

@@ -102,7 +102,7 @@ to be left alone. These are the ones worth reaching for:
 | `--criterion structure` | rarely — `auto` already picks this on any well-constrained fit. Force it if the structure ratio the run prints is far from 1 while `chi^2/N` looks fine |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
 | `--inversion dense` | you want the long-established path on a big dataset. `auto` (the default) switches to the sparse w-tilde inversion above 5000 visibilities, which is where the dense mapping matrix starts to dominate — see [Run time and memory](#run-time-and-memory). The sparse path is new; force `dense` if you want to compare |
-| `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on a 1-in-`n_chan` subset by default (`--cube-prior`), which is what makes a cube affordable — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
+| `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on every channel's data by default (`--cube-prior mfs`; `channel` fits it on a 1-in-`n_chan` subset) — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
 
 Full reference: [docs/parameters.md](docs/parameters.md).
 

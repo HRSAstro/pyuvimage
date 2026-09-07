@@ -322,12 +322,13 @@ def main(argv: list[str] | None = None) -> int:
         "is n_image_pixels x N complex",
     )
     p_fit.add_argument(
-        "--cube-prior", default="channel", choices=["channel", "mfs"],
-        help="cube mode only: what the shared prior is fitted on. channel "
-        "(default) uses a random 1-in-n_chan subset -- the same amount of "
-        "data each channel fit will have, and n_chan times cheaper; mfs uses "
-        "every channel's visibilities at once, which is the one step that "
-        "makes a cube run out of memory",
+        "--cube-prior", default="mfs", choices=["mfs", "channel"],
+        help="cube mode only: what the shared prior is fitted on. mfs "
+        "(default) uses every channel's visibilities at once -- free on the "
+        "streamed path, where the MFS terms are the channels' sum; channel "
+        "uses a random 1-in-n_chan subset, the same amount of data each "
+        "channel fit will have, which was what kept the in-memory MFS pass "
+        "affordable",
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
     p_fit.add_argument(

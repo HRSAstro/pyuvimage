@@ -167,7 +167,7 @@ def run(
     envelope_floor: float = 1e-2,
     adapt_power: float = fitting.ADAPT_POWER,
     criterion: str = "auto",
-    cube_prior: str = "channel",
+    cube_prior: str = "mfs",
     chi2_target: float = 1.0,
     positive_only: bool = True,
     enforce_positive: bool = False,
@@ -535,8 +535,8 @@ def run(
             "cube mode: fitting the shared prior on a random 1 visibility in "
             "%d (%d of %d, drawn across all channels) -- the same amount of "
             "data each channel fit will have, which is what the prior is "
-            "being chosen for. Costs %.1f GB instead of %.1f GB. Pass "
-            "--cube-prior mfs for the full pass over every channel.",
+            "being chosen for (--cube-prior channel). Costs %.1f GB instead "
+            "of %.1f GB.",
             prior_thin, len(d), uvd.n_samples,
             fitting.estimate_peak_memory_gb(len(d), n_pix),
             fitting.estimate_peak_memory_gb(uvd.n_samples, n_pix),
@@ -1005,7 +1005,7 @@ def run_streamed(
     use_jax_kernel: bool = False,
     reload: bool = False,
     header=None,
-    cube_prior: str = "channel",
+    cube_prior: str = "mfs",
     transformer: str = "auto",
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
@@ -1156,7 +1156,7 @@ def run_streamed(
                 "cube mode: fitting the shared prior on 1 visibility in %d "
                 "(%d of %d, drawn across all channels) -- the same amount of "
                 "data each channel fit will have, which is what the prior is "
-                "being chosen for. Pass --cube-prior mfs for every channel.",
+                "being chosen for (--cube-prior channel).",
                 prior_thin, terms.n_vis, header.n_samples,
             )
     else:

@@ -62,9 +62,9 @@ def _run(uvd, out, **kw):
     )
 
 
-def test_the_default_fits_the_prior_on_one_channel_worth(cube, tmp_path, caplog):
+def test_channel_fits_the_prior_on_one_channel_worth(cube, tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
-        res = _run(cube, tmp_path)
+        res = _run(cube, tmp_path, cube_prior="channel")
     assert "random 1 visibility in 4" in caplog.text
     assert res.parameters["source_prior"][
         "prior_fitted_on_one_visibility_in"] == cube.n_chan
@@ -78,7 +78,7 @@ def test_the_coefficient_is_used_as_fitted_not_scaled_back(cube, tmp_path):
 
     Checked where it can be checked exactly: a coefficient supplied by hand
     describes the model, not the dataset, and must come back untouched."""
-    res = _run(cube, tmp_path, coefficient=1e4, reg_scale=0.5)
+    res = _run(cube, tmp_path, coefficient=1e4, reg_scale=0.5, cube_prior="channel")
     assert res.parameters["source_prior"]["coefficient"] == pytest.approx(1e4)
     assert res.parameters["source_prior"][
         "prior_fitted_on_one_visibility_in"] == cube.n_chan
@@ -87,15 +87,16 @@ def test_the_coefficient_is_used_as_fitted_not_scaled_back(cube, tmp_path):
 def test_the_prior_pass_really_is_one_channel_worth(cube, tmp_path, caplog):
     """The memory claim, from the log the user will read."""
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
-        _run(cube, tmp_path)
+        _run(cube, tmp_path, cube_prior="channel")
     line = next(l for l in caplog.text.splitlines() if "random 1 visibility" in l)
     per_chan = cube.n_samples // cube.n_chan
     assert f"{per_chan} of {cube.n_samples}" in line
 
 
-def test_mfs_uses_every_visibility(cube, tmp_path, caplog):
+def test_the_default_mfs_uses_every_visibility(cube, tmp_path, caplog):
+    """The default since streaming: the MFS terms are the channels' sum."""
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
-        res = _run(cube, tmp_path, cube_prior="mfs")
+        res = _run(cube, tmp_path)
     assert "random 1 visibility in" not in caplog.text
     assert "prior_fitted_on_one_visibility_in" not in res.parameters["source_prior"]
 
