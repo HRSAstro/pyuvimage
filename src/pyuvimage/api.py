@@ -261,9 +261,10 @@ def run(
             and modification time, so this is for a file rewritten in place
             with both unchanged, or for ruling the cache out.
     """
-    from ._jax_guard import report_if_disabled
+    from ._jax_guard import report_if_disabled, report_if_numba_missing
 
     report_if_disabled()
+    report_if_numba_missing()
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
     stream, header = resolve_streaming(

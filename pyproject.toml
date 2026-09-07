@@ -16,6 +16,10 @@ dependencies = [
     "astropy",
     "matplotlib",
     "autogalaxy",
+    # autoarray's non-negative solver is built on numba kernels; without it
+    # they run as pure Python and every positive-only solve is several times
+    # slower (see docs/install.md)
+    "numba",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +27,11 @@ dependencies = [
 ms = ["python-casacore"]
 # JAX acceleration (strongly recommended for > ~10^4 visibilities):
 jax = ["jax", "nufftax>=0.6.1,<0.7.0"]
+# autoarray's development head: the in-place non-negative solver and its
+# cross-fit warm-start memo (Sep 2026) are not in a release yet, and the
+# version string was not bumped, so `pip install -U autoarray` will not see
+# them. Until the next release: pip install -e ".[autoarray-main]"
+autoarray-main = ["autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray"]
 
 [project.scripts]
 pyuvimage = "pyuvimage.cli:main"
