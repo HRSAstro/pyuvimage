@@ -312,20 +312,28 @@ def test_sparse_accepts_cube_mode(tmp_path, caplog):
     n_chan builds over n_vis/n_chan each total one pass over the dataset --
     the same work as the single MFS kernel.
 
-    This only checks that the guard no longer fires and that the cost is
-    explained; the fit itself needs JAX, which this environment lacks.
+    Without JAX the guard is all that can be checked: the in-memory sparse
+    path explains the per-channel cost and then stops for want of JAX. With
+    JAX the same call streams (a file, sparse named, cube mode) and completes
+    with one plane per channel.
     """
     import logging
 
     from pyuvimage import api
 
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
-        with pytest.raises((RuntimeError, ValueError)) as excinfo:
-            api.run(**_run_kwargs(tmp_path, n_chan=4, mode="cube"))
-    # whatever stops it, it must not be the old mfs-only refusal
-    assert "mfs-only" not in str(excinfo.value)
-    text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "one w-tilde kernel per channel" in text
+        try:
+            res = api.run(**_run_kwargs(tmp_path, n_chan=4, mode="cube",
+                                        uncertainty_map=False))
+        except (RuntimeError, ValueError) as e:
+            # whatever stops it, it must not be the old mfs-only refusal
+            assert "mfs-only" not in str(e)
+            text = "\n".join(r.getMessage() for r in caplog.records)
+            assert "one w-tilde kernel per channel" in text
+        else:
+            assert len(res.products) == 4
+            text = "\n".join(r.getMessage() for r in caplog.records)
+            assert "one channel at a time" in text
 
 
 def test_the_per_channel_kernels_key_apart(tmp_path):

@@ -176,8 +176,10 @@ def test_solve_matches_the_reference_for_every_call_pattern(systems):
     assert system.chi_squared_with_width(positions, 2, 0.05) == pytest.approx(
         ref.solve(positions, sig)[2], rel=1e-11)
     # a widened column and its point version must not share a cache entry
+    # (the same O(N) cancellation as above: 1.6e-12 measured on Accelerate,
+    # so the tolerance is the one the line above already uses)
     assert system.chi_squared(positions) == pytest.approx(
-        ref.solve(positions)[2], rel=1e-12)
+        ref.solve(positions)[2], rel=1e-11)
 
 
 def test_scan_matches_the_reference_with_and_without_accepted_points(systems):
