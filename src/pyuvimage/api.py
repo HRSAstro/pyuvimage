@@ -69,11 +69,6 @@ class RunResult:
         return self.products[0].rms
 
 
-#: `image_centre` values that mean "the phase centre" -- the only place the
-#: streaming path can fit yet
-_PHASE_CENTRE = ("0,0", "centre", (0.0, 0.0), (0, 0))
-
-
 def resolve_streaming(
     streaming,
     dataset,
@@ -93,11 +88,11 @@ def resolve_streaming(
     `auto` streams whenever streaming can give the same answer as the
     in-memory path, which since parity was established on JAX is every case
     `run_streamed` supports: a dataset on disk (an in-memory UVData is
-    already held, so there is nothing to save), MFS, no point components, the
-    image centred on the phase centre, and the sparse inversion -- which
-    under `inversion="auto"` means the same visibility threshold
-    `resolve_inversion` applies, so a small dataset still takes the dense
-    path it always did. Each `auto` that does not stream logs its reason.
+    already held, so there is nothing to save), no point components, and the
+    sparse inversion -- which under `inversion="auto"` means the same
+    visibility threshold `resolve_inversion` applies, so a small dataset
+    still takes the dense path it always did. Cube mode and recentring both
+    stream. Each `auto` that does not stream logs its reason.
 
     True and False are the user's word: True hands an unsupported
     combination to `run_streamed`, which refuses it rather than
@@ -124,17 +119,10 @@ def resolve_streaming(
             "the dataset is already in memory, so streaming it would save "
             "nothing"
         )
-    if mode != "mfs":
-        return _hold("cube mode is not streamed yet (one kernel per channel)")
     if point_sources:
         return _hold(
             "point components need the dense mapping matrix, which the "
             "streaming (sparse) path never forms"
-        )
-    if image_centre not in _PHASE_CENTRE:
-        return _hold(
-            "recentring is not streamed yet; the fit runs in memory at "
-            f"image_centre={image_centre!r}"
         )
     if inversion == "dense":
         return _hold("--inversion dense was asked for")
@@ -295,7 +283,7 @@ def run(
             pb_factor=pb_factor, uncertainty_map=uncertainty_map, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
             point_sources=point_sources, chunk_k=chunk_k, reload=reload,
-            header=header,
+            header=header, cube_prior=cube_prior, transformer=transformer,
         )
     uvd = (
         dataset
@@ -1016,6 +1004,8 @@ def run_streamed(
     use_jax_kernel: bool = False,
     reload: bool = False,
     header=None,
+    cube_prior: str = "channel",
+    transformer: str = "auto",
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
 
@@ -1029,11 +1019,13 @@ def run_streamed(
     operator and nothing else. Peak memory is the model's -- ~1 GB on a
     202-million-sample cube whose in-memory path needed 33 GB.
 
-    What it does not do yet, and refuses rather than approximates: cube mode
-    (one kernel per channel is a loop over this, not written), point
-    components (dense-only anyway), recentring (a phase ramp per visibility
-    is chunk-local and straightforward, but not wired), and `--inversion
-    dense` (nothing to stream *to*).
+    Cube mode streams the file once, one channel at a time, into one
+    `SparseTerms` per channel plus the terms the shared prior is fitted on
+    (`streaming.channel_terms_for`); each channel is then a fit on its own
+    stub, as `run` does it. Recentring is the same phase ramp `run` applies,
+    chunk by chunk (`streaming.recentred`); "auto" images the whole stream
+    once to find the source. What it still refuses: point components
+    (dense-only anyway) and `--inversion dense` (nothing to stream *to*).
 
     `use_jax_kernel` hands the per-chunk kernel accumulation to autoarray's
     JAX backend; the default NumPy backend is bit-identical to the in-memory
@@ -1045,19 +1037,14 @@ def run_streamed(
     from . import streaming as stm
     from .uvdata import describe_pooling, reim_asymmetry
 
-    if mode != "mfs":
-        raise NotImplementedError(
-            "streaming is MFS-only for now: cube mode needs one kernel per "
-            "channel, which is a loop over this path that is not written yet")
+    if mode not in ("mfs", "cube"):
+        raise ValueError("mode must be 'mfs' or 'cube'")
+    if cube_prior not in ("channel", "mfs"):
+        raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
     if point_sources:
         raise NotImplementedError(
             "point components need the dense mapping matrix, so they cannot "
             "run on the streaming (sparse) path")
-    if image_centre not in ("0,0", "centre", (0.0, 0.0), (0, 0)):
-        raise NotImplementedError(
-            "recentring is not streamed yet: the phase ramp is chunk-local "
-            "and straightforward, but not wired. Fit at the phase centre or "
-            "use the in-memory path.")
     if inversion == "dense":
         raise ValueError("streaming has nothing to stream to on the dense path")
     reason = fitting.sparse_inversion_diagnosis()
@@ -1083,7 +1070,9 @@ def run_streamed(
             "%.6g GHz -- streaming",
             header.n_vis, header.n_chan, header.central_frequency / 1e9,
         )
-    _warn_wide_band(header, "mfs")
+    _warn_wide_band(header, mode)
+    cube = mode == "cube" and header.n_chan > 1
+    prior_thin = int(header.n_chan) if cube and cube_prior == "channel" else 1
 
     b_max = header.max_baseline_wavelengths
     b_eff = header.baseline_percentile_wavelengths(BASELINE_PERCENTILE)
@@ -1105,13 +1094,16 @@ def run_streamed(
         )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
     n_image_pixels = int(np.prod(geometry.shape_native))
-    n_data = 2 * header.n_samples
-    criterion = fitting.resolve_criterion(criterion, n_data=n_data, n_mesh_pixels=n_pix)
-    if n_pix > n_data:
+    n_data_all = 2 * header.n_samples
+    # judged on the data each *fit* sees: one channel's worth in cube mode
+    # under `--cube-prior channel` (see `run`)
+    n_data_fit = 2 * (header.n_samples // prior_thin)
+    criterion = fitting.resolve_criterion(criterion, n_data=n_data_fit, n_mesh_pixels=n_pix)
+    if n_pix > n_data_fit:
         logger.warning(
             "the model has more pixels (%d) than data points (%d): the "
             "reconstruction is under-constrained and its faint structure is "
-            "set mainly by the source prior, not the data.", n_pix, n_data,
+            "set mainly by the source prior, not the data.", n_pix, n_data_fit,
         )
 
     # the same pooling decision `run` makes, on the header's noise sample
@@ -1140,11 +1132,40 @@ def run_streamed(
     if reload:
         logger.info("--reload: the visibilities are streamed again whether or "
                     "not their terms are cached")
-    terms = stm.sparse_terms_for(
-        dataset, geometry, mask, chunk_transformer, cache_dir=kernel_cache_dir,
-        chunk_k=chunk_k, use_jax=use_jax_kernel, mask_shape=mask_shape,
-        pool_noise=pool, reuse_cache=not reload,
+    # --image-centre: the same phase ramp `run` applies, per chunk. A ramp
+    # mixes re and im, so the recentred stream's noise is pooled (as
+    # `shift_image_centre` pools it); the header carries the offset for the WCS.
+    shift = _streamed_centre(
+        dataset, header, image_centre, fov, dish_diameter, chunk_k,
+        kernel_cache_dir, reuse_cache=not reload,
     )
+    if shift is not None:
+        header = header.with_centre(*shift)
+        pool = True
+    if cube:
+        channels = header.channel_index()
+        per_channel, terms = stm.channel_terms_for(
+            dataset, geometry, mask, chunk_transformer, channels,
+            cache_dir=kernel_cache_dir, chunk_k=chunk_k, use_jax=use_jax_kernel,
+            mask_shape=mask_shape, pool_noise=pool, reuse_cache=not reload,
+            centre=shift, thin=prior_thin,
+        )
+        if prior_thin > 1:
+            logger.info(
+                "cube mode: fitting the shared prior on 1 visibility in %d "
+                "(%d of %d, drawn across all channels) -- the same amount of "
+                "data each channel fit will have, which is what the prior is "
+                "being chosen for. Pass --cube-prior mfs for every channel.",
+                prior_thin, terms.n_vis, header.n_samples,
+            )
+    else:
+        per_channel = None
+        terms = stm.sparse_terms_for(
+            dataset, geometry, mask, chunk_transformer, cache_dir=kernel_cache_dir,
+            chunk_k=chunk_k, use_jax=use_jax_kernel, mask_shape=mask_shape,
+            pool_noise=pool, reuse_cache=not reload, centre=shift,
+        )
+    n_data = 2 * int(terms.n_vis)     # what the MFS / prior fit is measured on
     if terms.n_vis:
         mean_asym = terms.reim_asymmetry_sum / terms.n_vis
         if mean_asym > fitting.SPARSE_REIM_ASYMMETRY_WARN and not pool:
@@ -1195,7 +1216,7 @@ def run_streamed(
     fixed_prior = _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale,
                                optimise_envelope=optimise_env)
 
-    logger.info("fitting MFS image (%d visibility samples, none held)...", header.n_samples)
+    logger.info("fitting MFS image (%d visibility samples, none held)...", terms.n_vis)
     mfs_fit = fitting.fit_dataset(
         stub, geometry, reg_kind=reg, prior=fixed_prior,
         positive_only=positive_only, enforce_positive=enforce_positive,
@@ -1215,29 +1236,83 @@ def run_streamed(
     if pb_correction and not dish:
         logger.warning("no dish diameter known: skipping primary-beam products")
         pb_correction = False
-    products = [_products_for(
-        mfs_fit, stub, geometry, header, header.central_frequency, pb_correction,
-        dish, pb_factor, oversample, uncertainty_map, imager=imager,
-    )]
-    _report_dynamic_range(products[0], n_data, criterion)
+    channel_chi2: list[float] = []
+    if not cube:
+        products = [_products_for(
+            mfs_fit, stub, geometry, header, header.central_frequency, pb_correction,
+            dish, pb_factor, oversample, uncertainty_map, imager=imager,
+        )]
+        _report_dynamic_range(products[0], n_data_all, criterion)
+        freqs = np.atleast_1d(header.central_frequency)
+    else:
+        # -- the channels: `run`'s cube loop, each on its own stub ----------
+        frozen = dict(mfs_fit.prior)
+        logger.info(
+            "cube mode: source prior frozen from the MFS fit (%s)",
+            ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
+        )
+        # what the MFS guard actually ran with, not what was asked for
+        positive_only = bool(getattr(mfs_fit, "positive_only", positive_only))
+        if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
+            # the brightness map too, so each channel is one fit rather than
+            # its own two-pass search (see `run`)
+            envelope = dict(envelope)
+            envelope["brightness"] = np.clip(
+                np.asarray(mfs_fit.model_mesh_image).ravel(), 0.0, None
+            )
+            logger.info(
+                "cube mode: the adaptive prior's brightness map is frozen "
+                "too, so each channel is a single fit rather than its own "
+                "two-pass search"
+            )
+        mfs_summary = _fit_summary(mfs_fit)
+        products = []
+        freqs = header.frequencies
+        for c, key in enumerate(channels):
+            terms_c = per_channel[key]
+            stub_c = stm.stub_dataset_from_terms(terms_c, geometry, mask)
+            imager_c = fitting.imager_for(stub_c)
+            sf = fitting.fit_dataset(
+                stub_c, geometry, reg_kind=reg, prior=frozen,
+                positive_only=positive_only, enforce_positive=enforce_positive,
+                criterion=criterion, nu=nu, envelope=envelope,
+                chi2_target=chi2_target, warn_on_chi2=False,
+            )
+            n_data_c = 2 * int(terms_c.n_vis)
+            channel_chi2.append(float(sf.chi_squared) / n_data_c)
+            logger.log(
+                logging.WARNING
+                if sf.chi_squared / n_data_c > 1.3 * chi2_target else logging.INFO,
+                "channel %d/%d (%.6g GHz): chi2/N = %.3f", c + 1, len(channels),
+                float(freqs[c]) / 1e9, sf.chi_squared / n_data_c,
+            )
+            products.append(_products_for(
+                sf, stub_c, geometry, header, float(freqs[c]), pb_correction,
+                dish, pb_factor, oversample, uncertainty_map, imager=imager_c,
+            ))
+            del sf, stub_c, imager_c
+        mfs_fit = mfs_summary
 
     parameters = _parameter_record(
-        header, geometry, "mfs", reg, criterion, chi2_target, positive_only,
+        header, geometry, mode, reg, criterion, chi2_target, positive_only,
         chunk_transformer.__name__, oversample, dish, pb_factor, pb_correction,
         mfs_fit, scan, envelope=envelope, inversion="sparse",
         n_data_fitted=n_data, transformer_requested="streamed",
+        prior_thin=prior_thin,
+        channel_chi2_per_datum=channel_chi2 if cube else None,
     )
     parameters["streaming"] = {
-        "chunk_k": chunk_k, "n_visibilities_streamed": int(terms.n_vis),
+        "chunk_k": chunk_k, "n_visibilities_streamed": int(header.n_samples),
         "seconds_streaming": float(terms.seconds), "reload": bool(reload),
         "terms_cache": str(kernel_cache_dir) if kernel_cache_dir else None,
         "noise_pooled": bool(pool),
+        "image_centre_grid_arcsec": list(shift) if shift is not None else None,
     }
     written = {}
     if write:
         written = write_products(
-            products, geometry, header.meta, np.atleast_1d(header.central_frequency),
-            out, scan=scan, parameters=parameters,
+            products, geometry, header.meta, freqs, out, scan=scan,
+            parameters=parameters,
         )
         logger.info("products written to %s", Path(out).resolve())
     return RunResult(
@@ -1385,8 +1460,9 @@ AUTO_CENTRE_FIELD_FACTOR = 4.0
 AUTO_CENTRE_PIXELS = 96
 
 
-def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
-    """Apply --image-centre, resolving "auto" from a wide-field dirty image.
+def _explicit_centre(image_centre):
+    """Parse `image_centre` short of "auto": None for the phase centre, "auto"
+    for the string, else the grid (y, x) offset in arcsec.
 
     An explicit centre is given as image ``(x, y)`` in arcsec from the phase
     centre -- +x right and +y up, as read off `summary.png`, the same
@@ -1395,14 +1471,12 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
     they go through `pointsource.image_to_sky` and `sky_to_grid` rather than
     being written out by hand.
     """
-    from . import beam as beam_mod
-    from .pointsource import grid_to_sky, image_to_sky, sky_to_grid
-    from .uvdata import shift_image_centre
+    from .pointsource import image_to_sky, sky_to_grid
 
     if image_centre is None or (
         isinstance(image_centre, str) and image_centre == "centre"
     ):
-        return uvd
+        return None
     # "0,0" is the phase centre, so it must be exactly as much of a no-op as
     # "centre" is. Not merely cosmetic: `shift_image_centre` pools sigma_re
     # and sigma_im in quadrature, which is right when the phase ramp really
@@ -1413,8 +1487,10 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
     if not isinstance(image_centre, str) and (
         float(image_centre[0]) == 0.0 and float(image_centre[1]) == 0.0
     ):
-        return uvd
-    if isinstance(image_centre, str) and image_centre != "auto":
+        return None
+    if isinstance(image_centre, str):
+        if image_centre == "auto":
+            return "auto"
         # `run()` may be called directly with the same spelling the CLI takes,
         # and its own default is now the string "0,0", so a numeric pair has
         # to parse here as well as in `cli._parse_centre`.
@@ -1428,45 +1504,43 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
                 "'centre'"
             ) from None
         if x == 0.0 and y == 0.0:
-            return uvd
+            return None
         image_centre = (x, y)
-    if isinstance(image_centre, str):
-        dish = dish_diameter or uvd.meta.get("dish_diameter_m")
-        wide = fov * AUTO_CENTRE_FIELD_FACTOR
-        if dish:
-            wide = min(
-                wide,
-                primary_beam.pb_fwhm_arcsec(uvd.central_frequency, dish),
-            )
-        wide = max(wide, fov)
-        uv, d, n = uvd.flattened()
-        logger.info(
-            "looking for the source in a %.3g\" dirty image before choosing "
-            "the reconstruction centre...", wide,
-        )
-        img, rms = beam_mod.wide_field_image(
-            uv, d, n, wide, n_pixels=AUTO_CENTRE_PIXELS,
-            transformer=transformer,
-        )
-        centre = envelope_mod.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
-        peak = float(np.nanmax(img))
-        d_ra, d_dec = grid_to_sky(*centre)
-        logger.info(
-            "  brightest peak %.3g Jy/beam (%.0f sigma) at x %+.3f\", "
-            "y %+.3f\" (dRA %+.3f\", dDec %+.3f\")",
-            peak, peak / rms if rms > 0 else np.nan,
-            -d_ra, d_dec, d_ra, d_dec,
-        )
-        if max(abs(centre[0]), abs(centre[1])) < 0.5 * (
-            wide / AUTO_CENTRE_PIXELS
-        ):
-            logger.info("  already at the phase centre; not recentring")
-            return uvd
-    else:
-        # given as image (x, y); the grid and everything below is sky
-        centre = sky_to_grid(
-            *image_to_sky(float(image_centre[0]), float(image_centre[1]))
-        )
+    # given as image (x, y); the grid and everything below is sky
+    return sky_to_grid(*image_to_sky(float(image_centre[0]), float(image_centre[1])))
+
+
+def _wide_field_extent(fov: float, dish, central_frequency: float) -> float:
+    """How wide a field `--image-centre auto` looks at: a few times the
+    reconstruction, but never beyond the primary beam."""
+    wide = fov * AUTO_CENTRE_FIELD_FACTOR
+    if dish:
+        wide = min(wide, primary_beam.pb_fwhm_arcsec(central_frequency, dish))
+    return max(wide, fov)
+
+
+def _centre_from_wide_field(img: np.ndarray, rms: float, wide: float):
+    """The grid (y, x) of the brightest peak of a wide-field dirty image, or
+    None when it is already at the phase centre to within half a pixel."""
+    from .pointsource import grid_to_sky
+
+    centre = envelope_mod.peak_offset_arcsec(img, wide / AUTO_CENTRE_PIXELS)
+    peak = float(np.nanmax(img))
+    d_ra, d_dec = grid_to_sky(*centre)
+    logger.info(
+        "  brightest peak %.3g Jy/beam (%.0f sigma) at x %+.3f\", "
+        "y %+.3f\" (dRA %+.3f\", dDec %+.3f\")",
+        peak, peak / rms if rms > 0 else np.nan,
+        -d_ra, d_dec, d_ra, d_dec,
+    )
+    if max(abs(centre[0]), abs(centre[1])) < 0.5 * (wide / AUTO_CENTRE_PIXELS):
+        logger.info("  already at the phase centre; not recentring")
+        return None
+    return centre
+
+
+def _announce_centre(centre) -> None:
+    from .pointsource import grid_to_sky
 
     d_ra, d_dec = grid_to_sky(*centre)
     # both conventions, every time: the CLI takes image x,y and everything
@@ -1476,7 +1550,63 @@ def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
         "(dRA %+.3f\", dDec %+.3f\") from the phase centre; the output WCS "
         "follows.", -d_ra, d_dec, d_ra, d_dec,
     )
+
+
+def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):
+    """Apply --image-centre to an in-memory dataset, resolving "auto" from a
+    wide-field dirty image."""
+    from . import beam as beam_mod
+    from .uvdata import shift_image_centre
+
+    centre = _explicit_centre(image_centre)
+    if centre is None:
+        return uvd
+    if isinstance(centre, str):
+        dish = dish_diameter or uvd.meta.get("dish_diameter_m")
+        wide = _wide_field_extent(fov, dish, uvd.central_frequency)
+        uv, d, n = uvd.flattened()
+        logger.info(
+            "looking for the source in a %.3g\" dirty image before choosing "
+            "the reconstruction centre...", wide,
+        )
+        img, rms = beam_mod.wide_field_image(
+            uv, d, n, wide, n_pixels=AUTO_CENTRE_PIXELS,
+            transformer=transformer,
+        )
+        centre = _centre_from_wide_field(img, rms, wide)
+        if centre is None:
+            return uvd
+    _announce_centre(centre)
     return shift_image_centre(uvd, centre)
+
+
+def _streamed_centre(source, header, image_centre, fov: float, dish_diameter,
+                     chunk_k: int, cache_dir, reuse_cache: bool):
+    """`_recentre`'s decision for a stream: the grid (y, x) to recentre on, or
+    None. "auto" images the whole stream once (`streaming.wide_field_image_for`,
+    cached); the shift itself is applied chunk by chunk when the terms are
+    accumulated (`streaming.recentred`)."""
+    from . import streaming as stm
+
+    centre = _explicit_centre(image_centre)
+    if centre is None:
+        return None
+    if isinstance(centre, str):
+        dish = dish_diameter or header.meta.get("dish_diameter_m")
+        wide = _wide_field_extent(fov, dish, header.central_frequency)
+        logger.info(
+            "looking for the source in a %.3g\" dirty image before choosing "
+            "the reconstruction centre...", wide,
+        )
+        img, rms = stm.wide_field_image_for(
+            source, wide, AUTO_CENTRE_PIXELS, chunk_k=chunk_k,
+            cache_dir=cache_dir, reuse_cache=reuse_cache,
+        )
+        centre = _centre_from_wide_field(img, rms, wide)
+        if centre is None:
+            return None
+    _announce_centre(centre)
+    return (float(centre[0]), float(centre[1]))
 
 
 def _warn_wide_band(uvd, mode: str) -> None:

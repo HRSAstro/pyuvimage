@@ -282,6 +282,53 @@ def restore(
     return restored + np.nan_to_num(residual_dirty_jy_beam)
 
 
+class WideFieldAccumulator:
+    """A naturally weighted dirty image by direct summation, fed in chunks.
+
+    Deliberately does not go through a transformer. The point is to look at a
+    field far larger than the one being reconstructed -- to find where the
+    emission actually is -- and building an autoarray dataset for that would
+    allocate the ``n_pixels^2 x n_vis`` temporary the whole exercise is meant
+    to avoid. Here memory is bounded by the chunk handed to `add`, and the
+    streaming path can feed it straight from the file.
+
+    The image follows the same convention as every other native image here:
+    row 0 is North (+y), column index increases with +x, so
+    `envelope.peak_offset_arcsec` reads it directly.
+    """
+
+    def __init__(self, fov_arcsec: float, n_pixels: int = 96):
+        arcsec = np.pi / 180.0 / 3600.0
+        step = fov_arcsec / n_pixels
+        coord = (np.arange(n_pixels) - (n_pixels - 1) / 2.0) * step * arcsec
+        self.x_of_col = coord                 # +x with increasing column
+        self.y_of_row = coord[::-1]           # +y (North) at row 0
+        self.img = np.zeros((n_pixels, n_pixels))
+        self.total = 0.0
+
+    def add(self, uv_wavelengths: np.ndarray, data: np.ndarray, noise: np.ndarray) -> None:
+        uv = np.asarray(uv_wavelengths, dtype=float)
+        d = np.asarray(data)
+        sig = np.asarray(noise)
+        if len(d) == 0:
+            return
+        wc = 1.0 / (0.5 * (sig.real**2 + sig.imag**2))
+        u, v = uv[:, 0], uv[:, 1]
+        for r, yy in enumerate(self.y_of_row):
+            ph = 2.0 * np.pi * (u[None, :] * self.x_of_col[:, None] + v[None, :] * yy)
+            # Re[V e^{+i phi}] -- the sign that matches `DirtyImager`; the
+            # other one returns the image flipped in both axes, which is easy
+            # to miss on a centrally peaked source and wrong on every other
+            self.img[r] += (wc * (d.real * np.cos(ph) - d.imag * np.sin(ph))).sum(1)
+        self.total += float(np.sum(wc))
+
+    def image(self) -> tuple[np.ndarray, float]:
+        """(image [Jy/beam], analytic rms [Jy/beam])."""
+        if not np.isfinite(self.total) or self.total <= 0:
+            raise RuntimeError("no usable weights for the wide-field dirty image")
+        return self.img / self.total, float(1.0 / np.sqrt(self.total))
+
+
 def wide_field_dirty_image(
     uv_wavelengths: np.ndarray,
     data: np.ndarray,
@@ -290,48 +337,20 @@ def wide_field_dirty_image(
     n_pixels: int = 96,
     chunk: int = 4096,
 ) -> tuple[np.ndarray, float]:
-    """A naturally weighted dirty image by direct summation, in chunks.
-
-    Deliberately does not go through a transformer. The point is to look at a
-    field far larger than the one being reconstructed -- to find where the
-    emission actually is -- and building an autoarray dataset for that would
-    allocate the ``n_pixels^2 x n_vis`` temporary the whole exercise is meant
-    to avoid. Here memory is bounded by ``chunk``.
+    """`WideFieldAccumulator` over arrays already in memory, `chunk` at a time.
 
     On a real ALMA dataset (164k visibilities, 96x96 pixels) this takes about
     a minute and a few hundred MB.
 
-    The returned array follows the same convention as every other native image
-    here: row 0 is North (+y), column index increases with +x, so
-    `envelope.peak_offset_arcsec` reads it directly.
-
     Returns (image [Jy/beam], analytic rms [Jy/beam]).
     """
+    acc = WideFieldAccumulator(fov_arcsec, n_pixels)
     uv = np.asarray(uv_wavelengths, dtype=float)
     vis = np.asarray(data)
     sig = np.asarray(noise)
-    w = 1.0 / (0.5 * (sig.real**2 + sig.imag**2))
-    total = float(np.sum(w))
-    if not np.isfinite(total) or total <= 0:
-        raise RuntimeError("no usable weights for the wide-field dirty image")
-    arcsec = np.pi / 180.0 / 3600.0
-    step = fov_arcsec / n_pixels
-    coord = (np.arange(n_pixels) - (n_pixels - 1) / 2.0) * step * arcsec
-    x_of_col = coord                 # +x with increasing column
-    y_of_row = coord[::-1]           # +y (North) at row 0
-    img = np.zeros((n_pixels, n_pixels))
     for s in range(0, len(vis), chunk):
-        u = uv[s:s + chunk, 0]
-        v = uv[s:s + chunk, 1]
-        d = vis[s:s + chunk]
-        wc = w[s:s + chunk]
-        for r, yy in enumerate(y_of_row):
-            ph = 2.0 * np.pi * (u[None, :] * x_of_col[:, None] + v[None, :] * yy)
-            # Re[V e^{+i phi}] -- the sign that matches `DirtyImager`; the
-            # other one returns the image flipped in both axes, which is easy
-            # to miss on a centrally peaked source and wrong on every other
-            img[r] += (wc * (d.real * np.cos(ph) - d.imag * np.sin(ph))).sum(1)
-    return img / total, float(1.0 / np.sqrt(total))
+        acc.add(uv[s:s + chunk], vis[s:s + chunk], sig[s:s + chunk])
+    return acc.image()
 
 
 def wide_field_image(

@@ -285,10 +285,10 @@ def test_n_data_reads_the_terms_not_the_stub(terms):
 
 
 @pytest.mark.parametrize("kwargs, exc", [
-    (dict(mode="cube"), NotImplementedError),
     (dict(point_sources=True), NotImplementedError),
-    (dict(image_centre="auto"), NotImplementedError),
     (dict(inversion="dense"), ValueError),
+    (dict(mode="slices"), ValueError),
+    (dict(mode="cube", cube_prior="median"), ValueError),
 ])
 def test_run_streamed_refuses_what_it_cannot_do_yet(ragged, kwargs, exc):
     from pyuvimage import api
@@ -312,13 +312,13 @@ def test_auto_streams_a_file_on_the_mfs_sparse_path(npz_path, monkeypatch, caplo
     assert stream is True
     assert header is not None and header.n_samples > 0
     assert "streaming auto -> streamed" in caplog.text
+    # cube mode and recentring stream too, now that both are wired
+    for kwargs in (dict(mode="cube"), dict(image_centre="auto"), dict(image_centre=(1.0, 0.5))):
+        assert api.resolve_streaming("auto", str(npz_path), **kwargs)[0] is True
 
 
 @pytest.mark.parametrize("kwargs, why", [
-    (dict(mode="cube"), "cube mode"),
     (dict(point_sources=True), "point components"),
-    (dict(image_centre="auto"), "recentring"),
-    (dict(image_centre=(1.0, 0.0)), "recentring"),
     (dict(inversion="dense"), "dense"),
 ])
 def test_auto_holds_the_data_where_streaming_is_not_supported(
@@ -395,6 +395,287 @@ def test_the_cli_defaults_to_auto_and_has_both_switches(monkeypatch):
         assert seen[-1]["reload"] is reload
 
 
+# --- recentring, chunk by chunk ---------------------------------------------------
+
+def test_recentred_chunks_are_shift_image_centre_chunk_by_chunk(ragged):
+    """`streaming.recentred` is `uvdata.shift_image_centre` applied per chunk:
+    the same phase ramp, the same pooled noise, the uv untouched."""
+    from pyuvimage.uvdata import shift_image_centre
+
+    uvd, _, _ = ragged
+    centre = (0.7, -0.4)                        # grid (y, x) arcsec
+    reference = list(stm.iter_uvdata_chunks(shift_image_centre(uvd, centre), CHUNK))
+    streamed = list(stm.recentred(stm.iter_uvdata_chunks(uvd, CHUNK), centre))
+    assert len(reference) == len(streamed) > 1
+    for r, s in zip(reference, streamed):
+        assert np.array_equal(r.uv, s.uv)
+        np.testing.assert_allclose(s.data, r.data, rtol=1e-12, atol=1e-12 * np.abs(r.data).max())
+        np.testing.assert_allclose(s.noise, r.noise, rtol=1e-14)
+    # a zero shift is a no-op, noise included -- exactly as in memory
+    plain = list(stm.recentred(stm.iter_uvdata_chunks(uvd, CHUNK), (0.0, 0.0)))
+    for a, b in zip(plain, stm.iter_uvdata_chunks(uvd, CHUNK)):
+        assert np.array_equal(a.data, b.data) and np.array_equal(a.noise, b.noise)
+
+
+def test_recentred_terms_are_the_terms_of_the_recentred_dataset(ragged, tmp_path):
+    from pyuvimage.uvdata import shift_image_centre
+
+    uvd, _, geom = ragged
+    centre = (0.7, -0.4)
+    mask = fitting.make_mask(geom, "square")
+    direct = stm.accumulate_sparse_terms(
+        stm.iter_uvdata_chunks(shift_image_centre(uvd, centre), CHUNK), geom, mask,
+        ag.TransformerDFT, pool_noise=True)
+    streamed = stm.sparse_terms_for(uvd, geom, mask, ag.TransformerDFT, chunk_k=CHUNK,
+                                    pool_noise=True, centre=centre, cache_dir=tmp_path)
+    np.testing.assert_allclose(streamed.kernel, direct.kernel, rtol=1e-12)
+    np.testing.assert_allclose(streamed.dirty_image, direct.dirty_image, rtol=1e-10,
+                               atol=1e-12 * np.abs(direct.dirty_image).max())
+    assert streamed.data_term == pytest.approx(direct.data_term, rel=1e-12)
+    # the centre is in the key: the phase-centre terms are a different entry
+    assert stm.terms_key(uvd, geom, pool_noise=True, centre=centre) != \
+        stm.terms_key(uvd, geom, pool_noise=True)
+    assert stm.terms_key(uvd, geom, pool_noise=True, centre=(0.0, 0.0)) == \
+        stm.terms_key(uvd, geom, pool_noise=True)
+
+
+def test_the_streamed_wide_field_image_is_the_direct_one(ragged, flat, npz_path, tmp_path, caplog):
+    """`--image-centre auto` on a stream images the whole file by the same
+    direct summation `beam.wide_field_dirty_image` uses, and caches it."""
+    import logging
+    from pyuvimage import beam as beam_mod
+
+    uvd, _, _ = ragged
+    uv, d, n = uvd.flattened()
+    ref, rms_ref = beam_mod.wide_field_dirty_image(uv, d, n, 6.0, n_pixels=16)
+    img, rms = stm.wide_field_image_for(str(npz_path), 6.0, 16, chunk_k=CHUNK, cache_dir=tmp_path)
+    np.testing.assert_allclose(img, ref, rtol=1e-10, atol=1e-12 * np.abs(ref).max())
+    assert rms == pytest.approx(rms_ref, rel=1e-12)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        again, _ = stm.wide_field_image_for(str(npz_path), 6.0, 16, chunk_k=CHUNK, cache_dir=tmp_path)
+    assert "reusing the cached wide-field image" in caplog.text
+    assert np.array_equal(again, img)
+
+
+def test_the_streamed_centre_decision_matches_the_in_memory_one(ragged, npz_path, tmp_path):
+    from pyuvimage import api
+
+    uvd, _, _ = ragged
+    header = stm.scan_header(str(npz_path), CHUNK)
+    # explicit: the same grid offset `_recentre` would shift by
+    assert api._streamed_centre(str(npz_path), header, (1.0, 0.5), 3.0, None, CHUNK,
+                                tmp_path, True) == pytest.approx(api._explicit_centre((1.0, 0.5)))
+    assert api._streamed_centre(str(npz_path), header, "0,0", 3.0, None, CHUNK, tmp_path, True) is None
+    assert api._streamed_centre(str(npz_path), header, "centre", 3.0, None, CHUNK, tmp_path, True) is None
+    # the header of a recentred stream carries the offset for the WCS
+    shifted = header.with_centre(0.7, -0.4)
+    assert shifted.meta["image_centre_offset_arcsec"] == [0.7, -0.4]
+    assert "image_centre_offset_arcsec" not in header.meta
+
+
+# --- cube mode: one channel at a time ---------------------------------------------
+
+def test_per_channel_chunks_carry_their_channel_and_never_span_two(ragged, npz_path):
+    uvd, _, _ = ragged
+    for source in (uvd, str(npz_path)):
+        chunks = list(stm.iter_chunks(source, CHUNK, per_channel=True))
+        assert all(ch.channel is not None for ch in chunks)
+        # concatenated, still `flattened()` bit for bit
+        uv0, d0, n0 = uvd.flattened()
+        assert np.array_equal(np.concatenate([c.uv for c in chunks]), uv0)
+        assert np.array_equal(np.concatenate([c.data for c in chunks]), d0)
+        # every (spw, channel) of the header appears, in header order
+        seen = list(dict.fromkeys((c.spw, c.channel) for c in chunks))
+        assert sorted(seen) == sorted((i, c) for i, s in enumerate(uvd.spws)
+                                      for c in range(s.n_chan))
+    # the header's channel order is the in-memory one
+    header = stm.scan_header(str(npz_path), CHUNK)
+    assert header.channel_index() == uvd._channel_index()
+
+
+def test_channel_terms_are_each_channels_own_and_sum_to_the_mfs_terms(ragged, terms):
+    """One pass yields every channel's terms; each equals the terms of that
+    channel alone, and their sum is the MFS terms (every field is a sum over
+    visibilities)."""
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    per_channel, mfs = stm.accumulate_channel_terms(
+        stm.iter_uvdata_chunks(uvd, CHUNK, per_channel=True), geom, mask,
+        ag.TransformerDFT, pool_noise=True)
+    assert set(per_channel) == {(i, c) for i, s in enumerate(uvd.spws) for c in range(s.n_chan)}
+    for c, (spw_i, chan_i) in enumerate(uvd._channel_index()):
+        one = uvd.select(channel=c)
+        alone = stm.accumulate_sparse_terms(stm.iter_uvdata_chunks(one, CHUNK), geom, mask,
+                                            ag.TransformerDFT, pool_noise=True)
+        got = per_channel[(spw_i, chan_i)]
+        assert got.n_vis == alone.n_vis > 0
+        np.testing.assert_allclose(got.kernel, alone.kernel, rtol=1e-12)
+        np.testing.assert_allclose(got.dirty_image, alone.dirty_image, rtol=1e-10,
+                                   atol=1e-12 * np.abs(alone.dirty_image).max())
+        assert got.data_term == pytest.approx(alone.data_term, rel=1e-12)
+    np.testing.assert_allclose(mfs.kernel, terms.kernel, rtol=1e-12)
+    np.testing.assert_allclose(mfs.dirty_image, terms.dirty_image, rtol=1e-10,
+                               atol=1e-12 * np.abs(terms.dirty_image).max())
+    assert mfs.n_vis == terms.n_vis
+    assert mfs.data_term == pytest.approx(terms.data_term, rel=1e-12)
+    # every channel's terms carry the whole dataset's row bookkeeping
+    assert np.array_equal(mfs.row_lengths, terms.row_lengths)
+    for t in per_channel.values():
+        assert np.array_equal(t.row_lengths, terms.row_lengths)
+        assert np.array_equal(t.row_keep, terms.row_keep)
+
+
+def test_thinned_prior_terms_hold_about_one_channels_worth(ragged, terms):
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    n_chan = uvd.n_chan
+    _, thinned = stm.accumulate_channel_terms(
+        stm.iter_uvdata_chunks(uvd, CHUNK, per_channel=True), geom, mask,
+        ag.TransformerDFT, pool_noise=True, thin=n_chan)
+    expected = terms.n_vis / n_chan
+    assert abs(thinned.n_vis - expected) < 4 * np.sqrt(expected)
+    assert 0 < thinned.data_term < terms.data_term
+    assert thinned.kernel[0, 0] < terms.kernel[0, 0]
+    # deterministic: the same draw on a second pass
+    _, again = stm.accumulate_channel_terms(
+        stm.iter_uvdata_chunks(uvd, CHUNK, per_channel=True), geom, mask,
+        ag.TransformerDFT, pool_noise=True, thin=n_chan)
+    assert again.n_vis == thinned.n_vis and np.array_equal(again.kernel, thinned.kernel)
+
+
+def test_channel_terms_are_cached_per_channel(ragged, npz_path, tmp_path, caplog):
+    import logging
+
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    header = stm.scan_header(str(npz_path), CHUNK)
+    channels = header.channel_index()
+    first, prior = stm.channel_terms_for(str(npz_path), geom, mask, ag.TransformerDFT, channels,
+                                         cache_dir=tmp_path, chunk_k=CHUNK, pool_noise=True,
+                                         thin=len(channels))
+    assert len(list(tmp_path.glob("terms_*"))) == len(channels) + 1
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        again, prior2 = stm.channel_terms_for(str(npz_path), geom, mask, ag.TransformerDFT, channels,
+                                              cache_dir=tmp_path, chunk_k=CHUNK, pool_noise=True,
+                                              thin=len(channels))
+    assert "no data read this run" in caplog.text
+    for key in channels:
+        assert np.array_equal(again[key].kernel, first[key].kernel)
+    assert np.array_equal(prior2.kernel, prior.kernel)
+    # --reload streams again
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        stm.channel_terms_for(str(npz_path), geom, mask, ag.TransformerDFT, channels,
+                              cache_dir=tmp_path, chunk_k=CHUNK, pool_noise=True,
+                              thin=len(channels), reuse_cache=False)
+    assert "no data read this run" not in caplog.text
+
+
+# --- the run_streamed flow, with the JAX-only pieces faked -----------------------
+
+class _ZeroFit:
+    """A `SingleFit` stand-in: the zero model on a stub's terms.
+
+    Everything `run_streamed` and `_products_for` read from a fit -- and
+    nothing that needs the sparse operator. chi^2 of the zero model is the
+    data term, so the numbers stay honest."""
+
+    def __init__(self, stub, geometry, prior):
+        terms = fitting.streamed_terms_of(stub)
+        self.model_image = np.zeros(tuple(geometry.shape_native))
+        self.model_mesh_image = np.zeros(tuple(geometry.mesh_shape))
+        self.chi_squared = float(terms.data_term)
+        self.log_evidence = -0.5 * self.chi_squared
+        self.prior = dict(prior or {"coefficient": 1.0, "scale": 0.5, "nu": 1.5})
+        self.coefficient = float(self.prior["coefficient"])
+        self.scan = None
+        self.positive_only = True
+        self.points = []
+
+
+class _Stub:
+    pass
+
+
+@pytest.fixture
+def faked_sparse_fit(monkeypatch):
+    """Route the sparse-only steps of `run_streamed` through fakes so the rest
+    of the flow -- header, centre, per-channel terms, channel loop, record,
+    products -- runs where JAX is absent."""
+    from pyuvimage import api
+
+    monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
+
+    def stub_from(terms, geometry, mask, batch_size=128):
+        st = _Stub()
+        setattr(st, fitting.STREAMED_TERMS_ATTR, terms)
+        st.terms, st.mask = terms, mask
+        return st
+
+    monkeypatch.setattr(stm, "stub_dataset_from_terms", stub_from)
+    monkeypatch.setattr(fitting, "imager_for", lambda ds: stm.KernelDirtyImager(ds.terms, ds.mask))
+    fits = []
+
+    def fake_fit_dataset(dataset, geometry, prior=None, **kwargs):
+        f = _ZeroFit(dataset, geometry, prior)
+        fits.append((f, {"prior": prior, **kwargs}))
+        return f
+
+    monkeypatch.setattr(fitting, "fit_dataset", fake_fit_dataset)
+    return fits
+
+
+def test_run_streamed_cube_flow(ragged, npz_path, tmp_path, faked_sparse_fit):
+    """Cube mode end to end on the streaming path: one plane per channel in
+    header order, each fitted on its own terms with the frozen prior, the
+    record and the products written."""
+    from pyuvimage import api
+
+    uvd, _, _ = ragged
+    res = api.run(str(npz_path), fov=3.0, mode="cube", out=tmp_path / "cube",
+                  reg="matern", coefficient=10.0, reg_scale=0.5, pb_correction=False,
+                  uncertainty_map=False, chunk_k=CHUNK, kernel_cache=str(tmp_path / "cache"),
+                  streaming=True)
+    assert len(res.products) == uvd.n_chan
+    # the MFS/prior fit, then one per channel with the frozen prior
+    fits = faked_sparse_fit
+    assert len(fits) == 1 + uvd.n_chan
+    assert all(kw["prior"] == fits[0][0].prior for _, kw in fits[1:])
+    assert res.parameters["streaming"]["n_visibilities_streamed"] == uvd.n_samples
+    assert res.parameters["source_prior"]["prior_fitted_on_one_visibility_in"] == uvd.n_chan
+    assert len(res.parameters["fit_quality"]["channel_chi2_per_datum"]) == uvd.n_chan
+    assert (tmp_path / "cube" / "model.fits").exists()
+    from astropy.io import fits as afits
+    assert afits.getdata(tmp_path / "cube" / "model.fits").shape[0] == uvd.n_chan
+    # cached per channel (+ the thinned prior): a re-run reads nothing
+    assert len(list((tmp_path / "cache").glob("terms_*"))) == uvd.n_chan + 1
+
+
+def test_run_streamed_recentred_flow(ragged, npz_path, tmp_path, faked_sparse_fit, caplog):
+    import logging
+    from pyuvimage import api
+
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        res = api.run(str(npz_path), fov=3.0, out=tmp_path / "rc", reg="matern",
+                      coefficient=10.0, reg_scale=0.5, pb_correction=False,
+                      uncertainty_map=False, chunk_k=CHUNK, image_centre=(0.6, -0.3),
+                      kernel_cache=str(tmp_path / "cache"), streaming=True)
+    assert "recentring the reconstruction on x +0.600" in caplog.text
+    assert res.uvdata.meta["image_centre_offset_arcsec"] == pytest.approx(
+        list(api._explicit_centre((0.6, -0.3))))
+    assert res.parameters["streaming"]["image_centre_grid_arcsec"] == pytest.approx(
+        list(api._explicit_centre((0.6, -0.3))))
+    assert res.parameters["streaming"]["noise_pooled"] is True
+    # and "auto" images the stream once, then decides
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        api.run(str(npz_path), fov=3.0, out=tmp_path / "auto", reg="matern",
+                coefficient=10.0, reg_scale=0.5, pb_correction=False,
+                uncertainty_map=False, chunk_k=CHUNK, image_centre="auto",
+                kernel_cache=str(tmp_path / "cache"), streaming=True)
+    assert "imaging a" in caplog.text and "brightest peak" in caplog.text
+
+
 # --- JAX-only: the fit itself ----------------------------------------------------
 
 jax_needed = pytest.mark.skipif(
@@ -426,3 +707,40 @@ def test_streamed_fit_matches_the_in_memory_sparse_fit(ragged, flat, tmp_path):
                                atol=1e-12 * np.abs(r.dirty_image).max())
     assert streamed.parameters["fit_quality"]["n_data"] == 2 * len(d)
     assert streamed.parameters["streaming"]["n_visibilities_streamed"] == len(d)
+
+
+@jax_needed
+def test_streamed_cube_matches_the_in_memory_sparse_cube(ragged, tmp_path):
+    """Every channel from its own streamed terms, the shared prior from the
+    summed ones (`cube_prior="mfs"`, so both paths fit it on all the data)."""
+    from pyuvimage import api
+
+    uvd, _, geom = ragged
+    kw = dict(fov=3.0, mode="cube", cube_prior="mfs", reg="matern", criterion="discrepancy",
+              inversion="sparse", pb_correction=False, write=False, uncertainty_map=False)
+    reference = api.run(uvd, out=tmp_path / "mem", **kw)
+    streamed = api.run(uvd, out=tmp_path / "str", streaming=True, chunk_k=CHUNK, **kw)
+    assert len(streamed.products) == len(reference.products) == uvd.n_chan
+    for r, s in zip(reference.products, streamed.products):
+        assert s.chi_squared == pytest.approx(r.chi_squared, rel=1e-8)
+        np.testing.assert_allclose(s.model_image, r.model_image, rtol=1e-8,
+                                   atol=1e-10 * np.abs(r.model_image).max())
+        np.testing.assert_allclose(s.residual_sigma, r.residual_sigma, rtol=1e-8, atol=1e-8)
+    assert streamed.parameters["streaming"]["n_visibilities_streamed"] == uvd.n_samples
+
+
+@jax_needed
+def test_streamed_recentred_fit_matches_the_in_memory_one(ragged, tmp_path):
+    from pyuvimage import api
+
+    uvd, _, geom = ragged
+    kw = dict(fov=3.0, reg="matern", criterion="discrepancy", inversion="sparse",
+              pb_correction=False, write=False, uncertainty_map=False, image_centre=(0.6, -0.3))
+    reference = api.run(uvd, out=tmp_path / "mem", **kw)
+    streamed = api.run(uvd, out=tmp_path / "str", streaming=True, chunk_k=CHUNK, **kw)
+    r, s = reference.products[0], streamed.products[0]
+    assert s.chi_squared == pytest.approx(r.chi_squared, rel=1e-8)
+    np.testing.assert_allclose(s.model_image, r.model_image, rtol=1e-8,
+                               atol=1e-10 * np.abs(r.model_image).max())
+    assert streamed.uvdata.meta["image_centre_offset_arcsec"] == \
+        pytest.approx(reference.uvdata.meta["image_centre_offset_arcsec"])

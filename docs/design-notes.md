@@ -383,10 +383,12 @@ Measured: peak RSS of the accumulation is flat at 0.18 GB from 0.5M to 2M
 samples (the delta over baseline is 36 MB, one chunk and its transformer),
 where holding the data would have grown 4×. The cost moves to time — one
 pass through every sample, ~60 µs each with a DFT per chunk on the 2-core
-container. What is not streamed yet: cube mode (one kernel per channel, a
-loop over this), point components (dense-only anyway), recentring (a
-chunk-local phase ramp, unwired). MFS + sparse; the default
-(`streaming="auto"`) wherever those hold and the dataset is a file, in memory
+container. Cube mode is the same pass read one channel at a time, folded into
+one set of terms per channel (the MFS terms are their sum — every term is a
+sum over visibilities); recentring is the phase ramp applied chunk by chunk,
+with `auto` imaging the whole stream once to find the source. Not streamed:
+point components (dense-only anyway). The default (`streaming="auto"`)
+wherever the dataset is a file and the inversion is sparse, in memory
 otherwise with the reason logged; `--no-streaming` and `--reload` are the two
 overrides.
 
@@ -426,16 +428,29 @@ the second adaptive pass's reachability probe seeded from the first pass's
 takes 0.2 s instead of 35. `LinearSystem` pools every non-negative solution
 it produces, keyed by log10 trace(H) — a scalar that scales with the
 coefficient and is comparable across priors — and any solve asked for with
-`warm_start=True` seeds from the nearest one. A seed whose support is
-singular at the new strength (a jump from a strong prior to a weak one can
-do that) fails inside fnnls in milliseconds and falls back to the cold path,
-so a warm start is never slower than the framework's solve by more than
-that. The searches, probes and the window walk opt in; `Trial` itself and
-the delivered fit do not, because a `Trial` is meant to reproduce the
-framework fit to the bit and the seed changes the last digits. The
-remaining cold solves per pass are the first pass's reachability probe, the
-first solver check at the chosen coefficient, and the delivered fit — the
-last is the framework's own and cannot be seeded from outside.
+`warm_start=True` seeds from the nearest one *within a decade*. Not further:
+a seed from the wrong regime leads the active set through more changes than
+the unconstrained signs do (18 decades away, 60 s where the cold solve took
+7; on J0116 a 3-decade cap let two far seeds in and a three-solve check took
+18 minutes). A seed whose support is singular at the new strength fails
+inside fnnls in milliseconds and falls back to the cold path. The searches,
+probes and the window walk opt in; `Trial` itself and the delivered fit do
+not, because a `Trial` is meant to reproduce the framework fit to the bit and
+the seed changes the last digits.
+
+The other lever is not to solve the same system twice. The constrained
+solution at the chosen coefficient *is* the delivered fit, so `fit_dataset`
+now solves the delivered fit first and reads the solver check and the
+re-bisection gate off it; and the "does the solver respond to the prior at
+all" comparison uses the two constrained solutions already in hand — the
+search's reachability probe at the weakest prior and the chosen fit — when
+they sit three or more decades apart and the *unconstrained* models at the
+same two strengths differ (so the prior demonstrably acts between them). Only
+a coefficient chosen within three decades of the weakest prior, or a pair the
+prior does not separate, costs one more constrained solve, six decades up.
+Per adaptive pass that leaves two cold non-negative solves: the reachability
+probe (seeded on the second pass from the first's) and the delivered fit,
+which is the framework's own and cannot be seeded from outside.
 
 ## Known issue: the mask edge
 
