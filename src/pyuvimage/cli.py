@@ -316,6 +316,13 @@ def main(argv: list[str] | None = None) -> int:
         "in place with the same size and mtime, or to rule the cache out",
     )
     p_fit.add_argument(
+        "--no-pynufft-shift", action="store_true",
+        help="do not apply the half-pixel phase ramp that aligns the pynufft "
+        "transformer with the DFT. Reproduces the uncorrected upstream "
+        "behaviour: self-consistent, but the sky lands half a pixel from the "
+        "WCS in both axes. pynufft backend only; for comparison, not for use",
+    )
+    p_fit.add_argument(
         "--chunk-k", type=int, default=None, metavar="N",
         help="streaming only: visibilities per chunk (default 4096). "
         "Larger is faster and uses more memory per chunk; the per-chunk DFT "
@@ -479,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
             streaming=args.streaming,
             chunk_k=args.chunk_k,
             reload=args.reload,
+            pynufft_shift=not args.no_pynufft_shift,
             chi2_target=args.chi2_target,
             positive_only=not args.no_positive,
             enforce_positive=args.enforce_positive,

@@ -188,6 +188,7 @@ def run(
     streaming: bool | str = "auto",
     chunk_k: int | None = None,
     reload: bool = False,
+    pynufft_shift: bool = True,
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -260,11 +261,22 @@ def run(
             replace the cache. The cache is keyed on the file's path, size
             and modification time, so this is for a file rewritten in place
             with both unchanged, or for ruling the cache out.
+        pynufft_shift: apply the half-pixel phase ramp that aligns the pynufft
+            transformer with the DFT (default). False reproduces the
+            uncorrected upstream transformer: self-consistent, but the sky
+            lands half a pixel from the WCS in both axes. Only the pynufft
+            backend is affected. See `fitting.PYNUFFT_HALF_PIXEL_SHIFT`.
     """
     from ._jax_guard import report_if_disabled, report_if_numba_missing
 
     report_if_disabled()
     report_if_numba_missing()
+    fitting.PYNUFFT_HALF_PIXEL_SHIFT = bool(pynufft_shift)
+    if not pynufft_shift:
+        logger.warning(
+            "pynufft half-pixel shift disabled: if the pynufft backend runs, "
+            "the reconstruction sits half a pixel from the WCS in both axes"
+        )
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
     stream, header = resolve_streaming(
@@ -958,6 +970,7 @@ def run(
     # the record says which path ran; `run_streamed` writes a dict here
     parameters["streaming"] = False
     parameters["reload"] = bool(reload)
+    parameters["pynufft_half_pixel_shift"] = bool(pynufft_shift)
     written = {}
     if write:
         written = write_products(

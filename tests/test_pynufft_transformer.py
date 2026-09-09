@@ -422,3 +422,47 @@ def test_a_transformer_that_needs_scaling_but_lacks_the_argument_is_caught():
 
     with pytest.raises(RuntimeError, match="does not honour use_adjoint_scaling"):
         fitting.assert_adjoint_scale_consistent(NeedsScalingButCannot)
+
+
+@pynufft_only
+def test_the_shift_can_be_switched_off(problem, monkeypatch):
+    """`fitting.PYNUFFT_HALF_PIXEL_SHIFT = False` reproduces the uncorrected
+    upstream transformer: unit ramp, and visibilities that sit off the DFT's
+    by the half-pixel phase error the correction exists to remove."""
+    from pyuvimage import fitting
+
+    uv, _, _, _, mask, image = problem
+    ref = np.asarray(
+        ag.TransformerDFT(uv_wavelengths=uv, real_space_mask=mask)
+        .visibilities_from(image=image)
+    )
+    monkeypatch.setattr(fitting, "PYNUFFT_HALF_PIXEL_SHIFT", False)
+    tr = TransformerPyNUFFT(uv_wavelengths=uv, real_space_mask=mask)
+    assert tr.half_pixel_shift is False
+    assert np.all(tr.shift == 1.0)
+    raw = np.asarray(tr.visibilities_from(image=image))
+    assert np.max(np.abs(raw - ref)) / np.std(np.abs(ref)) > 0.1
+    # amplitudes untouched: a pure phase
+    np.testing.assert_allclose(np.abs(raw), np.abs(ref), rtol=1e-3, atol=1e-3 * np.abs(ref).max())
+
+
+def test_the_cli_and_run_carry_the_switch(monkeypatch, caplog):
+    import logging
+
+    from pyuvimage import api, cli, fitting
+
+    seen = []
+    real_run = api.run
+    monkeypatch.setattr(api, "run", lambda *a, **k: seen.append(k))
+    cli.main(["fit", "d.npz", "--fov", "1"])
+    assert seen[-1]["pynufft_shift"] is True
+    cli.main(["fit", "d.npz", "--fov", "1", "--no-pynufft-shift"])
+    assert seen[-1]["pynufft_shift"] is False
+    # run() sets the module flag and says so before doing anything else
+    monkeypatch.setattr(api, "resolve_streaming", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        with pytest.raises(RuntimeError, match="stop"):
+            real_run("d.npz", fov=1.0, pynufft_shift=False)
+    assert fitting.PYNUFFT_HALF_PIXEL_SHIFT is False
+    assert "half-pixel shift disabled" in caplog.text
+    fitting.PYNUFFT_HALF_PIXEL_SHIFT = True

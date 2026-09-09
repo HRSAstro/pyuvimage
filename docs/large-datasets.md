@@ -83,6 +83,17 @@ that grows with baseline length, `nufftax` needs the same correction, and
 every JAX-path fit so far has been reconstructing the sky half a pixel off.
 That is worth knowing before trusting a position.
 
+The correction can be switched off for comparison: `--no-pynufft-shift`
+(`run(pynufft_shift=False)`) reproduces the uncorrected upstream transformer.
+Nothing breaks — every quantity that passes through the transformer (the
+dirty image and beam, the model visibilities, `F` and `D`) is shifted
+together, so the fit, the residual map and the restored image stay
+self-consistent — but the whole reconstruction lands half a pixel from the
+WCS in both axes. It is recorded in `fit_parameters.json` as
+`pynufft_half_pixel_shift`. The restoring beam is unaffected either way:
+`gaussian_kernel` centres on the pixel `fftconvolve` uses, independently of
+which transformer imaged the data.
+
 ## 2. Find the source before choosing `--fov`
 
 Both of these sit several arcsec off the phase centre, which is easy to miss

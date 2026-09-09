@@ -225,6 +225,15 @@ def pynufft_available() -> bool:
 
 _PYNUFFT_CLASS = None
 
+#: Whether the vendored pynufft transformer applies the half-pixel phase ramp
+#: that aligns it with `TransformerDFT` (see `pynufft_transformer_class`).
+#: On by default; `run(pynufft_shift=False)` / `--no-pynufft-shift` turns it
+#: off for comparison with the uncorrected upstream behaviour, in which case
+#: everything that passes through the transformer -- dirty images, beam,
+#: model visibilities, F and D -- stays self-consistent, and the reconstructed
+#: sky sits half a pixel from the DFT/WCS convention in both axes.
+PYNUFFT_HALF_PIXEL_SHIFT = True
+
 
 def pynufft_transformer_class():
     """A pynufft-backed transformer that agrees with `TransformerDFT`.
@@ -297,12 +306,14 @@ def pynufft_transformer_class():
             self.plan(om=om, Nd=shape, Kd=(2 * shape[0], 2 * shape[1]), Jd=(6, 6))
 
             # the half-pixel phase ramp aligning pynufft's grid convention
-            # with TransformerDFT's
+            # with TransformerDFT's -- or unity, when the module flag turns
+            # the correction off
             half_pix = self.grid.pixel_scales[0] / 2.0 * units.arcsec.to(units.rad)
+            self.half_pixel_shift = bool(PYNUFFT_HALF_PIXEL_SHIFT)
             self.shift = np.exp(
                 -2.0j * np.pi * half_pix
                 * (self.uv_wavelengths[:, 1] + self.uv_wavelengths[:, 0])
-            )
+            ) if self.half_pixel_shift else np.ones(len(self.uv_wavelengths), dtype=complex)
 
             # What `image_from(use_adjoint_scaling=True)` multiplies by, to put
             # pynufft's internally-normalised adjoint back on the plain
