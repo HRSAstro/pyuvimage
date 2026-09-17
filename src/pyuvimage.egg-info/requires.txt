@@ -3,6 +3,10 @@ scipy
 astropy
 matplotlib
 autogalaxy
+numba
+
+[autoarray-main]
+autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray
 
 [jax]
 jax

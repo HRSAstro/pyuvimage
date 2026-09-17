@@ -34,6 +34,13 @@ def __getattr__(name):
         from . import api
 
         return getattr(api, name)
+    if name in (
+        "UniformDisc", "PolarGrid", "DiscPerturbationFit", "DiscFitResult",
+        "run_disc", "make_disc_dataset", "make_rdor_mock",
+    ):
+        from . import discmodel
+
+        return getattr(discmodel, name)
     raise AttributeError(f"module 'pyuvimage' has no attribute {name!r}")
 
 __all__ = [
@@ -43,5 +50,10 @@ __all__ = [
     "ImageGeometry",
     "resolve_geometry",
     "nyquist_pixel_scale_arcsec",
+    "UniformDisc",
+    "PolarGrid",
+    "DiscPerturbationFit",
+    "DiscFitResult",
+    "run_disc",
     "__version__",
 ]

@@ -2,6 +2,7 @@
 
     pyuvimage import obs.ms mydata/            # MS -> dataset (needs casacore)
     pyuvimage fit mydata/ --fov 3.0            # reconstruct
+    pyuvimage disc mydata/ --radius 0.035      # uniform disc + polar perturbations
     pyuvimage convert export.npz mydata/       # CASA-script export -> dataset
     pyuvimage demo demo_out/                   # self-contained demo run
 """
@@ -86,7 +87,7 @@ def _hint_negative_centre(argv: list[str]) -> None:
     it before argparse does.
     """
     for i, a in enumerate(argv):
-        if a in ("--image-centre", "--point", "--envelope-centre") and i + 1 < len(argv):
+        if a in ("--image-centre", "--point", "--envelope-centre", "--centre") and i + 1 < len(argv):
             nxt = argv[i + 1]
             if nxt.startswith("-") and "," in nxt:
                 raise SystemExit(
@@ -384,6 +385,81 @@ def main(argv: list[str] | None = None) -> int:
         help="most auto-detected point components to keep (default 5)",
     )
 
+    p_disc = sub.add_parser(
+        "disc",
+        help="fit a uniform disc plus polar-grid surface-brightness perturbations",
+    )
+    p_disc.add_argument(
+        "dataset", nargs="?",
+        help="dataset directory or .npz (omit with --demo)",
+    )
+    p_disc.add_argument(
+        "--demo", action="store_true",
+        help="fit an R Dor-like mock (disc + two spots) instead of a dataset",
+    )
+    p_disc.add_argument("--out", default="pyuvimage_disc_out")
+    p_disc.add_argument(
+        "--radius", type=float, default=None,
+        help="starting angular radius [arcsec]. Guessed from the first |V| "
+             "null if omitted",
+    )
+    p_disc.add_argument(
+        "--flux", type=float, default=None,
+        help="starting total flux [Jy]. Guessed from the shortest baselines "
+             "if omitted",
+    )
+    p_disc.add_argument(
+        "--centre", default="0,0", metavar="x,y",
+        help="starting disc centre as image-plane x,y [arcsec] from the "
+             "phase centre (+x right, +y up; same as --point). Default 0,0",
+    )
+    p_disc.add_argument(
+        "--n-rings", type=int, default=None,
+        help="radial rings on the polar grid (default: 3 with --demo, "
+             "else 6). Cells are ~R/n_rings on a side",
+    )
+    p_disc.add_argument(
+        "--az-oversample", type=float, default=1.0,
+        help="azimuthal cells per ring relative to square cells (default 1)",
+    )
+    p_disc.add_argument(
+        "--reg", default=None,
+        choices=["matern", "exponential", "gaussian", "constant"],
+        help="source prior on the polar cells (optional; default matern): "
+             "matern, exponential (rougher Matérn ν=0.5), gaussian "
+             "(Matérn × envelope on the disc), or constant (Tikhonov). "
+             "Strength still set by --lambda",
+    )
+    p_disc.add_argument(
+        "--lambda", dest="coefficient", default="evidence",
+        help='prior strength: "evidence" (default), "chi2", or a number',
+    )
+    p_disc.add_argument(
+        "--chi2-target", type=float, default=1.0,
+        help="target chi^2/N when --lambda chi2 (default 1)",
+    )
+    p_disc.add_argument(
+        "--scale", type=float, default=None,
+        help="Matern correlation length [arcsec]; default one ring width",
+    )
+    p_disc.add_argument("--nu", type=float, default=1.5)
+    p_disc.add_argument(
+        "--n-iter", type=int, default=2,
+        help="alternations of disc refit and perturbation solve (default 2)",
+    )
+    p_disc.add_argument(
+        "--no-refit-disc", action="store_true",
+        help="hold the first-pass disc; do not alternate",
+    )
+    p_disc.add_argument(
+        "--fov", type=float, default=None,
+        help="rendered field of view [arcsec]; default 3 disc diameters",
+    )
+    p_disc.add_argument(
+        "--pixel-scale", type=float, default=None,
+        help="rendered pixel scale [arcsec]; default R / n_rings / 8",
+    )
+
     p_demo = sub.add_parser("demo", help="run a self-contained mock demo")
     p_demo.add_argument("out", nargs="?", default="pyuvimage_demo")
 
@@ -499,6 +575,62 @@ def main(argv: list[str] | None = None) -> int:
             point_significance=args.point_significance,
             max_points=args.max_points,
             point_retune=not args.no_point_retune,
+        )
+        return 0
+
+    if args.command == "disc":
+        from .discmodel import make_rdor_mock, run_disc
+
+        try:
+            coefficient = float(args.coefficient)
+        except ValueError:
+            coefficient = args.coefficient
+        if args.demo:
+            uvd, true_disc, spots = make_rdor_mock()
+            dataset = uvd
+            truth_kw = {"truth_disc": true_disc, "truth_spots": spots}
+        elif args.dataset:
+            dataset = args.dataset
+            truth_kw = {}
+        else:
+            raise SystemExit("disc: give a dataset path, or pass --demo")
+        n_rings = (
+            args.n_rings if args.n_rings is not None
+            else (3 if args.demo else 6)
+        )
+        reg = args.reg if args.reg is not None else "matern"
+        result = run_disc(
+            dataset,
+            radius_arcsec=args.radius,
+            flux_jy=args.flux,
+            centre=_parse_pair(args.centre, "--centre"),
+            n_rings=n_rings,
+            az_oversample=args.az_oversample,
+            reg=reg,
+            coefficient=coefficient,
+            chi2_target=args.chi2_target,
+            scale=args.scale,
+            nu=args.nu,
+            n_iter=args.n_iter,
+            refit_disc=not args.no_refit_disc,
+            out=args.out,
+            fov=args.fov,
+            pixel_scale=args.pixel_scale,
+            **truth_kw,
+        )
+        d = result.as_dict()
+        print(f"disc products written to {args.out}")
+        print(
+            f"  disc: F = {d['disc']['flux_jy']:.4g} Jy, "
+            f"R = {d['disc']['radius_arcsec']*1e3:.2f} mas, "
+            f"centre (dRA, dDec) = ({d['disc']['d_ra_arcsec']:+.4g}\", "
+            f"{d['disc']['d_dec_arcsec']:+.4g}\")"
+        )
+        print(
+            f"  chi2/N = {d['chi_squared_reduced']:.3f} "
+            f"(disc alone {d['disc_only_chi_squared_reduced']:.3f}); "
+            f"{d['n_cells']} polar cells; "
+            f"max |dI/I| = {d['max_fractional_perturbation']:.3f}"
         )
         return 0
 
