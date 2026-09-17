@@ -5,6 +5,9 @@
 Every run writes `fit_parameters.json` recording all of the below, plus
 `prior_scan.json` with every hyperparameter trial. Defaults in **bold**.
 
+Any flag on this page can be set in a JSON file instead — see
+[Parameters from a file](#parameters-from-a-file) at the end.
+
 **Source prior** (the prior on the pixelized source; PyAutoLabs' shipped
 default for a pixelized source is the Matern kernel, so it is ours too)
 
@@ -340,3 +343,61 @@ differ by more than 2%.
   per-channel and identical to a single-channel fit, because it depends on the
   image and the mesh rather than on how many visibilities a channel holds. The
   kernel cache keys on uv and noise, so the channels separate on their own.
+
+
+## Parameters from a file
+
+Every `pyuvimage fit` flag above can come from a JSON file instead of the
+command line:
+
+```bash
+pyuvimage fit --config params.json
+```
+
+[`fit-config-template.json`](fit-config-template.json) is a template carrying
+every key at its default — copy it and delete the lines you do not want to
+set. A minimal file is just:
+
+```json
+{
+  "dataset": "mydata.npz",
+  "fov": 3.0,
+  "reg": "gibbs",
+  "image-centre": [-2.3, 0.3],
+  "point": [[0.70, 0.80]]
+}
+```
+
+The rules, in full:
+
+- **A key is the flag without its dashes.** `"fov"`, `"pixel-scale"`,
+  `"no-uncertainty"`. Underscores work too (`"pixel_scale"`), as does the
+  destination a flag sets where the two differ — `"lambda"` and
+  `"coefficient"` are the same parameter, as are `"scale"` and `"reg_scale"`.
+  Setting one parameter twice under two names refuses rather than picking one.
+- **A value is what the flag would take.** A string or a number for the ones
+  that take a value, `true`/`false` for the switches. `"fov": 3` and
+  `"fov": "3"` are the same thing.
+- **The dataset can come from the file.** `"dataset"` is the positional
+  argument, so `pyuvimage fit --config params.json` with nothing else is a
+  complete command.
+- **The command line wins.** `pyuvimage fit --config params.json --fov 12`
+  runs the file's configuration at a different field of view, which is the
+  point: keep one file per field and vary one thing at a time.
+- **Positions are pairs.** `"image-centre": [-2.3, 0.3]` or
+  `"image-centre": "-2.3,0.3"`, both in image axes (+x right, +y up). No
+  shell-quoting trick is needed for a negative value here, unlike
+  `--image-centre="-2.3,0.3"` on the command line. `"point"` takes a list of
+  them — `[[0.7, 0.8], [-1.2, 0.4]]` — or a single `[x, y]`.
+- **`null` means "not set".** The parameter keeps its default, exactly as if
+  the key were absent.
+- **`"streaming"` is the one tri-state**: `true`, `false` or `"auto"`, read
+  literally. (`"no-streaming": true` also works, and means `false`.)
+- **A key beginning with `_` is a comment** and is ignored, which is how the
+  template annotates itself. JSON has no comment syntax of its own.
+- **An unknown key refuses**, listing what is accepted — a typo in a
+  parameter name never silently does nothing.
+
+The run logs which parameters came from the file. Note that
+`fit_parameters.json` in the output directory is a *record* of a run, not an
+input to one: its keys are the internal names, not the flags.

@@ -159,7 +159,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     p_fit = sub.add_parser("fit", help="reconstruct an image or cube")
-    p_fit.add_argument("dataset", help="dataset directory or .npz")
+    p_fit.add_argument(
+        "dataset", nargs="?", default=None,
+        help="dataset directory or .npz",
+    )
+    p_fit.add_argument(
+        "--config", default=None, metavar="FILE",
+        help="read the options below from a JSON file instead of the command "
+        "line: one key per flag, without the dashes (\"fov\": 5, "
+        '"reg": "gibbs"). Anything also given on the command line wins, so a '
+        "saved configuration can be re-run with one value changed. The "
+        "dataset and --fov may come from the file, which makes "
+        "`pyuvimage fit --config params.json` a complete command. "
+        "docs/fit-config-template.json is a template carrying every key at "
+        "its default; fit_parameters.json in any output directory records "
+        "what a run actually used",
+    )
     p_fit.add_argument(
         "--fov", type=float, required=True,
         help="full field of view [arcsec]; must cover all emission",
@@ -463,13 +478,38 @@ def main(argv: list[str] | None = None) -> int:
     p_demo = sub.add_parser("demo", help="run a self-contained mock demo")
     p_demo.add_argument("out", nargs="?", default="pyuvimage_demo")
 
-    _hint_negative_centre(list(sys.argv[1:] if argv is None else argv))
+    raw = list(sys.argv[1:] if argv is None else argv)
+    _hint_negative_centre(raw)
+
+    # The file's values become the parser's defaults, so an explicit flag
+    # still wins and the file may supply the otherwise-required dataset and
+    # --fov. Done before parsing, which is why --config is found by hand.
+    from .config import apply_config, config_path_from, load_config
+
+    config_applied: list[str] = []
+    config_file = None
+    for token in raw:  # the subcommand is the first token naming one
+        if token in sub.choices:
+            config_file = (
+                config_path_from(raw) if token == "fit" else None
+            )
+            break
+    if config_file is not None:
+        config_applied = apply_config(
+            p_fit, load_config(config_file), str(config_file)
+        )
+
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
     )
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    if config_applied:
+        logging.getLogger(__name__).info(
+            "read %d parameter(s) from %s: %s",
+            len(config_applied), config_file, ", ".join(config_applied),
+        )
 
     from ._jax_guard import report_if_disabled
 
@@ -506,6 +546,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fit":
         from .api import run
 
+        if not args.dataset:
+            p_fit.error(
+                "a dataset is required: give it on the command line or as "
+                '"dataset" in the --config file'
+            )
         try:
             pixel_scale = float(args.pixel_scale)
         except ValueError:

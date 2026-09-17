@@ -104,6 +104,16 @@ to be left alone. These are the ones worth reaching for:
 | `--inversion dense` | you want the long-established path on a big dataset. `auto` (the default) switches to the sparse w-tilde inversion above 5000 visibilities, which is where the dense mapping matrix starts to dominate — see [Run time and memory](#run-time-and-memory). The sparse path is new; force `dense` if you want to compare |
 | `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on every channel's data by default (`--cube-prior mfs`; `channel` fits it on a 1-in-`n_chan` subset) — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
 
+Any of them can also be set in a JSON file instead of on the command line:
+
+```bash
+pyuvimage fit --config params.json          # dataset and --fov may be in it
+pyuvimage fit --config params.json --fov 12 # the command line still wins
+```
+
+[docs/fit-config-template.json](docs/fit-config-template.json) is a template
+with every key at its default.
+
 Full reference: [docs/parameters.md](docs/parameters.md).
 
 ## Choosing the prior (`--reg`)
@@ -428,7 +438,7 @@ Full discussion: [docs/noise.md](docs/noise.md).
 | doc | what is in it |
 |---|---|
 | [docs/install.md](docs/install.md) | installing, arm64 conda environments, and the install failures that look like bugs |
-| [docs/parameters.md](docs/parameters.md) | every flag, with defaults |
+| [docs/parameters.md](docs/parameters.md) | every flag, with defaults, and how to pass them in a JSON file instead |
 | [docs/noise.md](docs/noise.md) | why the MS weights are not trusted, the four estimators, and the diagnostics that pick between them |
 | [docs/priors.md](docs/priors.md) | what each prior is, and how they compare across three mocks |
 | [docs/uncertainty.md](docs/uncertainty.md) | the uncertainty map in full, with the Monte Carlo validation |

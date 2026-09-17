@@ -1,0 +1,54 @@
+{
+  "_comment": "Template for `pyuvimage fit --config this-file.json`. Every key is a `pyuvimage fit` flag without the leading dashes, set to its default; keys beginning with an underscore are ignored, so they can be used for notes. Delete the lines you do not want to set -- a key that is present is applied, even at its default. Anything also given on the command line wins, so a saved configuration can be re-run with one value changed. docs/parameters.md explains what each one does.",
+
+  "_dataset": "the dataset directory or .npz, and the field of view in arcsec. Both may also be given on the command line; --fov is required one way or the other.",
+  "dataset": "my_data.npz",
+  "fov": 5.0,
+  "mode": "mfs",
+  "out": "pyuvimage_out",
+
+  "_geometry": "model mesh and where the image is centred. image-centre takes [x, y] in arcsec in image axes (+x right, +y up) or \"auto\"; no escaping is needed for a negative value here, unlike on the command line.",
+  "pixel-scale": "auto",
+  "mesh": null,
+  "image-centre": [0.0, 0.0],
+
+  "_prior": "the source prior and its hyperparameters. \"lambda\" is --lambda (the regularisation strength); \"scale\" is the kernel correlation length.",
+  "reg": "adaptive",
+  "adapt-power": null,
+  "scale": "auto",
+  "nu": 1.5,
+  "lambda": "auto",
+  "envelope-fwhm": "auto",
+  "envelope-centre": "auto",
+  "envelope-floor": 0.01,
+
+  "_criterion": "how the hyperparameters are chosen, and the positivity constraint.",
+  "criterion": "auto",
+  "chi2-target": 1.0,
+  "no-positive": false,
+  "enforce-positive": false,
+
+  "_engine": "transform backend, inversion formalism and the streaming load. \"streaming\" takes true, false or \"auto\" (the default: stream whenever it applies).",
+  "transformer": "auto",
+  "inversion": "auto",
+  "streaming": "auto",
+  "chunk-k": null,
+  "kernel-cache": null,
+  "reload": false,
+  "no-pynufft-shift": false,
+
+  "_cube": "cube mode only.",
+  "cube-prior": "mfs",
+
+  "_products": "what is written alongside the model image.",
+  "no-uncertainty": false,
+  "no-pb": false,
+  "dish-diameter": null,
+
+  "_points": "analytic point components. \"point\" takes a list of [x, y] positions in arcsec, image axes, and implies point-sources with auto-detection off.",
+  "point-sources": false,
+  "point": null,
+  "point-significance": 5.0,
+  "max-points": 5,
+  "no-point-retune": false
+}
