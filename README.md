@@ -18,12 +18,8 @@ pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
 
-Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but on
-datasets above 5000 visibilities it is what lets `--inversion auto` take the
-sparse path, which is where the memory ceiling comes off — without it every
-fit uses the dense mapping matrix. See [docs/install.md](docs/install.md),
-which also covers building an **arm64** conda environment on Apple silicon,
-the one setup detail whose symptoms otherwise appear much later.
+Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but becomes increasingly memory intensive above ~5000 visibilities. JAX is strongly recommended for larger data sets. See [docs/install.md](docs/install.md),
+which also covers building an **arm64** conda environment on Apple silicon.
 
 ## Use
 
@@ -79,10 +75,10 @@ point components are fitted.
 
 J0209 (9io9) at 135 GHz, an ALMA Band 4 observation of a lensed source
 (164,262 visibility samples across four spectral windows, `pyuvimage fit
-9io9_135GHz_cont.npz --fov 8` and nothing else): the arc and its counter-image
+9io9_135GHz_cont.npz --fov 8`): the arc and its counter-image
 at χ²/N = 1.016 on a 62×62 mesh, a residual peaking at 4.1σ — 3.5% of a 117σ
 peak — and a residual map whose rms is 1.01σ with no trace of the source,
-which is what you want to see. The run chose the sparse inversion, the
+which is what you want to see. The run chose the sparse inversion (using JAX), the
 `structure` criterion and the adaptive prior for itself. The model panel is in
 Jy/pixel and the reconvolved panel in Jy/beam, which is why they look so
 different: the model is the sky at the mesh scale, not smoothed by the beam.
@@ -137,12 +133,10 @@ Matérn smoothness. Comparisons across three mocks are in
 [docs/priors.md](docs/priors.md).
 
 **How the strength is chosen** is `--criterion`, and the default `auto`
-decides for you. `structure` drives the residual *map* to white, which is what
-"the fit is done" actually means, and it is what you want on any fit where the
-data comfortably outnumber the model — but it is not calibrated when they do
-not, so `auto` uses it above 10 data points per mesh pixel and `chi^2 = N`
-below, and says in the log which it took. On three real ALMA datasets spanning
-30× in visibility count, `--reg adaptive` at structure ratio 1.0 leaves a
+decides for you. `structure` drives the residual *map* to the noise level, and it is what you want on any fit where the
+visibilities outnumber image pixels. `auto` uses it above 10 data points per mesh pixel and `chi^2 = N`
+below (the log says which it used). On three real ALMA datasets spanning
+30× in visibility count, `--reg adaptive` at structure ratio 1.0 leaves a peak
 residual of 3.9–5.0σ; see [docs/design-notes.md](docs/design-notes.md).
 
 ## The uncertainty map
@@ -158,15 +152,11 @@ the median of each in the FITS header:
 
 The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
 with `C = (F+H)^-1`, verified against Monte Carlo at 0.996. That term alone is
-optimistic — a regularised model is smoothed, hence biased — so the systematic
+optimistic (a regularised model is smoothed, hence biased) so the systematic
 term measures how far each pixel moves when the regularisation strength is
-varied over the range the data cannot distinguish between: the strengths whose
-χ² is within one σ(χ²) = √(2N) of the fitted one, measured per fit and
-recorded in the header as `ERRWLO`/`ERRWHI`. That window is half a decade
-either side on a well-constrained fit and opens up to six decades on a weak
-one, which is the point — where χ² stops caring about the strength, the prior
+varied over the range the data cannot distinguish between. Where χ² stops caring about the strength, the prior
 is choosing the answer. Neither term covers the prior *family* being wrong,
-nor calibration or deconvolution error.
+nor calibration errors.
 
 **Do not add per-pixel errors in quadrature**: they are correlated over the
 prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
@@ -180,9 +170,7 @@ Details, and the mesh/image checkerboard removal recorded as `ERRDEBL`:
 
 ## True point sources
 
-A genuine point source is the one thing a pixel grid cannot represent: on our
-test data a nearest-pixel delta half a pixel off-centre misrepresents it at
-chi^2/N = 31.5. `--point-sources` instead adds analytic delta components whose
+A genuine point source cannot be fit by a regularised pixel grid. `--point-sources` instead adds analytic delta components whose
 amplitudes are solved **in the same linear system** as the mesh.
 
 ```bash
@@ -190,8 +178,8 @@ pyuvimage fit mydata/ --fov 3.0 --point-sources     # auto-detect
 pyuvimage fit mydata/ --fov 3.0 --point 0.70,0.80   # you supply the position
 ```
 
-Opt-in and deliberately conservative: detection is a matched filter over the
-whole field, not a residual peak-finder, and a candidate must clear a
+`--point-sources` is deliberately conservative: point source detection is a matched filter over the
+whole field, not a residual peak-finder. A candidate must clear a
 significance cut *and* be positive, at least 0.75 beams from any other
 candidate, and genuinely unresolved. Across the generalisation suite this gave
 **zero false positives**. Fluxes and 1σ errors land in `point_sources.json`.
@@ -215,7 +203,7 @@ pyuvimage import obs.ms mydata/ --spw all
 pyuvimage fit mydata/ --fov 3.0 --mode mfs
 ```
 
-MFS across a wide band mis-models a source with a spectral index, so the import
+MFS across a wide band mismodels a source with a spectral index, so the import
 warns above 20% fractional bandwidth. Details, and how irregular cube
 frequencies are written:
 [docs/spectral-windows.md](docs/spectral-windows.md).
@@ -229,9 +217,9 @@ it should be featureless. What it shows tells you what to change.
 
 **The source is still in the residual** (a positive or negative imprint at the
 source position, `chi^2/N` well above 1 in the log). The model cannot reproduce
-the data. In rough order of likelihood: the field does not cover all the
+the data. Possible causes: the field does not cover all the
 emission — look at `dirty_image.fits`, or run `--image-centre auto`, which
-images a field several times wider to find the peak, and grow `--fov` or
+images a field several times wider to find the peak, and increase `--fov` or
 recentre; there is a genuine point source, which no pixel grid can represent —
 `--point-sources`, or `--point x,y` if you know where it is; the mesh is too
 coarse for the S/N — `--pixel-scale nyquist`; or the noise map is wrong — see
@@ -241,11 +229,11 @@ the next item.
 estimate is off, not the model: `chi^2/N = 2` means the stored σ is √2 too
 small. Re-estimate it with `pyuvimage convert mydata.npz mydata/ --noise
 difference` (or `scaled`; see [Noise](#noise)) and refit. A residual that is
-white *and* at the right level is what a finished fit looks like; the number on
+noise *and* at the right level is what a good fit looks like; the number on
 its own is not the test.
 
 **Sidelobe-like structure across the whole residual, not centred on the
-source.** Emission outside the field. Grow `--fov`, or if the other source is
+source.** Emission outside the field. Increase `--fov`, or if the other source is
 far away and you only want this one, recentre on it with `--image-centre` and
 keep the field small.
 
@@ -253,8 +241,7 @@ keep the field small.
 strong. Check the log for `the constrained fit cannot go below chi2/N = …`: if
 the non-negative solver has a floor above 1, positivity is what is smoothing
 the fit, and `--no-positive` will show you whether the data want negative
-pixels (usually a sign of the problems above rather than of the sky). Otherwise
-try `--criterion evidence`, or `--reg gibbs` for a single compact feature.
+pixels. Otherwise try `--criterion evidence`, or `--reg gibbs`.
 
 **The model is speckled, has negative bowls, or the residual is quieter than
 the noise** (the log warns that the model has *absorbed* noise; structure ratio
