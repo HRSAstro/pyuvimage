@@ -61,9 +61,9 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 |---|---|---|
 | `--no-positive` | off (positivity **on**) | The inversion solves `(F + H)s = D`; positivity uses a non-negative solver. The hyperparameter search always uses the fast unconstrained solve, then the coefficient is re-bisected with the constrained solver so the delivered model really does fit to the noise. |
 | `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. **Note:** positivity applies to the mesh-only solve. With `--point-sources`, the bordered system is eliminated by an unconstrained Cholesky solve, so the delivered mesh may contain small negative values whatever this is set to (measured on the demo: 0 negative mesh pixels without points, 78 carrying 0.59% of the flux with them). The point amplitudes are unaffected. pyuvimage warns when this applies. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
-| `--inversion` | **auto** | How the curvature matrix `F` is built. `auto` takes `sparse` at or above 5000 visibilities and `dense` below, and falls back to `dense` whenever sparse cannot give the same answer — JAX missing, `--point-sources` requested, a transformer whose adjoint is not scale-consistent, or σ_re and σ_im differing by more than 5% — logging which and why. Naming `sparse` explicitly raises instead of falling back. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT, so its cost stops depending on the number of visibilities. Works in MFS and cube mode. Needs JAX and cannot yet be combined with `--point-sources`. Experimental: it has not yet been compared against `dense` under conditions that would establish they agree. See below. |
+| `--inversion` | **auto** | How the curvature matrix `F` is built. `auto` takes `sparse` at or above 5000 visibilities and `dense` below, and falls back to `dense` whenever sparse cannot give the same answer — JAX missing, a transformer whose adjoint is not scale-consistent, or σ_re and σ_im differing by more than 5% — logging which and why. Naming `sparse` explicitly raises instead of falling back. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT, so its cost stops depending on the number of visibilities. Works in MFS and cube mode, and with `--point-sources` (their cross-terms come from one adjoint transform per point column, never the dense matrix — see below). Needs JAX. Experimental: it has not yet been compared against `dense` under conditions that would establish they agree. See below. |
 | `--kernel-cache` | beside the output | `--inversion sparse` only: where w-tilde kernels are kept. The kernel depends on the uv coverage, the noise and the geometry and nothing else, so re-fitting the same field with different regularisation reuses it. |
-| `--streaming` / `--no-streaming` | **auto** | Read the visibilities once, in chunks, and hold nothing per visibility. The w-tilde kernel, the dirty images and the χ² constants are accumulated in one pass — cached beside the output or in `--kernel-cache` — and the fit runs on them alone, so memory does not depend on the visibility count: a 200-million-sample MFS cube fits in about a gigabyte. The cost is time (one pass over every sample; a cached re-fit reads none). `auto` streams whenever the run can be streamed — a dataset on disk, the sparse inversion (at or above the same 5000-visibility threshold `--inversion auto` uses, or named), no `--point-sources` — and otherwise runs in memory, logging why (`streaming auto -> in memory: …`). Cube mode streams one channel at a time into one set of terms per channel (cached per channel; the shared prior is fitted on their sum, or under `--cube-prior channel` on a 1-in-n_chan Bernoulli thinning accumulated in the same pass); `--image-centre` applies the same phase ramp per chunk, and `auto` images the whole stream once to find the source (cached). `--streaming` names it, so an unsupported combination refuses rather than falling back; `--no-streaming` is the in-memory path regardless. |
+| `--streaming` / `--no-streaming` | **auto** | Read the visibilities once, in chunks, and hold nothing per visibility. The w-tilde kernel, the dirty images and the χ² constants are accumulated in one pass — cached beside the output or in `--kernel-cache` — and the fit runs on them alone, so memory does not depend on the visibility count: a 200-million-sample MFS cube fits in about a gigabyte. The cost is time (one pass over every sample; a cached re-fit reads none). `auto` streams whenever the run can be streamed — a dataset on disk, the sparse inversion (at or above the same 5000-visibility threshold `--inversion auto` uses, or named), no `--point-sources` (their columns are analytic in uv and the streamed pass keeps nothing per visibility to evaluate them against — the sparse *inversion* still runs, only the streaming load is held back) — and otherwise runs in memory, logging why (`streaming auto -> in memory: …`). Cube mode streams one channel at a time into one set of terms per channel (cached per channel; the shared prior is fitted on their sum, or under `--cube-prior channel` on a 1-in-n_chan Bernoulli thinning accumulated in the same pass); `--image-centre` applies the same phase ramp per chunk, and `auto` images the whole stream once to find the source (cached). `--streaming` names it, so an unsupported combination refuses rather than falling back; `--no-streaming` is the in-memory path regardless. |
 | `--no-pynufft-shift` | off | Reproduce the uncorrected upstream pynufft transformer (no half-pixel phase ramp). Self-consistent, but the sky lands half a pixel from the WCS in both axes; pynufft backend only. For comparison — see [large-datasets.md](large-datasets.md). |
 | `--reload` | off | Read the visibilities again even when the streamed terms (or the w-tilde kernel) for this file and geometry are cached, and replace the cache. The cache is keyed on the file's path, size and modification time, so this is for a file rewritten in place with both unchanged, or for ruling the cache out. |
 | `--chunk-k` | 4096 | streaming only: visibilities per chunk. Larger is faster and costs more per chunk (the per-chunk DFT is `n_image × N` complex). |
@@ -329,12 +329,37 @@ differ by more than 2%.
 * **It needs JAX.** The kernel build is pure NumPy, but the operator itself
   (`Khat`, and the FFT convolution that applies it) is `jax.numpy`. There is
   no fallback; `--inversion dense` needs nothing.
-* **It refuses `--point-sources`.** Not for correctness — for cost. Point
-  components are solved as a bordered system, and its cross-terms between the
-  mesh columns and the point columns need `operated_mapping_matrix`: the dense
-  `n_vis × n_mesh` build that the w-tilde path exists to avoid (21.6 GB on
-  Ruby CO(7-6)). Asking for both would give up the entire benefit and most
-  likely be OOM-killed, so pyuvimage raises and asks which one to drop.
+* ~~It refuses `--point-sources`.~~ **Point components work.** They used to
+  be refused on cost: the bordered system's cross-terms between the mesh and
+  the point columns were read off `operated_mapping_matrix`, the dense
+  `n_vis × n_mesh` build the w-tilde path exists to avoid (21.6 GB on Ruby
+  CO(7-6)). They never needed the matrix. Since `A = F M` — the real-space
+  mapping matrix followed by the transform — the cross-terms are
+
+      Aᵀ W P = Mᵀ Re(Fᴴ (w_re Re P + i w_im Im P))
+
+  which is the *dirty image of the point column*, projected onto the mesh:
+  one adjoint transform per point column, no matrix. Model visibilities are
+  the mirror of it, `A s = F(M s)`. Both are exact — pinned against the dense
+  matrix at 5e-16 in `tests/test_pointsource_sparse.py` — and correct for
+  unequal σ_re and σ_im as well, unlike the kernel itself.
+
+  The detector is the one place that needed more than this: it scores a trial
+  position at every pixel of the image grid, and one transform per trial is
+  the wrong price (1.3 s × 2304 positions = 50 minutes, measured at 10⁵
+  visibilities). But a trial position on a *pixel centre* is a delta on the
+  grid, so its whole lattice of cross-terms is `(W̃ M)ᵀ` — the kernel applied
+  to the mesh's few hundred mapping columns rather than to the lattice's few
+  thousand, in one batched call. Measured 2400× faster, agreeing with the
+  exact route to 1.6e-14. It inherits the kernel's σ_re = σ_im assumption,
+  which the sparse inversion already makes; and it is only the *detector* —
+  accepted positions are refined and solved through the exact route, so no
+  delivered number rests on it.
+
+  What still holds back is **streaming**, not sparse: a point column is an
+  analytic function of uv, and the streamed pass keeps no per-visibility data
+  to evaluate it against. `--point-sources` therefore runs sparse but in
+  memory, which costs ~136 B per visibility and not the 21.6 GB it used to.
 * ~~It is MFS only.~~ **Cube mode works.** Each channel's uv coordinates are
   the same baselines in metres scaled by its own frequency, so each channel
   needs its own kernel — but a channel's build streams only that channel's

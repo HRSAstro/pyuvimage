@@ -120,9 +120,18 @@ def resolve_streaming(
             "nothing"
         )
     if point_sources:
+        # Not the mapping matrix any more -- the sparse inversion fits points
+        # without it (`pointsource.SparseMesh`). What streaming cannot give
+        # them is the visibilities themselves: a point column is an analytic
+        # function of uv, and its three terms (A^T W P, P^T W P, P^T W d) are
+        # sums over samples the streamed pass has already discarded. The
+        # accumulated terms hold those sums only on the image grid, and a
+        # point's whole reason for existing is that it is not on the grid.
         return _hold(
-            "point components need the dense mapping matrix, which the "
-            "streaming (sparse) path never forms"
+            "point components are analytic in the uv plane, and the streamed "
+            "pass keeps no per-visibility data for them to be evaluated "
+            "against. The sparse inversion still runs -- only the streaming "
+            "load is held back"
         )
     if inversion == "dense":
         return _hold("--inversion dense was asked for")
@@ -431,39 +440,6 @@ def run(
             logger.log(level, message)
             uvd = with_pooled_noise(uvd)
     if inversion == "sparse":
-        # Not a correctness problem -- a performance cliff, and a total one.
-        # Our point components are not autoarray linear objects; they are a
-        # bordered system (`pointsource.PointExtendedSystem`) built on top of
-        # the framework's inversion, and its first act is
-        #
-        #     self.A = np.asarray(inversion.operated_mapping_matrix)
-        #
-        # to form the cross-terms B = A^dagger N^-1 P between the mesh columns
-        # and the point columns. `operated_mapping_matrix` is inherited
-        # unchanged by `InversionInterferometerSparse` and calls
-        # `transformer.transform_mapping_matrix` -- the dense n_vis x n_mesh
-        # build that the whole w-tilde path exists to avoid (21.6 GB on Ruby
-        # CO(7-6)). So the fit would be correct, would allocate exactly what
-        # the user chose --inversion sparse to escape, and would most likely
-        # be OOM-killed. Refuse, and say which of the two to give up.
-        # Unblocked upstream, not yet wired up here: autoarray has added the
-        # mapper-function and function-function block methods to
-        # `InterferometerSparseOperator`, so this restriction is ours to
-        # remove rather than theirs. See docs/sparse-analytic-components.md --
-        # in particular that the operator already carries the inverse-variance
-        # weighting, so columns go in un-weighted, unlike our own bordered
-        # system and unlike the imaging operator.
-        if point_sources:
-            raise ValueError(
-                "--inversion sparse cannot yet fit point sources. Our point "
-                "components are solved as a bordered system whose cross-terms "
-                "need the dense operated mapping matrix (n_vis x n_mesh) -- "
-                "the one allocation the w-tilde path exists to avoid, so "
-                "asking for both would give up the entire benefit. autoarray "
-                "now provides the sparse block methods that make this "
-                "unnecessary; wiring them up here is pending. For now use "
-                "--inversion dense, or drop --point-sources."
-            )
         if mode == "cube" and uvd.n_chan > 1:
             # Each channel's uv coordinates are the same metres scaled by its
             # own frequency, so each needs its own kernel. That sounds
@@ -1057,8 +1033,10 @@ def run_streamed(
         raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
     if point_sources:
         raise NotImplementedError(
-            "point components need the dense mapping matrix, so they cannot "
-            "run on the streaming (sparse) path")
+            "point components cannot run on the streaming path: their "
+            "columns are analytic in uv, and the streamed pass keeps no "
+            "per-visibility data to evaluate them against. --inversion "
+            "sparse fits them in memory (--no-streaming)")
     if inversion == "dense":
         raise ValueError("streaming has nothing to stream to on the dense path")
     reason = fitting.sparse_inversion_diagnosis()

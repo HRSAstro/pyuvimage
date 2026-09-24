@@ -157,6 +157,219 @@ SCAN_CHUNK_BYTES = 256 * 2**20
 COLUMN_CACHE_BYTES = 128 * 2**20
 
 
+class DenseMesh:
+    """The mesh half of the bordered system, from the dense operated matrix.
+
+    Holds ``[A.real; A.imag]`` contiguously, so the two quadratic forms the
+    bordered system needs are one real GEMM.  Measured at n_vis = 1e5,
+    n_mesh = 576: 0.14 s per `solve` against 1.3 s for `A.real.T @ ...` on the
+    complex matrix, which copies a strided `A` every call.
+    """
+
+    #: whether `A` can be handed out
+    has_matrix = True
+
+    def __init__(self, inversion):
+        A = np.asarray(inversion.operated_mapping_matrix)
+        self.n_vis = A.shape[0]
+        self.n_mesh = A.shape[1]
+        self.A_stack = np.empty((2 * self.n_vis, self.n_mesh))
+        self.A_stack[: self.n_vis] = A.real
+        self.A_stack[self.n_vis:] = A.imag
+
+    @property
+    def A(self) -> np.ndarray:
+        return self.A_stack[: self.n_vis] + 1j * self.A_stack[self.n_vis:]
+
+    def cross(self, Pw: np.ndarray) -> np.ndarray:
+        """``A^T Pw`` for stacked real weighted columns -> (n_mesh, k)."""
+        return self.A_stack.T @ Pw
+
+    def forward(self, mesh_values: np.ndarray) -> np.ndarray:
+        """The mesh model's visibilities, ``A s``."""
+        stacked = self.A_stack @ np.asarray(mesh_values)
+        return stacked[: self.n_vis] + 1j * stacked[self.n_vis:]
+
+
+class SparseMesh:
+    """The same two operations without ever forming ``A``.
+
+    ``A = F M`` -- the real-space mapping matrix `M` followed by the Fourier
+    transform -- so for stacked real weighted columns
+    ``Pw = [w_re Re(P); w_im Im(P)]``
+
+        A^T Pw = Re(A^H (w_re Re(P) + i w_im Im(P)))
+               = M^T Re(F^H (w_re Re(P) + i w_im Im(P)))
+
+    which is the *dirty image of the point column*, projected onto the mesh.
+    One adjoint transform per column replaces the `n_vis x n_mesh` build that
+    `operated_mapping_matrix` does -- 21.6 GB on Ruby CO(7-6) against a few
+    image-sized arrays here.  The forward direction is the mirror of it:
+    ``A s = F (M s)``, one forward transform of one image.
+
+    Note the weighting stays explicit and per-part, so this is exact for
+    unequal sigma_re and sigma_im as well -- unlike the w-tilde kernel, which
+    assumes they are equal.  `tests/test_pointsource_sparse.py` pins both
+    operations against `DenseMesh` at 1e-15.
+    """
+
+    has_matrix = False
+
+    def __init__(self, inversion, dataset):
+        mappers = [
+            obj for obj in inversion.linear_obj_list
+            if hasattr(obj, "mapping_matrix")
+        ]
+        if len(mappers) != 1:
+            raise ValueError(
+                "the sparse bordered system expects exactly one mapper in the "
+                f"inversion, found {len(mappers)}"
+            )
+        self.mapping_matrix = np.asarray(mappers[0].mapping_matrix)
+        self.transformer = dataset.transformer
+        self.mask = self.transformer.grid.mask
+        self.n_vis = int(np.asarray(dataset.data).shape[0])
+        self.n_mesh = self.mapping_matrix.shape[1]
+        self.sparse_operator = getattr(dataset, "sparse_operator", None)
+        self._operated_mapping = None   # W~ M, for `cross_on_grid`
+        self._grid_lookup = None
+
+    @property
+    def A_stack(self) -> np.ndarray:
+        return self.A
+
+    @property
+    def A(self) -> np.ndarray:
+        raise NotImplementedError(
+            "the sparse bordered system never forms the operated mapping "
+            "matrix -- that n_vis x n_mesh build is the allocation "
+            "--inversion sparse exists to avoid. Use `cross`/`forward`, or "
+            "--inversion dense if the matrix itself is wanted."
+        )
+
+    def cross(self, Pw: np.ndarray) -> np.ndarray:
+        import autoarray as aa
+
+        n = self.n_vis
+        Pw = np.asarray(Pw)
+        z = Pw[:n] + 1j * Pw[n:]
+        out = np.empty((self.n_mesh, z.shape[1]))
+        for j in range(z.shape[1]):
+            image = self.transformer.image_from(
+                visibilities=aa.Visibilities(visibilities=z[:, j])
+            )
+            out[:, j] = self.mapping_matrix.T @ np.asarray(image).ravel()
+        return out
+
+    def forward(self, mesh_values: np.ndarray) -> np.ndarray:
+        import autoarray as aa
+
+        image = self.mapping_matrix @ np.asarray(mesh_values)
+        return np.asarray(
+            self.transformer.visibilities_from(
+                image=aa.Array2D(values=image, mask=self.mask)
+            )
+        )
+
+    # ---- the detector's shortcut ------------------------------------------
+
+    def _slim_index_for(self, ys, xs):
+        """Slim image-pixel indices for positions sitting on pixel centres.
+
+        ``None`` if any of them does not, which sends `scan` back to the
+        general per-column route.
+        """
+        # the mask's own grid, in arcsec and in slim order -- not
+        # `transformer.grid`, which autoarray keeps in radians
+        grid = np.asarray(self.mask.derive_grid.unmasked).reshape(-1, 2)
+        if grid.shape[0] != self.mapping_matrix.shape[0]:
+            return None
+        if self._grid_lookup is None:
+            pixel = float(self.mask.pixel_scales[0])
+            # half-pixel units: an even-sided grid puts its centres on
+            # half-integer multiples of the pixel scale, so rounding to whole
+            # pixels collides two neighbours into one key
+            self._grid_lookup = (
+                pixel,
+                {
+                    (round(2.0 * float(gy) / pixel),
+                     round(2.0 * float(gx) / pixel)): i
+                    for i, (gy, gx) in enumerate(grid)
+                },
+            )
+        pixel, lookup = self._grid_lookup
+        index = np.empty(len(ys), dtype=np.int64)
+        for j, (y, x) in enumerate(zip(ys, xs)):
+            key = (round(2.0 * float(y) / pixel), round(2.0 * float(x) / pixel))
+            hit = lookup.get(key)
+            if hit is None:
+                return None
+            index[j] = hit
+        # the rounding above found a *nearest* pixel; insist it is the pixel
+        if not np.allclose(grid[index, 0], ys, atol=1e-9 * pixel + 1e-12):
+            return None
+        if not np.allclose(grid[index, 1], xs, atol=1e-9 * pixel + 1e-12):
+            return None
+        return index
+
+    def cross_on_grid(self, ys, xs):
+        """All of `scan`'s cross-terms at once, when the lattice is the grid.
+
+        The per-column route costs one adjoint transform per trial position,
+        which is the right price for the handful `solve` and `refine_position`
+        ask for and quite the wrong one for a detection lattice: measured at
+        1e5 visibilities on a 48x48 lattice, 1.3 s x 2304 = 50 minutes.
+
+        But a trial position on a *pixel centre* is a delta on the grid, so
+
+            b_j = A^T W P_j = M^T F^H W F e_j = M^T W~ e_j
+
+        and every column at once is ``(W~ M)^T`` -- the operator applied to the
+        mesh's `n_mesh` mapping columns rather than to the lattice's, in one
+        batched FFT call. `detection_lattice` is exactly the image grid, so
+        this is the path the detector actually takes; 576 columns once,
+        reused for every rescan.
+
+        This inherits the w-tilde kernel's assumption that sigma_re == sigma_im
+        -- but so does the sparse inversion's own `F`, so it adds nothing the
+        run has not already accepted (`api.run` pools the noise and warns above
+        2% before choosing this path). It is also only the *detector*: accepted
+        positions are refined and solved through the exact per-column route,
+        so nothing delivered rests on it.
+
+        Returns ``None`` when the lattice is not on the grid, or when there is
+        no operator to use.
+        """
+        if self.sparse_operator is None:
+            return None
+        ys = np.asarray(ys, dtype=float).ravel()
+        xs = np.asarray(xs, dtype=float).ravel()
+        index = self._slim_index_for(ys, xs)
+        if index is None:
+            return None
+        if self._operated_mapping is None:
+            self._operated_mapping = np.asarray(
+                self.sparse_operator.operated_matrix_slim_from(
+                    matrix_slim=self.mapping_matrix,
+                    extent_index_for_masked_pixel=(
+                        self.mask.extent_index_for_masked_pixel
+                    ),
+                )
+            )                                  # (n_image_slim, n_mesh)
+        return self._operated_mapping.T[:, index]   # (n_mesh, L)
+
+
+def mesh_operator(inversion, dataset):
+    """`SparseMesh` when the inversion is the sparse one, else `DenseMesh`.
+
+    The test is the dataset's sparse operator, which is what makes autoarray's
+    factory choose `InversionInterferometerSparse` in the first place.
+    """
+    if getattr(dataset, "sparse_operator", None) is not None:
+        return SparseMesh(inversion, dataset)
+    return DenseMesh(inversion)
+
+
 class AugmentedSystem:
     """The mesh's linear system, extensible with analytic point components.
 
@@ -189,13 +402,8 @@ class AugmentedSystem:
         data = np.asarray(dataset.data)
         self.w_re, self.w_im = 1.0 / noise.real**2, 1.0 / noise.imag**2
         self.d_re, self.d_im = data.real, data.imag
-        A = np.asarray(inversion.operated_mapping_matrix)
-        self.n_vis = A.shape[0]
-        # [A.real; A.imag], contiguous: one real GEMM replaces two strided ones
-        self.A_stack = np.empty((2 * self.n_vis, A.shape[1]))
-        self.A_stack[: self.n_vis] = A.real
-        self.A_stack[self.n_vis:] = A.imag
-        del A
+        self.mesh = mesh_operator(inversion, dataset)
+        self.n_vis = self.mesh.n_vis
         self.w_stack = np.concatenate([self.w_re, self.w_im])
         self.d_stack = np.concatenate([self.d_re, self.d_im])
         self.wd_stack = self.w_stack * self.d_stack
@@ -219,9 +427,17 @@ class AugmentedSystem:
         self._lattice = None
 
     @property
+    def A_stack(self) -> np.ndarray:
+        """The dense backend's stacked real matrix (dense path only)."""
+        return self.mesh.A_stack
+
+    @property
     def A(self) -> np.ndarray:
-        """The complex operated mapping matrix, rebuilt on request."""
-        return self.A_stack[: self.n_vis] + 1j * self.A_stack[self.n_vis:]
+        """The complex operated mapping matrix, rebuilt on request.
+
+        Raises on the sparse path, which never forms it.
+        """
+        return self.mesh.A
 
     def set_regularization_scale(self, factor: float) -> bool:
         """Rescale the regularisation, refactorising the mesh block.
@@ -333,7 +549,7 @@ class AugmentedSystem:
             P_new = self._stacked_columns(
                 [keys[i][0] for i in missing], [keys[i][1] for i in missing],
                 [keys[i][2] for i in missing])
-            B_new = self._curv(self.A_stack, P_new)
+            B_new = self.mesh.cross(self.w_stack[:, None] * P_new)
             Dp_new = self._dvec(P_new)
             for j, i in enumerate(missing):
                 self._columns[keys[i]] = (
@@ -447,6 +663,10 @@ class AugmentedSystem:
         cho = cho_factor(M, lower=True, check_finite=False)
         MinvD = cho_solve(cho, D_eff, check_finite=False)
 
+        # every cross-term at once when the backend can (see `cross_on_grid`)
+        on_grid = getattr(self.mesh, "cross_on_grid", None)
+        b_all = None if on_grid is None else on_grid(ys, xs)
+
         amp = np.empty(ys.size)
         sig = np.empty(ys.size)
         for lo in range(0, ys.size, chunk):
@@ -456,7 +676,10 @@ class AugmentedSystem:
                 P = self._stacked_columns(ys[lo:hi], xs[lo:hi])
                 Pw = self.w_stack[:, None] * P
                 if hit is None:
-                    b = self.A_stack.T @ Pw
+                    b = (
+                        b_all[:, lo:hi] if b_all is not None
+                        else self.mesh.cross(Pw)
+                    )
                     dp = self._dvec(P)
                     c = np.einsum("ij,ij->j", P, Pw)
                     if self._lattice is not None:
@@ -518,8 +741,7 @@ class AugmentedSystem:
         return self.solve(positions)[2]
 
     def model_visibilities(self, mesh_values, positions, amplitudes) -> np.ndarray:
-        stacked = self.A_stack @ np.asarray(mesh_values)
-        vis = stacked[: self.n_vis] + 1j * stacked[self.n_vis:]
+        vis = self.mesh.forward(mesh_values)
         if len(positions):
             vis = vis + self.columns_for(positions) @ amplitudes
         return vis

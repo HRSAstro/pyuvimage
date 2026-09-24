@@ -1432,11 +1432,6 @@ def resolve_inversion(
             "at which the w-tilde path starts to pay for its kernel build. "
             "Pass --inversion sparse to use it anyway"
         )
-    if point_sources:
-        return _dense(
-            "point components were requested, and the sparse path cannot fit "
-            "them yet (their cross-terms need the dense mapping matrix)"
-        )
     reason = sparse_inversion_diagnosis()
     if reason is not None:
         return _dense(reason)

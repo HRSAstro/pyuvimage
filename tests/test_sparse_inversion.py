@@ -285,22 +285,21 @@ def test_unknown_inversion_is_rejected(tmp_path):
         api.run(**_run_kwargs(tmp_path, inversion="wtilde"))
 
 
-def test_sparse_refuses_point_sources(tmp_path):
-    """Refuse rather than silently give up the benefit.
+def test_sparse_accepts_point_sources(tmp_path):
+    """The guard that refused them is gone.
 
-    Our point components are not autoarray linear objects -- they are a
-    bordered system built on top of the framework's inversion, and it needs
-    `inversion.operated_mapping_matrix` to form the mesh/point cross-terms.
-    `InversionInterferometerSparse` inherits that property unchanged, so
-    touching it triggers the dense n_vis x n_mesh build the w-tilde path
-    exists to avoid. The fit would be correct and would allocate exactly what
-    the user asked to escape, so the honest move is an error at the top of the
-    run naming which of the two to give up.
+    It was never a correctness problem, only a cost one: the bordered system
+    read its mesh/point cross-terms off `operated_mapping_matrix`, the dense
+    n_vis x n_mesh build the w-tilde path exists to avoid. It never needed the
+    matrix -- `A = F M`, so the cross-terms are the dirty image of each point
+    column projected onto the mesh, one adjoint transform apiece
+    (`pointsource.SparseMesh`, pinned against the dense matrix in
+    tests/test_pointsource_sparse.py).
     """
     from pyuvimage import api
 
-    with pytest.raises(ValueError, match="cannot yet fit point sources"):
-        api.run(**_run_kwargs(tmp_path, point_sources=True))
+    result = api.run(**_run_kwargs(tmp_path, point_sources=True))
+    assert result.parameters["solver"]["inversion"] == "sparse"
 
 
 def test_sparse_accepts_cube_mode(tmp_path, caplog):
@@ -668,12 +667,14 @@ def test_the_threshold_is_inclusive_at_5000(monkeypatch):
     assert fitting.resolve_inversion("auto", n_vis=4999) == "dense"
 
 
-def test_auto_avoids_sparse_when_point_sources_are_wanted(monkeypatch):
-    """Sparse cannot fit them yet, and auto must not turn that into an error."""
+def test_auto_keeps_sparse_when_point_sources_are_wanted(monkeypatch):
+    """Points used to demote a million-visibility fit to the dense mapping
+    matrix, which is the one thing that dataset cannot afford. They no longer
+    need it, so they no longer demote it."""
     monkeypatch.setattr(fitting, "sparse_inversion_diagnosis", lambda: None)
     assert fitting.resolve_inversion(
         "auto", n_vis=10**6, point_sources=True
-    ) == "dense"
+    ) == "sparse"
 
 
 def test_auto_falls_back_when_sparse_is_unavailable(monkeypatch, caplog):

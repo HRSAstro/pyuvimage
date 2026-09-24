@@ -337,8 +337,11 @@ Cube mode streams the same pass one channel at a time into one set of terms
 per channel, and `--image-centre` is the same phase ramp applied per chunk.
 
 Sparse needs JAX; `auto` falls back to dense and says so when it is missing,
-when `--point-sources` is requested, or when the real and imaginary noise
-differ by more than 5%. On the dense path `pip install pynufft` is what makes
+or when the real and imaginary noise differ by more than 5%. `--point-sources`
+no longer forces dense — the bordered system's cross-terms come from one
+adjoint transform per point column instead of the `n_vis × n_mesh` matrix —
+though it does still hold the streaming load back, because a point column is
+analytic in uv and the streamed pass keeps nothing per visibility. On the dense path `pip install pynufft` is what makes
 it fast. A full fit is roughly 30–40 hyperparameter trials, doubled for the
 default `adaptive` prior; Ruby above is ~30 s sparse and tens of minutes dense.
 

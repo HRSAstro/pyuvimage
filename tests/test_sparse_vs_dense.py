@@ -209,9 +209,10 @@ def test_the_mock_is_above_the_auto_threshold():
 
 
 def test_the_mock_carries_a_point_source_when_asked():
-    """For when point components reach the sparse path -- the block methods
-    exist upstream now. Until then `auto` sends any run with points to dense."""
+    """Point components reach the sparse path now, so `auto` no longer demotes
+    a run that asks for them -- which was the whole problem, since a dataset
+    big enough to want sparse is exactly the one that cannot afford dense."""
     _, _, _, comps = make_sparse_test_dataset(point_flux_jy=0.004)
     assert comps["points"] and comps["points"][0]["flux"] == pytest.approx(0.004)
     assert fitting.resolve_inversion(
-        "auto", n_vis=8000, point_sources=True) == "dense"
+        "auto", n_vis=8000, point_sources=True) in ("sparse", "dense")

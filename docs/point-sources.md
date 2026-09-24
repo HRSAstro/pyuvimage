@@ -118,6 +118,55 @@ uncertainty map is marginalised over the point amplitudes,
 `Cov = M^-1 + (M^-1 B) S^-1 (M^-1 B)^T` — ignoring the second term would
 understate the error wherever a point competes with the mesh for flux.
 
+**On the sparse (w-tilde) inversion.** The bordered system needs two things
+from the mesh: the cross-terms `B = A^T W P` between the mesh columns and the
+point columns, and `A s` for the model visibilities. Both used to be read off
+`inversion.operated_mapping_matrix` — the dense `n_vis x n_mesh` build — which
+is why `--point-sources` forced `--inversion dense` (21.6 GB on Ruby CO(7-6)
+against a 0.10 MB kernel: asking for both gave up the whole point of sparse).
+
+Neither actually needs the matrix. `A = F M`, the real-space mapping matrix
+followed by the Fourier transform, so
+
+    A^T W P = M^T Re(F^H (w_re Re(P) + i w_im Im(P)))
+    A s     = F (M s)
+
+— the first is the *dirty image of the point column* projected onto the mesh,
+one adjoint transform per column; the second is one forward transform of one
+image. `pointsource.SparseMesh` does exactly that, and `pointsource.DenseMesh`
+keeps the old stacked-matrix route for the dense path. They agree to 5e-16 on
+the cross-terms and 7e-14 on the forward direction.
+
+The amplitudes then differ between the two paths at ~5e-7 relative, which is
+*not* the backends disagreeing: `F + H` has a condition number around 1e10 (the
+mesh has pixels the uv coverage barely constrains), so a 1e-16 difference
+anywhere reaches the amplitudes at ~1e-6. Perturbing the dense cross-terms
+randomly by the same 5e-16 moves them roughly ten times *further*, which is
+what `test_the_difference_is_conditioning_not_error` asserts.
+
+The detector needed one thing more. It scores a trial point at every pixel of
+the image grid, and one adjoint transform per trial is the wrong price —
+measured at 1e5 visibilities, 1.3 s x 2304 lattice positions is 50 minutes.
+But a trial position on a pixel centre is a delta on the grid, so
+
+    b_j = A^T W P_j = M^T F^H W F e_j = M^T W~ e_j
+
+and the whole lattice at once is `(W~ M)^T`: the kernel applied to the mesh's
+few hundred mapping columns rather than to the lattice's few thousand, in one
+batched FFT. 2400x faster, agreeing with the exact route to 1.6e-14. It
+inherits the kernel's `sigma_re == sigma_im` assumption — which the sparse
+inversion's own `F` already makes — and a lattice that is not on the grid
+declines it and falls back. It is only the detector: accepted positions are
+refined and solved through the exact per-column route.
+
+**Streaming is the part still held back**, and for a different reason: a point
+column is an analytic function of uv, and all three of its terms are sums over
+samples the streamed pass has already discarded. The accumulated terms hold
+those sums only on the image grid, and a point's whole reason for existing is
+that it is not on the grid. So `--point-sources` runs the sparse inversion in
+memory: ~136 B per visibility for the data, rather than the `n_vis x n_mesh`
+matrix it used to need.
+
 **Limits.** The amplitude covariance is conditional on the prior, so a point
 sitting on bright extended emission has an error bar that is only as good as
 the prior's description of that emission. Detection has no look-elsewhere
