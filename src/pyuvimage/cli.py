@@ -392,8 +392,10 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument(
         "--no-point-retune", action="store_true",
         help="keep the mesh-only regularisation when point components are "
-             "fitted, instead of re-tuning to chi^2 = N (looser mesh, wider "
-             "point error bars)",
+             "fitted, instead of re-tuning it with the points present (to "
+             "chi^2 = N under --criterion discrepancy, to a structure ratio "
+             "of 1 under structure). Without the retune the mesh keeps "
+             "freedom the point has taken over and fits noise",
     )
     p_fit.add_argument(
         "--max-points", type=int, default=5,

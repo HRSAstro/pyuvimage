@@ -154,18 +154,47 @@ def test_no_false_positives_on_a_smooth_source():
 
 
 def test_user_supplied_position_is_kept_and_refined(knot_case):
-    """A position the user asked for is never dropped, and is improved on."""
+    """A position the user asked for is kept, whatever its significance, and
+    improved on.
+
+    The guess used to be 0.21" off (about half a beam), and the test passed
+    while the refinement settled on the trough beside the knot at -5.2 mJy --
+    a wrong answer, since a negative component is never delivered now. 0.11"
+    off (a quarter beam) the +-1 pixel refinement reaches the knot.
+    """
     uvd, _, geom, comps = knot_case
     _, ds, fit = _system(uvd, geom)
     dec, ra = comps["compact"]["centre"]
-    guess = (-ra + 0.15, dec - 0.15)
+    guess = (-ra + 0.08, dec - 0.08)
     sol = fit_point_sources(fit.fit.inversion, ds, geom, positions=[guess])
     assert len(sol.points) == 1
     p = sol.points[0]
     assert p.user_supplied
     moved = np.hypot(p.d_ra - guess[0], p.d_dec - guess[1])
     err = np.hypot(p.d_ra - (-ra), p.d_dec - dec)
-    assert moved > 0.02 and err < np.hypot(0.15, 0.15)
+    assert moved > 0.02 and err < 0.5 * np.hypot(0.08, 0.08)
+    assert p.flux == pytest.approx(comps["compact"]["flux"], rel=0.1)
+
+
+def test_a_user_position_half_a_beam_off_is_never_delivered_negative(
+        knot_case, caplog):
+    """Half a beam off, the refinement cannot reach the knot and settles on
+    the trough beside it. Dropping that is the lesser evil -- the alternatives
+    tried (a matched-filter search within a beam, a positivity-constrained
+    refinement) each manufactured a positive point where there was none: on
+    the ring beside a trough, or on a 3 mJy bump 0.3" from the knot. The
+    warning has to say what to do instead."""
+    import logging
+
+    uvd, _, geom, comps = knot_case
+    _, ds, fit = _system(uvd, geom)
+    dec, ra = comps["compact"]["centre"]
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        sol = fit_point_sources(fit.fit.inversion, ds, geom,
+                                positions=[(-ra + 0.15, dec - 0.15)])
+    assert all(p.flux > 0 for p in sol.points)
+    if not sol.points:
+        assert "--point-sources" in caplog.text
 
 
 def test_retune_restores_the_discrepancy_criterion(knot_case):

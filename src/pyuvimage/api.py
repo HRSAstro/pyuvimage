@@ -685,7 +685,21 @@ def run(
                 max_points=max_points,
                 dirty_imager=imager,
                 beam_fwhm=beam_size,
-                retune=bool(point_retune) and criterion == "discrepancy",
+                # Re-tune on the criterion the search used, now that the
+                # points are in the model. It used to run for `discrepancy`
+                # only, so on large data (where `auto` picks `structure`) the
+                # coefficient stayed where the *mesh-only* search left it --
+                # tuned to let the mesh chase the point's residual -- and the
+                # delivered fit overfitted. A coefficient the user fixed is
+                # theirs, and is not re-tuned.
+                retune=(
+                    bool(point_retune) and coefficient == "auto"
+                    and criterion in ("discrepancy", "structure")
+                ),
+                retune_criterion=(
+                    criterion if criterion in ("discrepancy", "structure")
+                    else "discrepancy"
+                ),
                 chi2_target=chi2_target,
             )
 
@@ -714,7 +728,9 @@ def run(
             try:
                 mfs_refit = fitting.fit_dataset(
                     mfs_dataset, geometry, reg_kind=reg, criterion=criterion,
-                    positive_only=positive_only, prior=None, nu=nu,
+                    # `prior=None` here re-optimised the coefficient even
+                    # when the user had fixed it with --lambda
+                    positive_only=positive_only, prior=fixed_prior, nu=nu,
                     fixed_scale=beam_scale, envelope=envelope_np,
                     chi2_target=chi2_target,
                     warn_on_chi2=False,  # the point fit follows; see above
@@ -735,6 +751,18 @@ def run(
             else:
                 if refit_solution.points:
                     mfs_fit, point_solution = mfs_refit, refit_solution
+                elif point_solution.points:
+                    # The refit is the better-posed of the two (its prior map
+                    # does not have the point smeared into it), and it kept
+                    # nothing -- now usually because the component came back
+                    # negative and was dropped. Keeping the first solution's
+                    # point would deliver exactly the component the refit
+                    # exists to correct.
+                    logger.warning(
+                        "  the refit with the extended-only prior map kept no "
+                        "point component; delivering the pixelized model alone"
+                    )
+                    point_solution = refit_solution
 
         if speculative and point_solution.points:
             # Judge the answer, now that there is one to judge. Two tests, both
@@ -906,7 +934,7 @@ def run(
                 sol_c = fit_point_sources(
                     sf.fit.inversion, ds_c, geometry, positions=cube_points,
                     refine=False, retune=False, beam_fwhm=beam_size,
-                    chi2_target=chi2_target,
+                    chi2_target=chi2_target, check_positions=False,
                 )
                 if sol_c.points:
                     sf = PointAugmentedFit(sf, sol_c)

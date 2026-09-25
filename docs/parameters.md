@@ -45,7 +45,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | `--point x,y` | — | Fit a point at this offset in arcsec from the phase centre, in **image axes** (+x right, +y up — same as `--image-centre`; `x = -dRA`). The position is refined. Repeatable; implies `--point-sources` and disables auto-detection. A negative x needs the `=` form: `--point="-1.2,0.4"`. Fitted positions are *reported* in dRA/dDec, matching the FITS WCS. |
 | `--point-significance` | **5** | Keep auto-detected points above this significance. |
 | `--max-points` | **5** | Most auto-detected components to keep. |
-| `--no-point-retune` | off (retune **on**) | Keep the mesh-only regularisation instead of re-imposing `chi^2 = N` with the points present. |
+| `--no-point-retune` | off (retune **on**) | Keep the mesh-only regularisation instead of re-tuning it with the points present -- to `chi^2 = N` under `--criterion discrepancy`, to a structure ratio of 1 (for the combined mesh + point residual) under `structure`, which `auto` picks on large data. Not applied when `--lambda` fixes the coefficient. |
 
 In `--mode cube` the MFS pass decides *where* the points are and every channel then fits its own amplitude at those fixed positions, so a point's spectrum comes out per plane (`point_sources.json` lists it under `channels`; the FITS header's `PTFLUX` is the mean over planes). Positions are not re-refined per channel.
 

@@ -88,6 +88,39 @@ mock, the signature of a mesh now fitting noise. The retune re-imposes
 chi^2 = N by stiffening the prior (here by 8e6, coefficient 6.2e3 -> 5.1e10),
 which is the same regime the *disc-only* control independently optimises to.
 
+**It re-tunes on the criterion the search used.** Until Sep 2026 the retune
+ran only under `discrepancy`. On a large dataset `auto` picks `structure`
+(chi^2 is flat there: 0.99995-1.00076 over twelve decades of the coefficient
+on one 1.8e7-datum field), so nothing re-tuned, and the delivered prior was
+the one the *mesh-only* search chose -- tuned to let the mesh chase the
+point's residual. With the point carrying that flux the mesh then fits noise:
+structure ratio 0.40 on the real field, 0.14 on a mock of it. Worse, the
+split between the point and the mesh under it is set by a prior too weak to
+set anything: on a small mock a true 12 mJy point came back at **-86 mJy**,
+the mesh carrying the difference. Under `structure` the retune now brings the
+structure ratio of the combined (mesh + point) residual to 1 -- on that mock
+by a factor of ~8700, recovering 12.5 mJy. A coefficient fixed with
+`--lambda` is the user's and is not re-tuned (nor, now, re-optimised on the
+adaptive refit, which it silently was).
+
+*Known limitation.* The retune scales one global strength until the *whole*
+residual map reads as noise, and that can be met by moving the misfit rather
+than removing it. On a mock of a 10 mJy point on diffuse emission with two
+narrow streamers: under `adaptive` the retuned fit leaves a +-5 sigma ring
+around the point and the flux comes out 8.5 +- 1.4 mJy; under `matern` the
+point is exact (9.97 +- 0.07 mJy) but the streamers, narrower than the beam,
+sit in the residual at +-4 sigma. Before the retune both fits were overfit
+(structure ratio 0.16). Look at `residual.fits` around the point.
+
+**Positions you supply are checked too.** They are kept whatever their
+significance, but a component that comes back *negative* is dropped with a
+warning, and one that a Gaussian fits better (the same unresolved test
+auto-detection applies) is flagged: its flux is then split between the point
+and the mesh by the prior, not the data. On mocks a negative component at a
+user position is the signature of a resolved compact source -- the mesh
+describes it and overshoots slightly at its centre -- and it stays negative at
+every prior strength. See `claude/central-point-mock-reproduction.md`.
+
 | | extended model | knot flux (truth 0.01200) | peak residual |
 |---|---|---|---|
 | mesh only, no point | striped by beam sidelobes at +-5e-5, half the disc's peak | knot smeared into the mesh | 2.42 sigma |

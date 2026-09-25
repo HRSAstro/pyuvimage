@@ -848,11 +848,50 @@ def _best_candidate(system, accepted, ys, xs, excluded, radius):
 
 
 
+def augmented_structure_ratio(
+    system: AugmentedSystem, positions: list, imager,
+) -> float | None:
+    """The structure ratio of the mesh *plus* point components.
+
+    The same statistic `--criterion structure` bisects on -- the residual
+    dirty image's rms against what white residuals of this chi^2 would give
+    (`fitting._structure_ratio`) -- but of the combined model. The criterion's
+    own search only ever sees the mesh, so the point's flux sits in its
+    residual; see `retune_regularization`.
+    """
+    from . import fitting
+
+    try:
+        mesh, amps, chi2, _ = system.solve(positions)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    model = system.model_visibilities(mesh, positions, amps)
+    resid = (system.d_re + 1j * system.d_im) - model
+    ratio = fitting._structure_ratio(resid, chi2, imager, system.n_data)
+    return float(ratio) if np.isfinite(ratio) else None
+
+
 def retune_regularization(
     system: AugmentedSystem, positions: list, chi2_target: float = 1.0,
     max_iter: int = 40, min_factor: float = 1e-8, max_factor: float = 1e12,
+    criterion: str = "discrepancy", imager=None,
 ) -> float:
-    """Re-hit chi^2 = target*N now that point components carry some of the flux.
+    """Re-hit the criterion now that point components carry some of the flux.
+
+    ``criterion="discrepancy"`` re-hits chi^2 = target*N;
+    ``criterion="structure"`` re-hits a structure ratio of 1 for the combined
+    (mesh + point) residual, which needs the ``imager``.
+
+    The structure form is the one that matters on large datasets, and it was
+    missing: the retune ran only under `discrepancy`, whose chi^2 is flat on
+    anything big (Teresa's 1.8e7 data: chi^2/N 0.99995-1.00076 over twelve
+    decades of the coefficient). Everywhere else the coefficient stayed where
+    the *mesh-only* search left it -- and that search tunes the prior to let
+    the mesh chase the point's residual. With the point taking that flux the
+    prior is then decades too weak and the mesh fits noise: on a mock with a
+    true 10 mJy point the delivered structure ratio was 0.14, and still only
+    0.66 with the prior 1e4 x stronger (`claude/central-point-mock-
+    reproduction.md`). Teresa's 0.40 is the same thing.
 
     The regularisation strength was chosen for the mesh alone.  A point
     absorbs signal the mesh had been straining to reproduce, so the same
@@ -867,22 +906,37 @@ def retune_regularization(
     makes F singular whenever the mesh has pixels the uv coverage does not
     constrain.  The bracket stops there rather than crashing.
     """
-    target = chi2_target * system.n_data
+    if criterion == "structure":
+        if imager is None:
+            raise ValueError("a structure retune needs the dirty imager")
+        target = 1.0
+        what = "a structure ratio of 1"
 
-    def chi2_at(factor) -> float | None:
-        if not system.set_regularization_scale(factor):
-            return None
-        try:
-            return system.chi_squared(positions)
-        except (np.linalg.LinAlgError, ValueError):
-            return None
+        def chi2_at(factor) -> float | None:
+            # the metric, whichever it is; the name is kept from when it was
+            # always chi^2, and both rise monotonically with the prior
+            if not system.set_regularization_scale(factor):
+                return None
+            return augmented_structure_ratio(system, positions, imager)
+    elif criterion == "discrepancy":
+        target = chi2_target * system.n_data
+        what = f"chi^2 = {chi2_target:.2f} N"
+
+        def chi2_at(factor) -> float | None:
+            if not system.set_regularization_scale(factor):
+                return None
+            try:
+                return system.chi_squared(positions)
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+    else:
+        raise ValueError(f"cannot retune on criterion {criterion!r}")
 
     def give_up(reason: str) -> float:
         system.set_regularization_scale(1.0)
         logger.warning(
-            "  could not restore chi^2 = %.2f N with point components "
-            "present (%s); keeping the mesh-only regularisation",
-            chi2_target, reason,
+            "  could not restore %s with point components present (%s); "
+            "keeping the mesh-only regularisation", what, reason,
         )
         return 1.0
 
@@ -948,6 +1002,8 @@ def fit_point_sources(
     resolved_delta_chi2: float = DEFAULT_RESOLVED_DELTA_CHI2,
     retune: bool = True,
     chi2_target: float = 1.0,
+    retune_criterion: str = "discrepancy",
+    check_positions: bool = True,
 ):
     """Fit analytic point components alongside the pixelized model.
 
@@ -963,6 +1019,16 @@ def fit_point_sources(
         Synthesised beam FWHM [arcsec].  Sets the minimum separation between
         detections and the width scale of the unresolved test.  Auto-detection
         without it is far more trigger-happy, so it is strongly recommended.
+    retune_criterion
+        What the regularisation is re-tuned to once points are present:
+        ``"discrepancy"`` (chi^2 = target N) or ``"structure"`` (a structure
+        ratio of 1 for the combined residual).
+    check_positions
+        For supplied ``positions``: drop any that come back negative, and warn
+        when one does not look unresolved. Off for the per-channel fits of a
+        cube, whose positions come from the MFS pass and whose flux may
+        legitimately scatter negative in a line-free channel -- dropping those
+        would bias the spectrum.
     dirty_imager
         A `beam.DirtyImager` for the dataset.  Used only when ``beam_fwhm`` is
         not given: the FWHM is then taken as the geometric mean of the fitted
@@ -977,6 +1043,23 @@ def fit_point_sources(
         b = fit_beam(dirty_imager.dirty_beam, geometry.pixel_scale)
         beam_fwhm = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
     system = AugmentedSystem(inversion, dataset)
+
+    if retune and retune_criterion == "structure" and dirty_imager is None:
+        from .beam import DirtyImager
+
+        dirty_imager = DirtyImager(dataset)
+
+    def _retune(points_now):
+        return retune_regularization(
+            system, points_now, chi2_target,
+            criterion=retune_criterion, imager=dirty_imager,
+        )
+
+    def _metric_now():
+        if retune_criterion == "structure":
+            r = augmented_structure_ratio(system, accepted, dirty_imager)
+            return "structure ratio", (float("nan") if r is None else r)
+        return "chi2/N", system.chi_squared(accepted) / system.n_data
     pixel = geometry.pixel_scale
     accepted: list = []
     user_flags: list = []
@@ -1066,9 +1149,10 @@ def fit_point_sources(
     factor = 1.0
     if accepted:
         chi2_before = system.chi_squared(accepted) / system.n_data
+        metric_name, metric_before = _metric_now()
         for _ in range(3):
             if retune:
-                factor = retune_regularization(system, accepted, chi2_target)
+                factor = _retune(accepted)
             if not refine or factor == 1.0:
                 break
             moved = 0.0
@@ -1084,12 +1168,12 @@ def fit_point_sources(
         # the loop can exit on a position move, which leaves chi^2 below the
         # target again -- so always finish on a retune, never on a refine
         if retune:
-            factor = retune_regularization(system, accepted, chi2_target)
+            factor = _retune(accepted)
         if retune:
             logger.info(
                 "  regularisation rescaled by %.3g with point components "
-                "present (chi2/N %.3f -> %.3f)", factor, chi2_before,
-                system.chi_squared(accepted) / system.n_data,
+                "present (%s %.3f -> %.3f)", factor, metric_name,
+                metric_before, _metric_now()[1],
             )
         elif chi2_before < 0.9 * chi2_target:
             logger.info(
@@ -1129,8 +1213,62 @@ def fit_point_sources(
             if weakest < len(user_flags):
                 del user_flags[weakest]
             if accepted and retune:
-                factor = retune_regularization(system, accepted, chi2_target)
+                factor = _retune(accepted)
             mesh, amps, chi2, cov = system.solve(accepted)
+
+    # User positions are kept whatever their significance -- the user asked
+    # for them -- but not whatever their sign. This branch used to have no
+    # check at all, so a user point came back at -4.3 mJy and 41.6 sigma on
+    # Teresa's field (|flux| 45% of the peak) and was delivered without a
+    # word, while auto-detection rejects the same thing twice over. On mocks a
+    # negative component at a user position is the signature of a *resolved*
+    # compact source: the mesh already describes it and overshoots slightly
+    # at the centre, and the delta models that shape error. It stays negative
+    # at every prior strength, so no retune rescues it.
+    if accepted and positions and check_positions:
+        while accepted and np.min(amps) <= 0:
+            i = int(np.argmin(amps))
+            err = float(np.sqrt(max(cov[i, i], 0.0)))
+            logger.warning(
+                "the point component at dRA %.3f\", dDec %.3f\" came back "
+                "with a negative flux (%.3g +- %.2g Jy) and has been dropped. "
+                "A negative component is the fit patching a dip, not a "
+                "source. Two usual causes: the source there is resolved (the "
+                "pixelized model already describes it, overshoots slightly at "
+                "its centre, and the point models that shape error), or the "
+                "position is a fraction of a beam off a real point and the "
+                "refinement, which only searches +-1 pixel, settled on the "
+                "trough beside it. If the position is approximate, "
+                "--point-sources (auto-detection) searches the whole field.",
+                *grid_to_sky(*accepted[i]), amps[i], err,
+            )
+            del accepted[i]
+            if i < len(user_flags):
+                del user_flags[i]
+            if accepted and retune:
+                factor = _retune(accepted)
+            mesh, amps, chi2, cov = system.solve(accepted)
+        if not accepted and system.h_scale != 1.0:
+            # nothing left for a retuned prior to be tuned against
+            system.set_regularization_scale(1.0)
+            factor = 1.0
+            mesh, amps, chi2, cov = system.solve(accepted)
+        # and say when a kept one does not look like a point
+        if beam_fwhm:
+            for i in range(len(accepted)):
+                ok, best_sigma, gain = unresolved_test(
+                    system, accepted, i, float(beam_fwhm), resolved_delta_chi2)
+                if not ok:
+                    logger.warning(
+                        "the point component at dRA %.3f\", dDec %.3f\" does "
+                        "not look unresolved: a Gaussian of FWHM %.3g\" "
+                        "(%.2f beams) fits better by delta chi2 = %.1f. Its "
+                        "flux is then split between the point and the "
+                        "pixelized model by the prior rather than by the data, "
+                        "so read it as a lower limit on the compact flux.",
+                        *grid_to_sky(*accepted[i]), 2.3548 * best_sigma,
+                        2.3548 * best_sigma / float(beam_fwhm), gain,
+                    )
 
     # Systematic on the amplitude: how far it moves when the regularisation
     # strength is varied over the range that is defensible for these data.
@@ -1173,6 +1311,7 @@ def fit_point_sources(
         system=system, mesh_values=mesh, points=points, chi_squared=chi2,
         grid_positions=accepted, amplitudes=amps, amplitude_covariance=cov,
         regularization_factor=factor,
+        retune_criterion=retune_criterion if retune else None,
     )
 
 
@@ -1188,6 +1327,10 @@ class PointSolution:
     amplitudes: np.ndarray
     amplitude_covariance: np.ndarray = field(default_factory=lambda: np.zeros((0, 0)))
     regularization_factor: float = 1.0
+    #: what the factor was tuned to -- "discrepancy", "structure", or None
+    #: when there was no retune. The search's own criterion in
+    #: `prior_scan.json` can differ (e.g. "structure->evidence").
+    retune_criterion: str | None = None
 
     @property
     def model_visibilities(self) -> np.ndarray:
@@ -1205,6 +1348,10 @@ class PointSolution:
             "total_point_flux_jy": self.total_point_flux,
             "chi_squared": float(self.chi_squared),
             "regularization_rescaled_by": float(self.regularization_factor),
+            "regularization_retuned_on": (
+                self.retune_criterion if self.regularization_factor != 1.0
+                else None
+            ),
             "points": [p.as_dict() for p in self.points],
         }
 
