@@ -18,7 +18,7 @@ pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
 
-Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but becomes increasingly memory intensive above ~5000 visibilities. JAX is strongly recommended for larger data sets. See [docs/install.md](docs/install.md),
+Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but becomes increasingly memory intensive above ~5000 visibilities. JAX is **strongly** recommended for larger data sets. See [docs/install.md](docs/install.md),
 which also covers building an **arm64** conda environment on Apple silicon.
 
 ## Use
