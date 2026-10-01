@@ -197,3 +197,86 @@ def apply_config(
         )
     parser.set_defaults(**values)
     return sorted(values)
+
+
+# --------------------------------------------------------------------------
+# The other direction: what a run was given, written so it can be given again.
+# --------------------------------------------------------------------------
+
+#: written into every output directory by `api.run`
+INPUT_RECORD = "input_parameters.json"
+
+
+def _pair_value(text: str) -> list[float]:
+    x, y = (float(v) for v in str(text).replace("(", "").replace(")", "").split(","))
+    return [x, y]
+
+
+def config_from_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace,
+) -> dict[str, Any]:
+    """The inverse of `apply_config`: every option of ``parser`` as it was
+    parsed, keyed the way a ``--config`` file is.
+
+    So ``pyuvimage fit --config <out>/input_parameters.json`` repeats a run
+    whether its options came from flags, a file, or both -- flags having
+    already won over the file by the time ``args`` exists. Keys follow
+    ``docs/fit-config-template.json`` (the flag without its dashes), in the
+    parser's own order. The dataset is made absolute so the record still
+    works from another directory.
+    """
+    out: dict[str, Any] = {}
+    seen_dest: set[str] = set()
+    for action in parser._actions:
+        if isinstance(action, argparse._HelpAction) or action.dest == "config":
+            continue
+        if action.dest in seen_dest:      # --no-streaming after --streaming
+            continue
+        seen_dest.add(action.dest)
+        longs = [o for o in action.option_strings if o.startswith("--")]
+        key = longs[0][2:] if longs else action.dest
+        value = getattr(args, action.dest, None)
+        if not action.option_strings and isinstance(value, str):
+            value = str(Path(value).expanduser().resolve())   # the dataset
+        elif isinstance(action, argparse._AppendAction) and value is not None:
+            value = [_pair_value(v) for v in value]
+        elif key == "image-centre" and isinstance(value, str) and "," in value:
+            value = _pair_value(value)
+        out[key] = value
+    return out
+
+
+def write_input_record(out_dir, record: dict[str, Any], *, cli: bool) -> Path:
+    """Write the inputs of a run to ``out_dir/input_parameters.json``.
+
+    Written at the *start* of a run, so a run that is killed or crashes still
+    leaves a record of what it was asked to do. ``cli`` says whether the keys
+    are the command line's (re-runnable with ``--config``) or `run()`'s own
+    keyword arguments (a Python call).
+    """
+    import datetime
+
+    from . import __version__
+
+    head: dict[str, Any] = {
+        "_written": datetime.datetime.now().isoformat(timespec="seconds"),
+        "_pyuvimage_version": __version__,
+    }
+    if cli:
+        head["_comment"] = (
+            "The inputs of this run, in --config form. Re-run it with "
+            "`pyuvimage fit --config input_parameters.json`; change any value "
+            "here or override it on the command line. fit_parameters.json is "
+            "what the run *resolved* these to."
+        )
+    else:
+        head["_comment"] = (
+            "The keyword arguments of this pyuvimage.run() call. These are "
+            "run()'s names, not the command line's, so this file is a record "
+            "rather than a --config input."
+        )
+    path = Path(out_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    path = path / INPUT_RECORD
+    path.write_text(json.dumps({**head, **record}, indent=2, default=str))
+    return path

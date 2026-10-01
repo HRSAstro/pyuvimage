@@ -159,6 +159,56 @@ def resolve_streaming(
     return True, header
 
 
+def normalise_point_sources(value):
+    """`run`'s ``point_sources`` as False, True (auto-detect), or a list of
+    image ``(x, y)`` positions.
+
+    The trap this closes: ``run(point_sources=(0, 0))`` -- one position, at
+    the phase centre -- is a non-empty tuple, so it read as *true* and
+    switched on auto-detection, while only a list counted as positions. The
+    position was silently dropped. And a flat ``[0, 0]`` crashed. A bare pair
+    is now one position, whatever its values.
+    """
+    if value is None or value is False:
+        return False
+    if value is True or (isinstance(value, str) and value.lower() == "auto"):
+        return True
+    if isinstance(value, str):
+        x, y = (float(v) for v in value.replace("(", "").replace(")", "").split(","))
+        return [(x, y)]
+    seq = list(value)
+    if not seq:
+        return False
+    if len(seq) == 2 and all(np.isscalar(v) and not isinstance(v, (str, bool))
+                             for v in seq):
+        return [(float(seq[0]), float(seq[1]))]
+    out = []
+    for q in seq:
+        q = list(q)
+        if len(q) != 2:
+            raise ValueError(
+                f"point_sources: {q!r} is not an (x, y) position in arcsec")
+        out.append((float(q[0]), float(q[1])))
+    return out
+
+
+def _jsonable_call(call: dict) -> dict:
+    """`run`'s arguments, made safe for JSON: a dataset held in memory is
+    named rather than serialised."""
+    out = {}
+    for k, v in call.items():
+        if k == "dataset" and not isinstance(v, (str, Path)):
+            v = f"<in-memory {type(v).__name__}>"
+        elif isinstance(v, Path):
+            v = str(Path(v).expanduser().resolve())
+        elif k == "dataset":
+            v = str(Path(v).expanduser().resolve())
+        elif isinstance(v, tuple):
+            v = list(v)
+        out[k] = v
+    return out
+
+
 def run(
     dataset: str | Path | UVData,
     fov: float,
@@ -189,7 +239,7 @@ def run(
     dish_diameter: float | None = None,
     pb_factor: float = primary_beam.DEFAULT_PB_FACTOR,
     uncertainty_map: bool = True,
-    point_sources: bool | list = False,
+    point_sources: bool | str | tuple | list | None = None,
     point_significance: float = 5.0,
     max_points: int = 5,
     point_retune: bool = True,
@@ -198,6 +248,7 @@ def run(
     chunk_k: int | None = None,
     reload: bool = False,
     pynufft_shift: bool = True,
+    input_parameters: dict | None = None,
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -270,12 +321,34 @@ def run(
             replace the cache. The cache is keyed on the file's path, size
             and modification time, so this is for a file rewritten in place
             with both unchanged, or for ruling the cache out.
+        point_sources: analytic point components. None or False (default):
+            none. True or "auto": auto-detect them. An **(x, y)** pair in
+            arcsec, image axes as ``image_centre``, or a list of pairs: fit
+            points there (refined). ``(0, 0)`` is the phase centre -- a
+            position, not "off": a bare pair used to be read as "auto-detect"
+            and the position silently ignored.
+        input_parameters: what to write to ``input_parameters.json`` in
+            ``out``. The CLI passes its options in ``--config`` form, so a run
+            can be repeated with ``pyuvimage fit --config``; a direct call
+            records this function's own keyword arguments instead.
         pynufft_shift: apply the half-pixel phase ramp that aligns the pynufft
             transformer with the DFT (default). False reproduces the
             uncorrected upstream transformer: self-consistent, but the sky
             lands half a pixel from the WCS in both axes. Only the pynufft
             backend is affected. See `fitting.PYNUFFT_HALF_PIXEL_SHIFT`.
     """
+    call = {k: v for k, v in locals().items() if k != "input_parameters"}
+    point_sources = normalise_point_sources(point_sources)
+    if write:
+        from .config import write_input_record
+
+        write_input_record(
+            out,
+            input_parameters if input_parameters is not None
+            else _jsonable_call(call),
+            cli=input_parameters is not None,
+        )
+
     from ._jax_guard import report_if_disabled, report_if_numba_missing
 
     report_if_disabled()

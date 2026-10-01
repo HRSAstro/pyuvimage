@@ -172,8 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         "dataset and --fov may come from the file, which makes "
         "`pyuvimage fit --config params.json` a complete command. "
         "docs/fit-config-template.json is a template carrying every key at "
-        "its default; fit_parameters.json in any output directory records "
-        "what a run actually used",
+        "its default, and every run writes input_parameters.json in this "
+        "form, so `--config <out>/input_parameters.json` repeats it",
     )
     p_fit.add_argument(
         "--fov", type=float, required=True,
@@ -486,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     # The file's values become the parser's defaults, so an explicit flag
     # still wins and the file may supply the otherwise-required dataset and
     # --fov. Done before parsing, which is why --config is found by hand.
-    from .config import apply_config, config_path_from, load_config
+    from .config import (
+        apply_config, config_from_args, config_path_from, load_config,
+    )
 
     config_applied: list[str] = []
     config_file = None
@@ -622,6 +624,9 @@ def main(argv: list[str] | None = None) -> int:
             point_significance=args.point_significance,
             max_points=args.max_points,
             point_retune=not args.no_point_retune,
+            # what was asked for, in --config form: written to
+            # input_parameters.json so the run can be repeated exactly
+            input_parameters=config_from_args(p_fit, args),
         )
         return 0
 

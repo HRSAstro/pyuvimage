@@ -67,9 +67,11 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
 | `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D), centred on the phase centre — not on the image centre when `--image-centre` is used |
 
-Plus `summary.png`, `fit_parameters.json` (every parameter of the run),
-`prior_scan.json` (every hyperparameter trial), and `point_sources.json` when
-point components are fitted.
+Plus `summary.png`, `input_parameters.json` (what the run was asked to do,
+written as it starts -- `pyuvimage fit --config input_parameters.json` repeats
+it), `fit_parameters.json` (what those inputs resolved to), `prior_scan.json`
+(every hyperparameter trial), and `point_sources.json` when point components
+are fitted.
 
 ![summary.png for J0209 at 135 GHz](figures/J0209_summary.png)
 

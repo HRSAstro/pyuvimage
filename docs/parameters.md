@@ -2,7 +2,8 @@
 
 [← back to the README](../README.md)
 
-Every run writes `fit_parameters.json` recording all of the below, plus
+Every run writes `input_parameters.json` (what it was given, re-runnable
+with `--config`), `fit_parameters.json` (what that resolved to), and
 `prior_scan.json` with every hyperparameter trial. Defaults in **bold**.
 
 Any flag on this page can be set in a JSON file instead — see
@@ -42,7 +43,7 @@ default for a pixelized source is the Matern kernel, so it is ours too)
 | Parameter | Default | Meaning |
 |---|---|---|
 | `--point-sources` | off | Fit analytic delta components, auto-detecting their positions. |
-| `--point x,y` | — | Fit a point at this offset in arcsec from the phase centre, in **image axes** (+x right, +y up — same as `--image-centre`; `x = -dRA`). The position is refined. Repeatable; implies `--point-sources` and disables auto-detection. A negative x needs the `=` form: `--point="-1.2,0.4"`. Fitted positions are *reported* in dRA/dDec, matching the FITS WCS. |
+| `--point x,y` | — (none) | Fit a point at this offset in arcsec from the phase centre (`--point=0,0` is the phase centre itself), in **image axes** (+x right, +y up — same as `--image-centre`; `x = -dRA`). The position is refined. Repeatable; implies `--point-sources` and disables auto-detection. A negative x needs the `=` form: `--point="-1.2,0.4"`. Fitted positions are *reported* in dRA/dDec, matching the FITS WCS. |
 | `--point-significance` | **5** | Keep auto-detected points above this significance. |
 | `--max-points` | **5** | Most auto-detected components to keep. |
 | `--no-point-retune` | off (retune **on**) | Keep the mesh-only regularisation instead of re-tuning it with the points present -- to `chi^2 = N` under `--criterion discrepancy`, to a structure ratio of 1 (for the combined mesh + point residual) under `structure`, which `auto` picks on large data. Not applied when `--lambda` fixes the coefficient. |
@@ -423,6 +424,21 @@ The rules, in full:
 - **An unknown key refuses**, listing what is accepted — a typo in a
   parameter name never silently does nothing.
 
-The run logs which parameters came from the file. Note that
-`fit_parameters.json` in the output directory is a *record* of a run, not an
-input to one: its keys are the internal names, not the flags.
+The run logs which parameters came from the file.
+
+**Every run writes its inputs back out.** `input_parameters.json` in the
+output directory holds every `fit` option the run was given -- from flags, a
+file, or both, after the flags have won -- in exactly this form, with the
+dataset made absolute. So
+
+```bash
+pyuvimage fit --config pyuvimage_out/input_parameters.json --lambda 1e5
+```
+
+repeats a run with one thing changed. It is written when the run *starts*, so
+a run that crashes or is killed still records what it was asked to do. A
+direct `pyuvimage.run(...)` call writes the same file holding that call's
+keyword arguments instead (Python names, so a record rather than a
+`--config` input). `fit_parameters.json` is the other half: what the run
+*resolved* those inputs to (the mesh it chose, the criterion `auto` picked,
+the coefficient it found) -- its keys are the internal names, not the flags.
