@@ -59,6 +59,81 @@ logger = logging.getLogger("pyuvimage")
 #: next chunk.
 STREAM_CHUNK_K = 4096
 
+#: Visibilities per type-1 NUFFT call on the fast accumulation path. Each
+#: call's cost is dominated by the FFT of the upsampled grid, which does not
+#: depend on how many samples were spread onto it, so samples are batched;
+#: the spreader's gather buffer is batch x nspread^2 complex (~200 MB at
+#: eps 1e-12), which sets the ceiling.
+NUFFT_BATCH = 65536
+
+#: Requested NUFFT precision on the fast path -- the kernel builder's own.
+NUFFT_EPS = 1.0e-12
+
+
+def nufftax_available() -> bool:
+    try:
+        from autoarray.inversion.inversion.interferometer import (
+            inversion_interferometer_util as su,
+        )
+    except Exception:  # pragma: no cover
+        return False
+    return su._load_nufftax() is not None
+
+
+def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
+                pixel_scale_arcsec: float, centred: bool = False,
+                eps: float = NUFFT_EPS) -> np.ndarray:
+    """``Re sum_k c_k exp(+2 pi i (u_k x + v_k y))`` on a uniform grid, by a
+    type-1 NUFFT -- the adjoint of the forward transform, on its plain
+    mathematical scale.
+
+    ``centred=False`` (an image): the grid is autoarray's native image grid,
+    row 0 at +y, pixel centres at ``y = ((Ny-1)/2 - row) pix`` and
+    ``x = (col - (Nx-1)/2) pix`` -- half-integer multiples of the pixel for
+    the even sizes pyuvimage builds. This is what `fitting.adjoint_image`
+    returns through a DFT, at O(n_vis nspread^2 + N log N) instead of
+    O(n_vis N); `tests/test_streaming_nufft.py` pins the two together.
+
+    ``centred=True``: samples at integer multiples of the pixel, ``y =
+    (Ny/2 - row) pix`` and ``x = (col - Nx/2) pix`` -- zero at
+    ``[Ny/2, Nx/2]``. Used for the oversampled grids point components are
+    interpolated from, whose samples should include the origin.
+
+    nufftax returns ``f[m2, m1] = sum c exp(i (m1 x_k + m2 y_k))`` on centred
+    modes ``m in [-N/2, N/2)``; rows run toward -y, so ``y_k`` enters with a
+    minus sign, and the half-pixel offset of an image grid is a phase on c.
+    """
+    from autoarray.inversion.inversion.interferometer import (
+        inversion_interferometer_util as su,
+    )
+    import jax.numpy as jnp
+
+    nufftax = su._load_nufftax()
+    ny, nx = (int(v) for v in shape)
+    if ny % 2 or nx % 2:
+        raise ValueError(f"type1_image needs even sizes, got {shape}")
+    pix = float(pixel_scale_arcsec) * ARCSEC_TO_RAD_STREAM
+    u = np.asarray(uv[:, 0], dtype=np.float64)
+    v = np.asarray(uv[:, 1], dtype=np.float64)
+    c = np.asarray(values, dtype=np.complex128)
+    if not centred:
+        # x = (m1 + 1/2) pix, y = -(m2 + 1/2) pix
+        c = c * np.exp(1j * np.pi * pix * (u - v))
+    f = nufftax.nufft2d1(
+        jnp.asarray(2.0 * np.pi * u * pix), jnp.asarray(-2.0 * np.pi * v * pix),
+        jnp.asarray(c), (nx, ny), eps, 1,
+    )
+    return np.asarray(np.real(f), dtype=np.float64)
+
+
+#: the fine kernel's lag margin beyond one field width, as a fraction of it
+#: (see `TermsAccumulator`); a quarter covers 4 sigma of the widest Gaussian
+#: the unresolved test tries (1.5 beam sigma) once the field is ~4 beams
+POINT_KERNEL_PAD = 0.25
+
+ARCSEC_TO_RAD_STREAM = np.pi / (180.0 * 3600.0)
+
+
 @dataclass
 class VisibilityChunk:
     """One block of unflagged samples: uv in wavelengths, data and sigma.
@@ -454,6 +529,12 @@ class SparseTerms:
     shape_native: tuple[int, int] = (0, 0)
     pixel_scale: float = 0.0
     seconds: float = 0.0
+    # Point components (`streamed_points.py`): the kernel and the data's dirty
+    # image on a grid `oversample` times finer than the image, from which
+    # both are interpolated at sub-pixel positions. None when not asked for.
+    kernel_fine: np.ndarray | None = None   # (2 (Ny+pad) q, ...), wraparound, as `kernel`
+    dirty_fine: np.ndarray | None = None    # (2 Ny q, 2 Nx q), centred (`type1_image`)
+    oversample: int = 0
 
     @property
     def max_baseline(self) -> float:
@@ -491,6 +572,12 @@ class SparseTerms:
             reim_asymmetry_sum=float(sum(p.reim_asymmetry_sum for p in parts)),
             shape_native=first.shape_native, pixel_scale=first.pixel_scale,
             seconds=float(sum(p.seconds for p in parts)),
+            kernel_fine=(sum(p.kernel_fine for p in parts)
+                         if all(p.kernel_fine is not None for p in parts) else None),
+            dirty_fine=(sum(p.dirty_fine for p in parts)
+                        if all(p.dirty_fine is not None for p in parts) else None),
+            oversample=(first.oversample
+                        if all(p.kernel_fine is not None for p in parts) else 0),
         )
 
     # -- persistence -------------------------------------------------------
@@ -504,6 +591,9 @@ class SparseTerms:
             row_lengths=self.row_lengths, row_keep=self.row_keep,
             shape_native=np.array(self.shape_native), pixel_scale=self.pixel_scale,
             key=np.array(key),
+            **({} if self.kernel_fine is None else dict(
+                kernel_fine=self.kernel_fine, dirty_fine=self.dirty_fine,
+                oversample=np.array(self.oversample))),
         )
 
     @classmethod
@@ -520,6 +610,10 @@ class SparseTerms:
                 shape_native=tuple(int(v) for v in z["shape_native"]),
                 pixel_scale=float(z["pixel_scale"]),
             )
+            if "kernel_fine" in z.files:
+                terms.kernel_fine = z["kernel_fine"]
+                terms.dirty_fine = z["dirty_fine"]
+                terms.oversample = int(z["oversample"])
             return terms, str(z["key"])
 
 
@@ -586,7 +680,8 @@ class TermsAccumulator:
     """
 
     def __init__(self, geometry, mask, transformer_cls, *, use_jax: bool = False,
-                 pool_noise: bool = False, rows: RowTracker | None = None):
+                 pool_noise: bool = False, rows: RowTracker | None = None,
+                 fast: bool | None = None, point_oversample: int = 0):
         self.geometry = geometry
         self.mask = mask
         self.transformer_cls = transformer_cls
@@ -603,6 +698,38 @@ class TermsAccumulator:
         self.sum_w = self.data_term = self.noise_norm = self.asym = 0.0
         self.n_vis = 0
         self.t0 = time.time()
+        # The fast path: every image above is a type-1 NUFFT of the chunk,
+        # batched (`NUFFT_BATCH`). The per-chunk DFT it replaces costs
+        # n_image per sample: measured 2.4 ms/sample at 112x112, i.e. ~6 h
+        # for a 9.1M-sample dataset whose in-memory kernel build took 11 s.
+        self.fast = nufftax_available() if fast is None else bool(fast)
+        if point_oversample and not self.fast:
+            raise RuntimeError(
+                "point components on the streamed path need nufftax (the "
+                "oversampled grids are type-1 NUFFTs)")
+        self.q = int(point_oversample)
+        if self.q:
+            if self.q % 2:
+                raise ValueError("point_oversample must be even")
+            fine = (shape[0] * self.q, shape[1] * self.q)
+            # The kernel's lags reach one field width -- every pixel pair --
+            # plus a margin: a Gaussian-widened column convolves K with the
+            # width, and a pair nearly a field apart would otherwise read the
+            # circular wrap (3e-3 of B for a 0.2" width in a 3" field)
+            pad = int(np.ceil(POINT_KERNEL_PAD * max(shape)))
+            self.kernel_fine_shape = ((shape[0] + pad) * self.q, (shape[1] + pad) * self.q)
+            self.kernel_fine = np.zeros(
+                (2 * self.kernel_fine_shape[0], 2 * self.kernel_fine_shape[1]),
+                dtype=np.float64)
+            # twice the field, like the kernel: a Gaussian-widened column near
+            # the field's edge convolves Dd with values from beyond it, and
+            # the circular convolution must find the sky there, not the
+            # opposite edge (3.5% on Dp at 0.27" from the edge of a 3" field)
+            self.dirty_fine = np.zeros((2 * fine[0], 2 * fine[1]), dtype=np.float64)
+            # only the pixel spacing of this grid is used by the builder
+            self.grid_radians_fine = np.asarray(self.grid_radians)[:2, :2] / self.q
+        self._buf: list = []
+        self._buf_n = 0
 
     def add(self, ch: VisibilityChunk) -> None:
         from autoarray.inversion.inversion.interferometer import (
@@ -624,6 +751,13 @@ class TermsAccumulator:
         if self.pool_noise:
             s = pooled_noise(s)
         sr, si = s.real, s.imag
+        if self.fast:
+            self._buf.append((uv, d, sr, si))
+            self._buf_n += n
+            if self._buf_n >= NUFFT_BATCH:
+                self._flush()
+            self._add_scalars(d, sr, si, n)
+            return
         # -- the kernel, from autoarray's own accumulation on this chunk
         self.kernel += np.asarray(sparse_util.nufft_precision_operator_from(
             noise_map_real=sr, uv_wavelengths=uv,
@@ -644,14 +778,56 @@ class TermsAccumulator:
         self.beam += np.asarray(adjoint_image(transformer, Visibilities(w.astype(complex))).native)
         self.data_dirty += np.asarray(adjoint_image(transformer, Visibilities(d * w)).native)
         del transformer
-        # -- the scalars
+        self._add_scalars(d, sr, si, n)
+
+    def _add_scalars(self, d, sr, si, n) -> None:
+        w = sr ** -2.0
         self.sum_w += float(np.sum(w))
         self.data_term += float(np.sum(d.real ** 2 / sr ** 2) + np.sum(d.imag ** 2 / si ** 2))
         self.noise_norm += float(np.sum(np.log(2 * np.pi * sr ** 2))
                                  + np.sum(np.log(2 * np.pi * si ** 2)))
         self.n_vis += n
 
+    def _flush(self) -> None:
+        """The buffered samples' contribution to every image term."""
+        if not self._buf:
+            return
+        from autoarray.inversion.inversion.interferometer import (
+            inversion_interferometer_util as sparse_util,
+        )
+
+        uv = np.concatenate([b[0] for b in self._buf])
+        d = np.concatenate([b[1] for b in self._buf])
+        sr = np.concatenate([b[2] for b in self._buf])
+        si = np.concatenate([b[3] for b in self._buf])
+        self._buf, self._buf_n = [], 0
+        pix = float(self.geometry.pixel_scale)
+        self.kernel += np.asarray(sparse_util.nufft_precision_operator_from(
+            noise_map_real=sr, uv_wavelengths=uv,
+            shape_masked_pixels_2d=self.shape, grid_radians_2d=self.grid_radians,
+            method="nufft", eps=NUFFT_EPS,
+        ))
+        weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
+        w = sr ** -2.0
+        dirty = type1_image(uv, weighted, self.shape, pix)
+        self.dirty += dirty
+        self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
+        # with equal sigma_re and sigma_im -- always, once pooled -- the
+        # products' weighting is the fit's, and the two images are one
+        self.data_dirty += (dirty if np.array_equal(sr, si)
+                            else type1_image(uv, d * w, self.shape, pix))
+        if self.q:
+            self.kernel_fine += np.asarray(sparse_util.nufft_precision_operator_from(
+                noise_map_real=sr, uv_wavelengths=uv,
+                shape_masked_pixels_2d=self.kernel_fine_shape,
+                grid_radians_2d=self.grid_radians_fine,
+                method="nufft", eps=NUFFT_EPS,
+            ))
+            self.dirty_fine += type1_image(
+                uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
+
     def finish(self) -> SparseTerms:
+        self._flush()
         lengths, keep = self.rows.lengths_and_keep()
         return SparseTerms(
             kernel=self.kernel, dirty_image=self.dirty, beam_raw=self.beam,
@@ -661,6 +837,9 @@ class TermsAccumulator:
             reim_asymmetry_sum=self.asym, shape_native=self.shape,
             pixel_scale=float(self.geometry.pixel_scale),
             seconds=time.time() - self.t0,
+            kernel_fine=self.kernel_fine if self.q else None,
+            dirty_fine=self.dirty_fine if self.q else None,
+            oversample=self.q,
         )
 
 
@@ -673,10 +852,11 @@ def accumulate_sparse_terms(
     use_jax: bool = False,
     pool_noise: bool = False,
     log_every: int = 50,
+    point_oversample: int = 0,
 ) -> SparseTerms:
     """One pass: fold every chunk into `SparseTerms` (see `TermsAccumulator`)."""
     acc = TermsAccumulator(geometry, mask, transformer_cls, use_jax=use_jax,
-                           pool_noise=pool_noise)
+                           pool_noise=pool_noise, point_oversample=point_oversample)
     for i, ch in enumerate(chunks):
         acc.add(ch)
         if log_every and (i + 1) % log_every == 0:
@@ -802,7 +982,8 @@ def source_identity(source) -> str:
 
 def terms_key(source, geometry, mask_shape: str = "square", pool_noise: bool = False,
               centre: tuple[float, float] | None = None,
-              channel: tuple[int, int] | None = None, thin: int = 1) -> str:
+              channel: tuple[int, int] | None = None, thin: int = 1,
+              oversample: int = 0) -> str:
     """What names a `SparseTerms` cache entry.
 
     The source's identity, the geometry, the mask, whether the noise was
@@ -824,6 +1005,8 @@ def terms_key(source, geometry, mask_shape: str = "square", pool_noise: bool = F
         geo["channel"] = [int(channel[0]), int(channel[1])]
     if thin > 1:
         geo["thin"] = int(thin)
+    if oversample:
+        geo["point_oversample"] = int(oversample)
     return hashlib.sha1((ident + "|" + json.dumps(geo, sort_keys=True)).encode()).hexdigest()[:16]
 
 
@@ -873,15 +1056,21 @@ def sparse_terms_for(
     pool_noise: bool = False,
     reuse_cache: bool = True,
     centre: tuple[float, float] | None = None,
+    point_oversample: int = 0,
 ) -> SparseTerms:
     """The terms for `source`, from the cache when it has them, else one pass.
+
+    `point_oversample` > 0 also accumulates the oversampled kernel and dirty
+    image point components are interpolated from (`streamed_points.py`); it
+    is part of the key.
 
     `reuse_cache=False` streams again regardless and overwrites the entry --
     the cache is keyed on path, size and mtime, which a file rewritten in
     place with the same size can defeat. `centre` (y0, x0 arcsec on the grid)
     recentres every chunk on the way in (`recentred`); it is part of the key.
     """
-    key = terms_key(source, geometry, mask_shape, pool_noise, centre=centre)
+    key = terms_key(source, geometry, mask_shape, pool_noise, centre=centre,
+                    oversample=point_oversample)
     path = terms_cache_path(cache_dir, key)
     if reuse_cache:
         terms = _load_cached(path, key, geometry)
@@ -902,6 +1091,7 @@ def sparse_terms_for(
         chunks = recentred(chunks, centre)
     terms = accumulate_sparse_terms(
         chunks, geometry, mask, transformer_cls, use_jax=use_jax, pool_noise=pool_noise,
+        point_oversample=point_oversample,
     )
     logger.info(
         "  %d visibilities in %.1f s; kernel %s, %.2f MB", terms.n_vis,

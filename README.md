@@ -326,6 +326,7 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 
 The streamed variant (`streaming="auto"`, the default: taken whenever the
 dataset is a file, the inversion is sparse and there are no point components
+in cube mode
 — `--no-streaming` holds the data in memory instead, `--streaming` refuses an
 unsupported combination rather than falling back, and `--reload` re-reads a
 file whose cached terms should not be trusted) accumulates the w-tilde kernel,

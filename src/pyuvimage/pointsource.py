@@ -348,15 +348,39 @@ class SparseMesh:
         if index is None:
             return None
         if self._operated_mapping is None:
-            self._operated_mapping = np.asarray(
+            self._operated_mapping = self._operated_mapping_T()
+        if index.size == self._operated_mapping.shape[1] and np.array_equal(
+                index, np.arange(index.size)):
+            return self._operated_mapping       # the whole grid: no copy
+        return self._operated_mapping[:, index]   # (n_mesh, L)
+
+    def _operated_mapping_T(self) -> np.ndarray:
+        """``(W~ M)^T``, (n_mesh, n_image_slim), built a batch of columns at
+        a time.
+
+        autoarray's `operated_matrix_slim_from` transforms every column at
+        once: zero-padded to (2Ny, 2Nx), forward and inverse real FFTs and
+        their product, ~128 bytes per image pixel per column. On Teresa's
+        112x112 grid and 3136 mesh pixels that is 5 GB of transients for a
+        315 MB answer -- an OOM kill in 7 GB here, and on her 3.6 GB laptop
+        the likeliest reason the in-memory point stage took 2 h 13 min.
+        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to the bit.
+        """
+        extent = self.mask.extent_index_for_masked_pixel
+        n_image, n_mesh = self.mapping_matrix.shape
+        ny, nx = (int(s) for s in self.mask.shape_native)
+        per_column = 128 * ny * nx
+        batch = int(max(1, min(n_mesh, SCAN_CHUNK_BYTES // per_column)))
+        out = np.empty((n_mesh, n_image))
+        for lo in range(0, n_mesh, batch):
+            hi = min(lo + batch, n_mesh)
+            out[lo:hi] = np.asarray(
                 self.sparse_operator.operated_matrix_slim_from(
-                    matrix_slim=self.mapping_matrix,
-                    extent_index_for_masked_pixel=(
-                        self.mask.extent_index_for_masked_pixel
-                    ),
+                    matrix_slim=self.mapping_matrix[:, lo:hi],
+                    extent_index_for_masked_pixel=extent,
                 )
-            )                                  # (n_image_slim, n_mesh)
-        return self._operated_mapping.T[:, index]   # (n_mesh, L)
+            ).T
+        return out
 
 
 def mesh_operator(inversion, dataset):
@@ -477,6 +501,11 @@ class AugmentedSystem:
     def _curv(self, P: np.ndarray, Q: np.ndarray) -> np.ndarray:
         """P^T W Q for stacked real column sets: P.real^T W_re Q.real + imag."""
         return P.T @ (self.w_stack[:, None] * Q)
+
+    def _point_gram(self, positions, sigmas, P: np.ndarray) -> np.ndarray:
+        """C = P^T W P, the point columns' own Gram matrix. (The streamed
+        system, which has no P, reads it off the kernel instead.)"""
+        return self._curv(P, P)
 
     def _dvec(self, P: np.ndarray) -> np.ndarray:
         """P^T W d for a stacked real column set."""
@@ -719,7 +748,7 @@ class AugmentedSystem:
             return s, np.array([]), float(chi2), np.zeros((0, 0))
 
         P, B, Dp = self._column_terms(positions, sigmas)
-        C = self._curv(P, P)
+        C = self._point_gram(positions, sigmas, P)
 
         # Schur complement: eliminate the mesh block, which is already factorised
         MinvB = cho_solve(self._cho, B, check_finite=False)
@@ -865,6 +894,11 @@ def augmented_structure_ratio(
         mesh, amps, chi2, _ = system.solve(positions)
     except (np.linalg.LinAlgError, ValueError):
         return None
+    if hasattr(system, "residual_dirty_image"):     # streamed: image plane only
+        resid_map = system.residual_dirty_image(mesh, positions, amps, imager)
+        ratio = fitting._structure_ratio_from_map(
+            resid_map, chi2, imager, system.n_data)
+        return float(ratio) if np.isfinite(ratio) else None
     model = system.model_visibilities(mesh, positions, amps)
     resid = (system.d_re + 1j * system.d_im) - model
     ratio = fitting._structure_ratio(resid, chi2, imager, system.n_data)
@@ -1004,11 +1038,17 @@ def fit_point_sources(
     chi2_target: float = 1.0,
     retune_criterion: str = "discrepancy",
     check_positions: bool = True,
+    system: AugmentedSystem | None = None,
 ):
     """Fit analytic point components alongside the pixelized model.
 
     Parameters
     ----------
+    system
+        A prebuilt bordered system, used instead of building one from
+        ``inversion`` and ``dataset`` -- the streamed path passes a
+        `streamed_points.StreamedAugmentedSystem`, with ``dirty_imager`` the
+        kernel imager its structure retune reads.
     positions
         Optional list of (dRA, dDec) offsets in arcsec.  Supplied positions are
         kept (and refined, if ``refine``) regardless of significance -- the
@@ -1042,7 +1082,8 @@ def fit_point_sources(
 
         b = fit_beam(dirty_imager.dirty_beam, geometry.pixel_scale)
         beam_fwhm = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
-    system = AugmentedSystem(inversion, dataset)
+    if system is None:
+        system = AugmentedSystem(inversion, dataset)
 
     if retune and retune_criterion == "structure" and dirty_imager is None:
         from .beam import DirtyImager

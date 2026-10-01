@@ -156,8 +156,8 @@ Everything above is about making `n_vis × n_mesh` small enough to hold.
 streaming pass over the visibilities builds a small kernel, and the memory
 then depends on the image size and the mesh but **not** on the number of
 visibilities. Ruby continuum at fov 3, mesh 16: 0.3 s and ~1.7 GB against
-25.4 s dense, for an identical `chi^2`. It needs JAX, is MFS only, and cannot
-be combined with `--point-sources` — see
+25.4 s dense, for an identical `chi^2`. It needs JAX, and works in cube mode
+and with `--point-sources` (streamed too, in MFS) — see
 [parameters.md](parameters.md#the-sparse-w-tilde-inversion). Where it applies,
 it is the answer to this whole section.
 

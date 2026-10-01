@@ -40,6 +40,10 @@ logger = logging.getLogger("pyuvimage")
 # excess and came back at 11.5 Jy in a 0.09 Jy field: 128 times the field.
 POINT_EXPLAINED_FRACTION = 0.5
 POINT_FLUX_SANITY = 2.0
+# How much finer than the image the streamed pass grids the kernel and the
+# dirty image for point components (`streamed_points`): at 8 a quintic spline
+# reads both to 2e-9 of the peak, against 3e-12 at 16 for 4x the grid.
+POINT_OVERSAMPLE = 8
 
 # Which baseline length the automatic mesh scale is sized from. The longest
 # baseline is the information limit, but on a real array only a handful of
@@ -88,7 +92,8 @@ def resolve_streaming(
     `auto` streams whenever streaming can give the same answer as the
     in-memory path, which since parity was established on JAX is every case
     `run_streamed` supports: a dataset on disk (an in-memory UVData is
-    already held, so there is nothing to save), no point components, and the
+    already held, so there is nothing to save), no point components in cube
+    mode, and the
     sparse inversion -- which under `inversion="auto"` means the same
     visibility threshold `resolve_inversion` applies, so a small dataset
     still takes the dense path it always did. Cube mode and recentring both
@@ -119,20 +124,22 @@ def resolve_streaming(
             "the dataset is already in memory, so streaming it would save "
             "nothing"
         )
-    if point_sources:
-        # Not the mapping matrix any more -- the sparse inversion fits points
-        # without it (`pointsource.SparseMesh`). What streaming cannot give
-        # them is the visibilities themselves: a point column is an analytic
-        # function of uv, and its three terms (A^T W P, P^T W P, P^T W d) are
-        # sums over samples the streamed pass has already discarded. The
-        # accumulated terms hold those sums only on the image grid, and a
-        # point's whole reason for existing is that it is not on the grid.
+    if point_sources and mode == "cube":
+        # MFS points stream (`streamed_points`): their terms are sums over
+        # visibilities like everything else, accumulated on fine grids. The
+        # cube's per-channel point fits are not wired to that yet.
         return _hold(
-            "point components are analytic in the uv plane, and the streamed "
-            "pass keeps no per-visibility data for them to be evaluated "
-            "against. The sparse inversion still runs -- only the streaming "
-            "load is held back"
+            "point components in cube mode are fitted per channel, which the "
+            "streamed cube does not do yet"
         )
+    if point_sources:
+        from . import streaming as stm
+
+        if not stm.nufftax_available():
+            return _hold(
+                "streamed point components need nufftax for their "
+                "oversampled grids, and it is not installed"
+            )
     if inversion == "dense":
         return _hold("--inversion dense was asked for")
     reason = fitting.sparse_inversion_diagnosis()
@@ -310,8 +317,8 @@ def run(
             fit runs on them alone. Memory then does not depend on the number
             of visibilities at all -- a 200-million-sample MFS cube fits in
             about a gigabyte. "auto" (default) streams whenever the run can be
-            streamed -- a dataset on disk, MFS, the sparse inversion, no point
-            components, no recentring -- and otherwise holds the data as
+            streamed -- a dataset on disk, the sparse inversion, no point
+            components in cube mode -- and otherwise holds the data as
             before, saying which and why (`resolve_streaming`). True refuses
             an unsupported combination rather than falling back; False is
             the in-memory path regardless. See `run_streamed`.
@@ -377,7 +384,9 @@ def run(
             pb_correction=pb_correction, dish_diameter=dish_diameter,
             pb_factor=pb_factor, uncertainty_map=uncertainty_map, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
-            point_sources=point_sources, chunk_k=chunk_k, reload=reload,
+            point_sources=point_sources, point_significance=point_significance,
+            max_points=max_points, point_retune=point_retune,
+            chunk_k=chunk_k, reload=reload,
             header=header, cube_prior=cube_prior, transformer=transformer,
         )
     uvd = (
@@ -707,196 +716,35 @@ def run(
     # Optional analytic point components, solved in the same linear system.
     # Opt-in: never added unless asked for, and auto-detected candidates are
     # kept only above `point_significance`.
+    # (`_point_stage`, shared with `run_streamed`).
     point_solution = None
-    # A mesh fit far above the target means the model cannot describe the data,
-    # and fitting points to that residual can produce nonsense: on the
-    # out-of-field test it returned an 11.5 Jy "source" in a 0.09 Jy field, at
-    # 76 sigma. This used to be a pre-emptive skip, but that got the causality
-    # backwards -- an unmodelled compact source is itself one of the commonest
-    # reasons chi^2 is high, and refusing to fit it guarantees the fit stays
-    # bad. The demo is exactly that case: a 4 mJy point no 24x24 mesh can hold
-    # puts the fit at chi^2/N = 2.87, and the skip then withheld the one thing
-    # that would have fixed it.
-    #
-    # So fit, then judge the answer -- which is testable in a way the
-    # precondition is not. A real point explains the excess and has a sane
-    # flux; the out-of-field artefact explains little and is many times the
-    # field's own flux.
-    speculative = (
-        bool(point_sources)
-        and mfs_fit.chi_squared / (2 * len(d)) > 2.0 * chi2_target
-    )
-    if speculative:
-        logger.warning(
-            "the pixelized model sits at chi^2/N = %.4g against a target of "
-            "%.3g. Fitting point components anyway, since an unmodelled "
-            "compact source is a common cause of exactly this -- but the "
-            "result will be discarded unless it explains the excess and has "
-            "a credible flux.",
-            mfs_fit.chi_squared / (2 * len(d)), chi2_target,
-        )
     if point_sources:
         from .pointsource import fit_point_sources
 
-        positions = point_sources if isinstance(point_sources, list) else None
-        logger.info(
-            "fitting analytic point sources (%s)...",
-            "user positions" if positions else
-            f"auto-detect above {point_significance:.1f} sigma",
-        )
-        # positions arrive as image (x, y); pointsource speaks sky
-        from .pointsource import image_to_sky as _img2sky
-
-        positions = (
-            [_img2sky(*q) for q in positions] if positions else positions
-        )
-
-        def _fit_points(fit_obj):
-            return fit_point_sources(
-                fit_obj.fit.inversion, mfs_dataset, geometry,
-                positions=positions, significance=point_significance,
-                max_points=max_points,
-                dirty_imager=imager,
-                beam_fwhm=beam_size,
-                # Re-tune on the criterion the search used, now that the
-                # points are in the model. It used to run for `discrepancy`
-                # only, so on large data (where `auto` picks `structure`) the
-                # coefficient stayed where the *mesh-only* search left it --
-                # tuned to let the mesh chase the point's residual -- and the
-                # delivered fit overfitted. A coefficient the user fixed is
-                # theirs, and is not re-tuned.
-                retune=(
-                    bool(point_retune) and coefficient == "auto"
-                    and criterion in ("discrepancy", "structure")
-                ),
-                retune_criterion=(
-                    criterion if criterion in ("discrepancy", "structure")
-                    else "discrepancy"
-                ),
+        mfs_fit, point_solution = _point_stage(
+            mfs_fit, point_sources, n_data=2 * len(d), geometry=geometry,
+            imager=imager, beam_size=beam_size,
+            point_significance=point_significance, max_points=max_points,
+            point_retune=point_retune, coefficient=coefficient,
+            criterion=criterion, chi2_target=chi2_target, reg=reg,
+            envelope=envelope, positive_only=positive_only,
+            fit_points=lambda fit_obj, **kw: fit_point_sources(
+                fit_obj.fit.inversion, mfs_dataset, geometry, **kw),
+            refit=lambda envelope_np: fitting.fit_dataset(
+                mfs_dataset, geometry, reg_kind=reg, criterion=criterion,
+                # `prior=None` here re-optimised the coefficient even
+                # when the user had fixed it with --lambda
+                positive_only=positive_only, prior=fixed_prior, nu=nu,
+                fixed_scale=beam_scale, envelope=envelope_np,
                 chi2_target=chi2_target,
-            )
-
-        point_solution = _fit_points(mfs_fit)
-
-        # An adaptive prior follows a first-pass brightness map, and that map
-        # has the point smeared into it -- so the prior is loosest exactly
-        # where the point sits, and the mesh underneath is free to soak up the
-        # point's flux.  Measured: the 3 mJy point sitting on the bright
-        # 0.25" blob came back at 30-56% of its true flux.  Once the points
-        # are known, rebuild the brightness map from the *extended* model
-        # alone (which excludes them by construction) and refit.
-        if (
-            point_solution.points
-            and reg in fitting.ADAPTIVE_REGULARIZATIONS
-            and envelope is not None
-            and envelope.get("brightness") is None
-        ):
-            logger.info(
-                "  refitting with the adaptive prior tracking the extended "
-                "model only (the first-pass map included the point sources)"
-            )
-            extended_only = np.clip(
-                np.asarray(point_solution.mesh_values).ravel(), 0.0, None)
-            envelope_np = {**envelope, "brightness": extended_only}
-            try:
-                mfs_refit = fitting.fit_dataset(
-                    mfs_dataset, geometry, reg_kind=reg, criterion=criterion,
-                    # `prior=None` here re-optimised the coefficient even
-                    # when the user had fixed it with --lambda
-                    positive_only=positive_only, prior=fixed_prior, nu=nu,
-                    fixed_scale=beam_scale, envelope=envelope_np,
-                    chi2_target=chi2_target,
-                    warn_on_chi2=False,  # the point fit follows; see above
-                    # Was omitted here, and this is the fit that gets kept
-                    # whenever point components are found -- so
-                    # --enforce-positive was silently ignored on exactly the
-                    # runs that use it. Measured on the demo: both with and
-                    # without the flag the delivered model had ~70 negative
-                    # mesh pixels.
-                    enforce_positive=enforce_positive,
-                )
-                refit_solution = _fit_points(mfs_refit)
-            except Exception as e:
-                logger.warning(
-                    "  adaptive refit failed (%s: %s); keeping the first "
-                    "solution", type(e).__name__, e,
-                )
-            else:
-                if refit_solution.points:
-                    mfs_fit, point_solution = mfs_refit, refit_solution
-                elif point_solution.points:
-                    # The refit is the better-posed of the two (its prior map
-                    # does not have the point smeared into it), and it kept
-                    # nothing -- now usually because the component came back
-                    # negative and was dropped. Keeping the first solution's
-                    # point would deliver exactly the component the refit
-                    # exists to correct.
-                    logger.warning(
-                        "  the refit with the extended-only prior map kept no "
-                        "point component; delivering the pixelized model alone"
-                    )
-                    point_solution = refit_solution
-
-        if speculative and point_solution.points:
-            # Judge the answer, now that there is one to judge. Two tests, both
-            # of which the out-of-field artefact fails badly and a real point
-            # passes easily.
-            before = mfs_fit.chi_squared / (2 * len(d))
-            after = point_solution.chi_squared / (2 * len(d))
-            extended = float(
-                np.sum(np.clip(np.asarray(point_solution.mesh_values), 0.0, None))
-            )
-            point_flux = point_solution.total_point_flux
-            explained = (before - after) / max(before - chi2_target, 1e-30)
-            plausible = point_flux <= POINT_FLUX_SANITY * max(extended, 1e-30)
-            if explained >= POINT_EXPLAINED_FRACTION and plausible:
-                logger.info(
-                    "  the point components explain %.0f%% of the excess "
-                    "chi^2 (%.3f -> %.3f) and carry %.4g Jy against the "
-                    "extended model's %.4g Jy: keeping them",
-                    100 * explained, before, after, point_flux, extended,
-                )
-            else:
-                logger.warning(
-                    "discarding the fitted point component(s): they explain "
-                    "%.0f%% of the excess chi^2 (%.3f -> %.3f) and carry "
-                    "%.4g Jy against the extended model's %.4g Jy. That is "
-                    "the signature of fitting structure the mesh cannot "
-                    "describe -- emission outside --fov is the usual cause -- "
-                    "rather than of a real source. Fix the fit first (usually "
-                    "--fov).",
-                    100 * explained, before, after, point_flux, extended,
-                )
-                point_solution = None
-
-        if point_solution is not None and point_solution.points:
-            from .pointsource import PointAugmentedFit
-
-            if positive_only:
-                # `PointExtendedSystem.solve` eliminates the mesh block with a
-                # Cholesky solve -- `cho_solve`, unconstrained -- so the mesh
-                # values that come back with point components present are not
-                # non-negative, whatever was asked for. Measured on the demo:
-                # 0 negative mesh pixels without points, 78 with them (0.59%
-                # of the flux) even under --enforce-positive.
-                #
-                # Say so rather than silently returning a model that does not
-                # satisfy the constraint the user set.
-                logger.warning(
-                    "positivity does not extend to the mesh once point "
-                    "components are fitted: the bordered system is solved by "
-                    "Cholesky elimination, which is unconstrained, so the "
-                    "delivered mesh may contain small negative values. The "
-                    "point amplitudes themselves are unaffected."
-                )
-            mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
-            logger.info(
-                "  %d point source(s), total %.4g Jy; chi2/N now %.3f",
-                len(point_solution.points), point_solution.total_point_flux,
-                point_solution.chi_squared / (2 * len(d)),
-            )
-        else:
-            logger.info("  no point source passed the significance cut")
+                warn_on_chi2=False,  # the point fit follows; see `_point_stage`
+                # Was omitted here, and this is the fit that gets kept
+                # whenever point components are found -- so
+                # --enforce-positive was silently ignored on exactly the
+                # runs that use it.
+                enforce_positive=enforce_positive,
+            ),
+        )
 
     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
     n_data = 2 * len(d)
@@ -1091,6 +939,9 @@ def run_streamed(
     inversion: str = "auto",
     image_centre="0,0",
     point_sources=False,
+    point_significance: float = 5.0,
+    max_points: int = 5,
+    point_retune: bool = True,
     chunk_k: int | None = None,
     use_jax_kernel: bool = False,
     reload: bool = False,
@@ -1116,7 +967,12 @@ def run_streamed(
     stub, as `run` does it. Recentring is the same phase ramp `run` applies,
     chunk by chunk (`streaming.recentred`); "auto" images the whole stream
     once to find the source. What it still refuses: point components
-    (dense-only anyway) and `--inversion dense` (nothing to stream *to*).
+    in cube mode, and `--inversion dense` (nothing to stream *to*).
+
+    Point components (MFS) run on the same terms: the pass also accumulates
+    the kernel and the dirty image on grids `POINT_OVERSAMPLE` times finer
+    than the image, and every term the bordered system needs is read off
+    them (`streamed_points.StreamedAugmentedSystem`).
 
     `use_jax_kernel` hands the per-chunk kernel accumulation to autoarray's
     JAX backend; the default NumPy backend is bit-identical to the in-memory
@@ -1132,12 +988,17 @@ def run_streamed(
         raise ValueError("mode must be 'mfs' or 'cube'")
     if cube_prior not in ("channel", "mfs"):
         raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
-    if point_sources:
+    point_sources = normalise_point_sources(point_sources)
+    if point_sources and mode == "cube":
         raise NotImplementedError(
-            "point components cannot run on the streaming path: their "
-            "columns are analytic in uv, and the streamed pass keeps no "
-            "per-visibility data to evaluate them against. --inversion "
-            "sparse fits them in memory (--no-streaming)")
+            "point components in cube mode are fitted per channel against "
+            "the MFS positions, which the streamed cube does not do yet; "
+            "--no-streaming runs it in memory")
+    if point_sources and not stm.nufftax_available():
+        raise RuntimeError(
+            "streamed point components need nufftax: their terms are read "
+            "off oversampled grids that only the type-1 NUFFT makes "
+            "affordable. Install nufftax, or --no-streaming")
     if inversion == "dense":
         raise ValueError("streaming has nothing to stream to on the dense path")
     reason = fitting.sparse_inversion_diagnosis()
@@ -1257,6 +1118,9 @@ def run_streamed(
             dataset, geometry, mask, chunk_transformer, cache_dir=kernel_cache_dir,
             chunk_k=chunk_k, use_jax=use_jax_kernel, mask_shape=mask_shape,
             pool_noise=pool, reuse_cache=not reload, centre=shift,
+            # point components are read off grids this much finer than the
+            # image (`streamed_points`), accumulated in the same pass
+            point_oversample=POINT_OVERSAMPLE if point_sources else 0,
         )
     n_data = 2 * int(terms.n_vis)     # what the MFS / prior fit is measured on
     if terms.n_vis:
@@ -1273,7 +1137,8 @@ def run_streamed(
     beam_scale = None
     envelope = None
     beam_size = None
-    if reg in fitting.KERNEL_REGULARIZATIONS or reg in fitting.ENVELOPE_REGULARIZATIONS:
+    if (point_sources or reg in fitting.KERNEL_REGULARIZATIONS
+            or reg in fitting.ENVELOPE_REGULARIZATIONS):
         b = beam_mod.fit_beam(imager.dirty_beam, geometry.pixel_scale)
         beam_size = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
     if reg in fitting.KERNEL_REGULARIZATIONS:
@@ -1315,8 +1180,37 @@ def run_streamed(
         positive_only=positive_only, enforce_positive=enforce_positive,
         criterion=criterion, nu=nu, fixed_scale=beam_scale, envelope=envelope,
         optimise_envelope=optimise_env, chi2_target=chi2_target,
+        warn_on_chi2=not point_sources,   # judged after the points, as in `run`
     )
     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
+    point_solution = None
+    if point_sources:
+        from .pointsource import fit_point_sources
+        from .streamed_points import StreamedAugmentedSystem
+
+        def _fit_points(fit_obj, **kw):
+            # the bordered system from the terms alone: no visibility is read
+            system = StreamedAugmentedSystem(
+                fit_obj.fit.inversion, stub, terms, imager)
+            return fit_point_sources(
+                fit_obj.fit.inversion, stub, geometry, system=system, **kw)
+
+        mfs_fit, point_solution = _point_stage(
+            mfs_fit, point_sources, n_data=n_data, geometry=geometry,
+            imager=imager, beam_size=beam_size,
+            point_significance=point_significance, max_points=max_points,
+            point_retune=point_retune, coefficient=coefficient,
+            criterion=criterion, chi2_target=chi2_target, reg=reg,
+            envelope=envelope, positive_only=positive_only,
+            fit_points=_fit_points,
+            refit=lambda envelope_np: fitting.fit_dataset(
+                stub, geometry, reg_kind=reg, criterion=criterion,
+                positive_only=positive_only, prior=fixed_prior, nu=nu,
+                fixed_scale=beam_scale, envelope=envelope_np,
+                chi2_target=chi2_target, warn_on_chi2=False,
+                enforce_positive=enforce_positive,
+            ),
+        )
     if mfs_fit.chi_squared / n_data > 1.3 * chi2_target:
         logger.warning(
             "the delivered model sits at chi^2/N = %.3g against a target of "
@@ -1389,7 +1283,8 @@ def run_streamed(
     parameters = _parameter_record(
         header, geometry, mode, reg, criterion, chi2_target, positive_only,
         chunk_transformer.__name__, oversample, dish, pb_factor, pb_correction,
-        mfs_fit, scan, envelope=envelope, inversion="sparse",
+        mfs_fit, scan, envelope=envelope, point_solution=point_solution,
+        inversion="sparse",
         n_data_fitted=n_data, transformer_requested="streamed",
         prior_thin=prior_thin,
         channel_chi2_per_datum=channel_chi2 if cube else None,
@@ -1412,6 +1307,186 @@ def run_streamed(
         geometry=geometry, products=products, written=written, scan=scan,
         uvdata=header, parameters=parameters,
     )
+
+
+def _point_stage(
+    mfs_fit, point_sources, *, n_data, geometry, imager, beam_size,
+    point_significance, max_points, point_retune, coefficient, criterion,
+    chi2_target, reg, envelope, positive_only, fit_points, refit,
+):
+    """Fit analytic point components to an MFS fit; return (fit, solution).
+
+    Shared by `run` and `run_streamed`, which differ only in how a point fit
+    and an adaptive refit are made: ``fit_points(fit_obj, **kwargs)`` runs
+    `pointsource.fit_point_sources` against that fit's inversion (in memory
+    on the dataset, streamed on a `StreamedAugmentedSystem`), and
+    ``refit(envelope)`` refits the mesh with the given adaptive envelope.
+    The fit comes back wrapped in `PointAugmentedFit` when points were kept.
+
+    A mesh fit far above the target means the model cannot describe the data,
+    and fitting points to that residual can produce nonsense: on the
+    out-of-field test it returned an 11.5 Jy "source" in a 0.09 Jy field, at
+    76 sigma. This used to be a pre-emptive skip, but that got the causality
+    backwards -- an unmodelled compact source is itself one of the commonest
+    reasons chi^2 is high, and refusing to fit it guarantees the fit stays
+    bad. The demo is exactly that case: a 4 mJy point no 24x24 mesh can hold
+    puts the fit at chi^2/N = 2.87, and the skip then withheld the one thing
+    that would have fixed it.
+
+    So fit, then judge the answer -- which is testable in a way the
+    precondition is not. A real point explains the excess and has a sane
+    flux; the out-of-field artefact explains little and is many times the
+    field's own flux.
+    """
+    speculative = mfs_fit.chi_squared / n_data > 2.0 * chi2_target
+    if speculative:
+        logger.warning(
+            "the pixelized model sits at chi^2/N = %.4g against a target of "
+            "%.3g. Fitting point components anyway, since an unmodelled "
+            "compact source is a common cause of exactly this -- but the "
+            "result will be discarded unless it explains the excess and has "
+            "a credible flux.",
+            mfs_fit.chi_squared / n_data, chi2_target,
+        )
+    positions = point_sources if isinstance(point_sources, list) else None
+    logger.info(
+        "fitting analytic point sources (%s)...",
+        "user positions" if positions else
+        f"auto-detect above {point_significance:.1f} sigma",
+    )
+    # positions arrive as image (x, y); pointsource speaks sky
+    from .pointsource import image_to_sky as _img2sky
+
+    positions = [_img2sky(*q) for q in positions] if positions else positions
+
+    def _fit_points(fit_obj):
+        return fit_points(
+            fit_obj,
+            positions=positions, significance=point_significance,
+            max_points=max_points,
+            dirty_imager=imager,
+            beam_fwhm=beam_size,
+            # Re-tune on the criterion the search used, now that the points
+            # are in the model. It used to run for `discrepancy` only, so on
+            # large data (where `auto` picks `structure`) the coefficient
+            # stayed where the *mesh-only* search left it -- tuned to let the
+            # mesh chase the point's residual -- and the delivered fit
+            # overfitted. A coefficient the user fixed is theirs, and is not
+            # re-tuned.
+            retune=(
+                bool(point_retune) and coefficient == "auto"
+                and criterion in ("discrepancy", "structure")
+            ),
+            retune_criterion=(
+                criterion if criterion in ("discrepancy", "structure")
+                else "discrepancy"
+            ),
+            chi2_target=chi2_target,
+        )
+
+    point_solution = _fit_points(mfs_fit)
+
+    # An adaptive prior follows a first-pass brightness map, and that map has
+    # the point smeared into it -- so the prior is loosest exactly where the
+    # point sits, and the mesh underneath is free to soak up the point's
+    # flux.  Measured: the 3 mJy point sitting on the bright 0.25" blob came
+    # back at 30-56% of its true flux.  Once the points are known, rebuild the
+    # brightness map from the *extended* model alone (which excludes them by
+    # construction) and refit.
+    if (
+        point_solution.points
+        and reg in fitting.ADAPTIVE_REGULARIZATIONS
+        and envelope is not None
+        and envelope.get("brightness") is None
+    ):
+        logger.info(
+            "  refitting with the adaptive prior tracking the extended "
+            "model only (the first-pass map included the point sources)"
+        )
+        extended_only = np.clip(
+            np.asarray(point_solution.mesh_values).ravel(), 0.0, None)
+        try:
+            mfs_refit = refit({**envelope, "brightness": extended_only})
+            refit_solution = _fit_points(mfs_refit)
+        except Exception as e:
+            logger.warning(
+                "  adaptive refit failed (%s: %s); keeping the first "
+                "solution", type(e).__name__, e,
+            )
+        else:
+            if refit_solution.points:
+                mfs_fit, point_solution = mfs_refit, refit_solution
+            elif point_solution.points:
+                # The refit is the better-posed of the two (its prior map does
+                # not have the point smeared into it), and it kept nothing --
+                # now usually because the component came back negative and
+                # was dropped. Keeping the first solution's point would
+                # deliver exactly the component the refit exists to correct.
+                logger.warning(
+                    "  the refit with the extended-only prior map kept no "
+                    "point component; delivering the pixelized model alone"
+                )
+                point_solution = refit_solution
+
+    if speculative and point_solution.points:
+        # Judge the answer, now that there is one to judge. Two tests, both of
+        # which the out-of-field artefact fails badly and a real point passes
+        # easily.
+        before = mfs_fit.chi_squared / n_data
+        after = point_solution.chi_squared / n_data
+        extended = float(
+            np.sum(np.clip(np.asarray(point_solution.mesh_values), 0.0, None))
+        )
+        point_flux = point_solution.total_point_flux
+        explained = (before - after) / max(before - chi2_target, 1e-30)
+        plausible = point_flux <= POINT_FLUX_SANITY * max(extended, 1e-30)
+        if explained >= POINT_EXPLAINED_FRACTION and plausible:
+            logger.info(
+                "  the point components explain %.0f%% of the excess "
+                "chi^2 (%.3f -> %.3f) and carry %.4g Jy against the "
+                "extended model's %.4g Jy: keeping them",
+                100 * explained, before, after, point_flux, extended,
+            )
+        else:
+            logger.warning(
+                "discarding the fitted point component(s): they explain "
+                "%.0f%% of the excess chi^2 (%.3f -> %.3f) and carry "
+                "%.4g Jy against the extended model's %.4g Jy. That is "
+                "the signature of fitting structure the mesh cannot "
+                "describe -- emission outside --fov is the usual cause -- "
+                "rather than of a real source. Fix the fit first (usually "
+                "--fov).",
+                100 * explained, before, after, point_flux, extended,
+            )
+            point_solution = None
+
+    if point_solution is not None and point_solution.points:
+        from .pointsource import PointAugmentedFit
+
+        if positive_only:
+            # The bordered system eliminates the mesh block with a Cholesky
+            # solve -- `cho_solve`, unconstrained -- so the mesh values that
+            # come back with point components present are not non-negative,
+            # whatever was asked for. Measured on the demo: 0 negative mesh
+            # pixels without points, 78 with them (0.59% of the flux) even
+            # under --enforce-positive. Say so rather than silently returning
+            # a model that does not satisfy the constraint the user set.
+            logger.warning(
+                "positivity does not extend to the mesh once point "
+                "components are fitted: the bordered system is solved by "
+                "Cholesky elimination, which is unconstrained, so the "
+                "delivered mesh may contain small negative values. The "
+                "point amplitudes themselves are unaffected."
+            )
+        mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
+        logger.info(
+            "  %d point source(s), total %.4g Jy; chi2/N now %.3f",
+            len(point_solution.points), point_solution.total_point_flux,
+            point_solution.chi_squared / n_data,
+        )
+    else:
+        logger.info("  no point source passed the significance cut")
+    return mfs_fit, point_solution
 
 
 def _fixed_prior(
@@ -1866,6 +1941,11 @@ def _products_for(
         # `LinearSystem.residual_dirty_image`)
         dirty_image = imager.dirty_image_of_data()
         dirty_model = imager.dirty_image_of_model(model_image)
+        solution = getattr(sf, "solution", None)
+        if solution is not None and len(solution.grid_positions):
+            # the points' own dirty image, K(x - p) per point, off the grids
+            dirty_model = dirty_model + solution.system.point_dirty_image(
+                solution.grid_positions, solution.amplitudes) / imager._norm
         resid_dirty = dirty_image - dirty_model
     else:
         data = np.asarray(dataset.data)

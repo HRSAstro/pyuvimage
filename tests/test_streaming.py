@@ -188,10 +188,15 @@ def test_the_dirty_image_is_the_operators(ragged, flat, terms):
 def test_the_products_side_matches_dirty_imager(flat, terms):
     _, d, _, ds = flat
     im = DirtyImager(ds)
-    np.testing.assert_allclose(terms.beam_raw / terms.sum_weights, im.dirty_beam, rtol=1e-12, atol=1e-14)
+    # Mixed tolerances: with nufftax present the terms are type-1 NUFFTs,
+    # whose error is bounded against the peak, not elementwise -- near-zero
+    # entries carry ~1e-11 relative (the kernel builder's docstring says the
+    # same of its own output). The DFT path agrees to 1e-14.
+    np.testing.assert_allclose(terms.beam_raw / terms.sum_weights, im.dirty_beam,
+                               rtol=1e-10, atol=1e-11)
     np.testing.assert_allclose(terms.data_dirty_raw / terms.sum_weights,
-                               im.dirty_image(np.asarray(ds.data)), rtol=1e-12,
-                               atol=1e-12 * np.abs(im.dirty_image(np.asarray(ds.data))).max())
+                               im.dirty_image(np.asarray(ds.data)), rtol=1e-10,
+                               atol=1e-11 * np.abs(im.dirty_image(np.asarray(ds.data))).max())
     assert terms.sum_weights == pytest.approx(np.sum(im.weights), rel=1e-12)
     assert terms.rms == pytest.approx(im.rms, rel=1e-12)
 
@@ -326,7 +331,7 @@ def test_n_data_reads_the_terms_not_the_stub(terms):
 
 
 @pytest.mark.parametrize("kwargs, exc", [
-    (dict(point_sources=True), NotImplementedError),
+    (dict(point_sources=True, mode="cube"), NotImplementedError),
     (dict(inversion="dense"), ValueError),
     (dict(mode="slices"), ValueError),
     (dict(mode="cube", cube_prior="median"), ValueError),
@@ -353,13 +358,17 @@ def test_auto_streams_a_file_on_the_mfs_sparse_path(npz_path, monkeypatch, caplo
     assert stream is True
     assert header is not None and header.n_samples > 0
     assert "streaming auto -> streamed" in caplog.text
-    # cube mode and recentring stream too, now that both are wired
-    for kwargs in (dict(mode="cube"), dict(image_centre="auto"), dict(image_centre=(1.0, 0.5))):
+    # cube mode, recentring and MFS point components stream too, now that
+    # all three are wired
+    for kwargs in (dict(mode="cube"), dict(image_centre="auto"), dict(image_centre=(1.0, 0.5)),
+                   dict(point_sources=True)):
+        if kwargs.get("point_sources") and not stm.nufftax_available():
+            continue
         assert api.resolve_streaming("auto", str(npz_path), **kwargs)[0] is True
 
 
 @pytest.mark.parametrize("kwargs, why", [
-    (dict(point_sources=True), "point components"),
+    (dict(point_sources=True, mode="cube"), "point components in cube mode"),
     (dict(inversion="dense"), "dense"),
 ])
 def test_auto_holds_the_data_where_streaming_is_not_supported(
@@ -550,11 +559,15 @@ def test_channel_terms_are_each_channels_own_and_sum_to_the_mfs_terms(ragged, te
                                             ag.TransformerDFT, pool_noise=True)
         got = per_channel[(spw_i, chan_i)]
         assert got.n_vis == alone.n_vis > 0
-        np.testing.assert_allclose(got.kernel, alone.kernel, rtol=1e-12)
+        np.testing.assert_allclose(got.kernel, alone.kernel, rtol=1e-10,
+                                   atol=1e-10 * np.abs(alone.kernel).max())
         np.testing.assert_allclose(got.dirty_image, alone.dirty_image, rtol=1e-10,
                                    atol=1e-12 * np.abs(alone.dirty_image).max())
         assert got.data_term == pytest.approx(alone.data_term, rel=1e-12)
-    np.testing.assert_allclose(mfs.kernel, terms.kernel, rtol=1e-12)
+    # summed per channel vs accumulated in one stream: the NUFFT batches
+    # differ, so this agrees to the transform's peak-scaled precision
+    np.testing.assert_allclose(mfs.kernel, terms.kernel, rtol=1e-10,
+                               atol=1e-10 * np.abs(terms.kernel).max())
     np.testing.assert_allclose(mfs.dirty_image, terms.dirty_image, rtol=1e-10,
                                atol=1e-12 * np.abs(terms.dirty_image).max())
     assert mfs.n_vis == terms.n_vis
@@ -785,3 +798,32 @@ def test_streamed_recentred_fit_matches_the_in_memory_one(ragged, tmp_path):
                                atol=1e-10 * np.abs(r.model_image).max())
     assert streamed.uvdata.meta["image_centre_offset_arcsec"] == \
         pytest.approx(reference.uvdata.meta["image_centre_offset_arcsec"])
+
+
+@pytest.mark.skipif(not stm.nufftax_available(), reason="the fast path is nufftax")
+def test_the_nufft_accumulation_matches_the_per_chunk_dft(ragged):
+    """The fast path (type-1 NUFFTs over batches of `NUFFT_BATCH`) against the
+    per-chunk DFT it replaced -- 54x faster on Teresa's 112x112 grid, where
+    the DFT pass would have taken ~6 h. Errors scale with each image's peak."""
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    slow = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=False)
+    fast = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=True)
+    for ch in stm.iter_uvdata_chunks(uvd, CHUNK):
+        slow.add(ch)
+        fast.add(ch)
+    a, b = slow.finish(), fast.finish()
+    for name in ("kernel", "dirty_image", "beam_raw", "data_dirty_raw"):
+        x, y = getattr(a, name), getattr(b, name)
+        np.testing.assert_allclose(y, x, rtol=0, atol=1e-11 * np.abs(x).max(), err_msg=name)
+    assert (b.sum_weights, b.data_term, b.n_vis) == (a.sum_weights, a.data_term, a.n_vis)
+
+
+def test_point_grids_need_the_fast_path_and_an_even_oversample(ragged):
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    with pytest.raises(RuntimeError, match="nufftax"):
+        stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=False, point_oversample=8)
+    if stm.nufftax_available():
+        with pytest.raises(ValueError, match="even"):
+            stm.TermsAccumulator(geom, mask, ag.TransformerDFT, point_oversample=3)

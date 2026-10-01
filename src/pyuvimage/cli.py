@@ -314,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         "MFS cube fits in about a gigabyte. The cost is time: one pass over "
         "every sample, and a cached re-fit reads none. This is the DEFAULT "
         "whenever it applies (a dataset on disk, the sparse inversion, no "
-        "--point-sources); cube mode and --image-centre stream too. Naming it "
+        "--point-sources in cube mode); cube mode, --image-centre and MFS "
+        "--point-sources stream too. Naming it "
         "makes an unsupported combination refuse rather than fall back to the "
         "in-memory path",
     )

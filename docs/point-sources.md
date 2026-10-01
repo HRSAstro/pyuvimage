@@ -192,13 +192,29 @@ inversion's own `F` already makes — and a lattice that is not on the grid
 declines it and falls back. It is only the detector: accepted positions are
 refined and solved through the exact per-column route.
 
-**Streaming is the part still held back**, and for a different reason: a point
-column is an analytic function of uv, and all three of its terms are sums over
-samples the streamed pass has already discarded. The accumulated terms hold
-those sums only on the image grid, and a point's whole reason for existing is
-that it is not on the grid. So `--point-sources` runs the sparse inversion in
-memory: ~136 B per visibility for the data, rather than the `n_vis x n_mesh`
-matrix it used to need.
+**Streaming works too (MFS).** A point column is an analytic function of uv,
+but all three of its terms are values of two image-plane functions the
+streaming pass can accumulate once — the kernel K(lag) = sum w cos(2 pi u.lag)
+and the data's dirty image Dd(x):
+
+    B_p = M^T k_p,  k_p[i] = K(x_i - p)      C_pq = K(p - q)      Dp_p = Dd(p)
+
+and a Gaussian width is a convolution of K or Dd with that Gaussian. The pass
+accumulates both on grids 8x finer than the image (type-1 NUFFTs, so the
+extra cost is ~2x the plain pass, not the 50x a per-chunk DFT would be), and
+`streamed_points.StreamedAugmentedSystem` reads them with a quintic spline:
+2e-9 of K(0), so on 1.8e7 chi^2 the refinement and the unresolved test see
+the same surface. The kernel grid reaches a quarter-field beyond one field
+width of lag so widened columns near the edge do not read the circular wrap.
+Pinned against the in-memory system: identical detections, positions within
+Nelder-Mead's own tolerance, fluxes to 1e-6. On a Teresa-sized field (112x112
+image, 3136 mesh pixels) a new trial position costs 60 ms and a full scan
+4-10 s, in under 2 GB. Cube mode with points still runs in memory.
+
+The in-memory point stage on her 9.1M samples took 2 h 13 min. Part of that
+was `cross_on_grid`: autoarray transforms all 3136 mapping columns in one
+call, ~5 GB of FFT transients — more than her laptop had. It is now built in
+batches (same numbers to the bit), on both paths.
 
 **Limits.** The amplitude covariance is conditional on the prior, so a point
 sitting on bright extended emission has an error bar that is only as good as
