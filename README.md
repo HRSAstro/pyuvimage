@@ -1,14 +1,13 @@
 # pyuvimage
 
 Easy image reconstruction of radio interferometric data by **forward modelling
-in the uv-plane**. A lightweight alternative to CLEAN for people who want a
-regularised maximum-likelihood image with honest residuals and honest error
-bars, without being an interferometry expert and without heavy compute.
+in the uv-plane**. A lightweight alternative to CLEAN producing a
+regularised maximum-likelihood image without heavy compute.
 
 Built using [PyAutoGalaxy](https://github.com/PyAutoLabs/PyAutoGalaxy) and [PyAutoArray](https://github.com/PyAutoLabs/PyAutoArray)
 tools: the sky is a freeform image on a
 cartesian grid, solved by a linear inversion under a Gaussian-process source
-prior whose hyperparameters are optimised automatically with nothing to tune by hand.
+prior whose hyperparameters are optimised automatically.
 
 ## Install
 
@@ -82,8 +81,7 @@ at χ²/N = 1.016 on a 62×62 mesh, a residual peaking at 4.1σ — 3.5% of a 11
 peak — and a residual map whose rms is 1.01σ with no trace of the source,
 which is what you want to see. The run chose the sparse inversion (using JAX), the
 `structure` criterion and the adaptive prior for itself. The model panel is in
-Jy/pixel and the reconvolved panel in Jy/beam, which is why they look so
-different: the model is the sky at the mesh scale, not smoothed by the beam.
+Jy/pixel and the reconvolved panel in Jy/beam.
 
 ## The settings worth knowing about
 
@@ -153,10 +151,10 @@ the median of each in the FITS header:
 | prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed |
 
 The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
-with `C = (F+H)^-1`, verified against Monte Carlo at 0.996. That term alone is
+with `C = (F+H)^-1`. It is
 optimistic (a regularised model is smoothed, hence biased) so the systematic
 term measures how far each pixel moves when the regularisation strength is
-varied over the range the data cannot distinguish between. Where χ² stops caring about the strength, the prior
+varied over the range the data cannot distinguish between. Where χ² stops caring about the regularisation strength, the prior
 is choosing the answer. Neither term covers the prior *family* being wrong,
 nor calibration errors.
 
@@ -325,27 +323,19 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
 | **dense** (below, or forced) | `n_vis × n_mesh`, per trial | 3.8 GB, rising to ~32 GB at Nyquist |
 
 The streamed variant (`streaming="auto"`, the default: taken whenever the
-dataset is a file, the inversion is sparse and there are no point components
-in cube mode
-— `--no-streaming` holds the data in memory instead, `--streaming` refuses an
-unsupported combination rather than falling back, and `--reload` re-reads a
-file whose cached terms should not be trusted) accumulates the w-tilde kernel,
+dataset is a file, the inversion is sparse
+— `--no-streaming` holds the data in memory, `--streaming` loads the data in chunks, and `--reload` re-reads the data) accumulates the w-tilde kernel,
 the dirty images and the χ² constants in one pass over the file, caches them
-beside the output, and fits on those alone — every quantity the fit and the
+beside the output, and fits on those alone. Every quantity the fit and the
 products need is a sum over visibilities, including the residual map, which
 is dirty(data) − W̃⋆model. A 200-million-sample MFS cube that needs 33 GB
 in memory needs about a gigabyte streamed; a cached re-fit reads no
-visibilities at all. The cost moves to time: one pass through every sample.
-Cube mode streams the same pass one channel at a time into one set of terms
-per channel, and `--image-centre` is the same phase ramp applied per chunk.
+visibilities at all. Cube mode streams the same pass one channel at a time into one set of terms
+per channel, and `--image-centre` is the same phase shift applied per chunk.
 
-Sparse needs JAX; `auto` falls back to dense and says so when it is missing,
-or when the real and imaginary noise differ by more than 5%. `--point-sources`
-no longer forces dense — the bordered system's cross-terms come from one
-adjoint transform per point column instead of the `n_vis × n_mesh` matrix —
-though it does still hold the streaming load back, because a point column is
-analytic in uv and the streamed pass keeps nothing per visibility. On the dense path `pip install pynufft` is what makes
-it fast. A full fit is roughly 30–40 hyperparameter trials, doubled for the
+Sparse needs JAX; `auto` falls back to dense and says so when it is missing. 
+On the dense path, `pip install pynufft` is what makes
+it faster. A full fit is roughly 30–40 hyperparameter trials, doubled for the
 default `adaptive` prior; Ruby above is ~30 s sparse and tens of minutes dense.
 
 **Two levers, in order of effect:**
@@ -408,6 +398,7 @@ Full discussion: [docs/noise.md](docs/noise.md).
 ## Caveats
 
 - Only Stokes I is currently supported.
+- Only natural weighting is supported.
 - Only a single field is currently supported; several spectral windows can be
   imaged together ([docs/spectral-windows.md](docs/spectral-windows.md)).
 - The w-term is neglected (small-field approximation), so very large fields are
@@ -415,12 +406,6 @@ Full discussion: [docs/noise.md](docs/noise.md).
 - Total flux cannot be resolved beyond the maximum recovery scale of the data
   set, which is determined by the baseline length distribution: emission
   resolved out by the array cannot be recovered (same as CLEAN).
-- The sparse (w-tilde) inversion that `--inversion auto` selects above 5000
-  visibilities is **new**. It agrees with the dense path to 3e-8 on the
-  built-in mock (`python scripts/compare_inversions.py --mock`), but that mock
-  is small enough to use the DFT; the pynufft path that real datasets take has
-  not been compared head-to-head. If a result matters, check it against
-  `--inversion dense` — the same script does this on your own data.
 - Positivity applies to the mesh-only solve. With `--point-sources` the
   bordered system is eliminated by an unconstrained Cholesky solve, so the
   delivered mesh may hold small negative values whatever `--enforce-positive`
