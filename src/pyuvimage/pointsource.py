@@ -364,7 +364,9 @@ class SparseMesh:
         112x112 grid and 3136 mesh pixels that is 5 GB of transients for a
         315 MB answer -- an OOM kill in 7 GB here, and on her 3.6 GB laptop
         the likeliest reason the in-memory point stage took 2 h 13 min.
-        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to the bit.
+        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to rounding
+        (bit-identical with SciPy's pocketfft on Linux; the FFT library may
+        vectorise a different batch size differently elsewhere).
         """
         extent = self.mask.extent_index_for_masked_pixel
         n_image, n_mesh = self.mapping_matrix.shape

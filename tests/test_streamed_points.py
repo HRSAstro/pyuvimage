@@ -199,10 +199,14 @@ def test_cross_on_grid_batches_without_changing_the_answer(case, monkeypatch):
     whole = SparseMesh(inv, ds).cross_on_grid(ys, xs)
     monkeypatch.setattr(pointsource, "SCAN_CHUNK_BYTES", 1)   # one column per batch
     batched = SparseMesh(inv, ds).cross_on_grid(ys, xs)
-    np.testing.assert_array_equal(batched, whole)
+    # bit-identical with pocketfft on Linux, but not guaranteed: an FFT
+    # library may vectorise a different batch size differently (it does on
+    # Hannah's macOS build), so rounding is the honest bound
+    tol = 1e-13 * np.abs(whole).max()
+    np.testing.assert_allclose(batched, whole, rtol=0, atol=tol)
     # and a strict subset of the grid is the matching columns
     sub = SparseMesh(inv, ds).cross_on_grid(ys[::7], xs[::7])
-    np.testing.assert_array_equal(sub, whole[:, ::7])
+    np.testing.assert_allclose(sub, whole[:, ::7], rtol=0, atol=tol)
 
 
 def test_streamed_run_with_points_matches_the_in_memory_run(tmp_path):

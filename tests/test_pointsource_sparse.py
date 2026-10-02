@@ -117,7 +117,11 @@ def test_the_cross_terms_match_the_dense_matrix(systems):
 
     B_dense = dense.mesh.cross(Pw)
     B_sparse = sparse.mesh.cross(Pw)
-    assert np.allclose(B_sparse, B_dense, rtol=0, atol=1e-15 * np.max(np.abs(B_dense)))
+    # rounding, not identity: the dense side is one BLAS GEMM and the sparse
+    # side an adjoint transform then a projection, and the two accumulate in
+    # different orders. 1e-15 held with OpenBLAS but not with macOS's
+    # Accelerate; 1e-13 is still four decades below any error that matters
+    assert np.allclose(B_sparse, B_dense, rtol=0, atol=1e-13 * np.max(np.abs(B_dense)))
 
 
 @sparse_only
@@ -141,7 +145,7 @@ def test_a_gaussian_column_matches_too(systems):
     Pw = dense.w_stack[:, None] * P
     B_dense, B_sparse = dense.mesh.cross(Pw), sparse.mesh.cross(Pw)
     assert np.allclose(
-        B_sparse, B_dense, rtol=0, atol=1e-15 * np.max(np.abs(B_dense)))
+        B_sparse, B_dense, rtol=0, atol=1e-13 * np.max(np.abs(B_dense)))   # see above
 
 
 # --- and the whole solve ----------------------------------------------------

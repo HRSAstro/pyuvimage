@@ -214,7 +214,7 @@ image, 3136 mesh pixels) a new trial position costs 60 ms and a full scan
 The in-memory point stage on her 9.1M samples took 2 h 13 min. Part of that
 was `cross_on_grid`: autoarray transforms all 3136 mapping columns in one
 call, ~5 GB of FFT transients — more than her laptop had. It is now built in
-batches (same numbers to the bit), on both paths.
+batches (same numbers to rounding), on both paths.
 
 **Limits.** The amplitude covariance is conditional on the prior, so a point
 sitting on bright extended emission has an error bar that is only as good as
