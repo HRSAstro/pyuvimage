@@ -33,9 +33,20 @@ masked, which the provenance cannot tell apart).
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
+import os
+import sys
 import time
 from pathlib import Path
+
+# a crash inside a compiled extension (JAX, nufftax) otherwise ends the
+# process with no Python traceback at all
+faulthandler.enable()
+sys.stdout.reconfigure(line_buffering=True)
+# autonerves treats the working directory as a workspace and warns that it
+# cannot check its version; irrelevant to a library-only script
+os.environ.setdefault("PYAUTO_SKIP_WORKSPACE_VERSION_CHECK", "1")
 
 import numpy as np
 
@@ -105,8 +116,10 @@ def main(argv=None):
                     help="stop after this many samples (both sides)")
     ap.add_argument("--out", default=None, help="write the report as JSON here")
     a = ap.parse_args(argv)
+    print(f"python {sys.version.split()[0]}; importing autoarray and pyuvimage...", flush=True)
 
     import autoarray as aa
+    import pyuvimage
     from pyuvimage import streaming as stm
     from pyuvimage.api import BASELINE_PERCENTILE
     from pyuvimage.grids import resolve_geometry
@@ -115,6 +128,14 @@ def main(argv=None):
         raise SystemExit(
             f"this autoarray ({aa.__file__}) has no Interferometer.from_stream; "
             "install PyAutoArray main")
+    for mod in (aa, pyuvimage):
+        print(f"  {mod.__name__} {getattr(mod, '__version__', '?')} from {mod.__file__}",
+              flush=True)
+    try:
+        import nufftax
+        print(f"  nufftax {nufftax.__version__}", flush=True)
+    except ImportError:
+        raise SystemExit("nufftax is not installed: both sides need it")
 
     header = stm.scan_header(a.dataset, a.chunk_k)
     geometry = resolve_geometry(
@@ -131,6 +152,7 @@ def main(argv=None):
     print(f"image grid {geometry.shape_native} at {geometry.pixel_scale:.4g}\"/pix")
 
     # -- pyuvimage
+    print("streaming the pyuvimage side...")
     t0 = time.time()
     acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
     for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
@@ -145,6 +167,7 @@ def main(argv=None):
         transformer_class = aa.TransformerDFT
     else:
         transformer_class = aa.TransformerNUFFT
+    print("streaming the autoarray side...")
     t0 = time.time()
     dataset = aa.Interferometer.from_stream(
         _rechunked(_pooled_chunks(a.dataset, a.chunk_k, a.limit), a.aa_chunk),
