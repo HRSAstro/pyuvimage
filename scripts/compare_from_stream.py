@@ -1,0 +1,199 @@
+"""Compare autoarray's `Interferometer.from_stream` with pyuvimage's streamed terms.
+
+PyAutoArray asked (PyAutoLabs discussion #13) whether its upstream streaming
+accumulation, `autoarray.Interferometer.from_stream` /
+`sparse_terms_from_chunks`, matches pyuvimage's `streaming.TermsAccumulator` on
+real data, and how long it takes on a large cube. This script runs both on the
+same file and reports the agreement of every term and the time each took.
+
+    python scripts/compare_from_stream.py DATA.npz --fov 25
+    python scripts/compare_from_stream.py DATA.npz --fov 25 --limit 2000000   # a first look
+
+Both sides see the same chunks: pyuvimage's reader (`streaming.iter_chunks`),
+with the noise pooled per sample, because `from_stream` refuses unequal
+sigma_re and sigma_im and pyuvimage's sparse path pools them anyway. Each side
+then uses its own transform:
+
+  pyuvimage   one batched type-1 NUFFT per `NUFFT_BATCH` samples, for every
+              image term and the kernel (`TermsAccumulator(fast=True)`)
+  autoarray   per chunk: the kernel builder (`method="nufft"`) and two
+              adjoints through a transformer built over that chunk
+              (`TransformerNUFFT` by default; `--aa-transformer dft` uses the
+              exact DFT, affordable only on small data)
+
+Chunks are regrouped to a fixed `--aa-chunk` before `from_stream` sees them,
+because a JAX transform recompiles for every new chunk length.
+
+Needs an autoarray with `Interferometer.from_stream` (late September 2026 or
+later) and nufftax. Masks: one square mask with origin (0, 0), which avoids
+the two caveats upstream noted (a non-zero mask origin, which
+`TransformerNUFFT` ignores, and masks that differ only in which pixels are
+masked, which the provenance cannot tell apart).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+
+
+def _rechunked(chunks, size, limit=None):
+    """`(uv, data, noise)` triples of exactly `size` samples (the last shorter)."""
+    buf_uv, buf_d, buf_n, have, total = [], [], [], 0, 0
+    for uv, d, n in chunks:
+        if limit is not None and total + len(d) > limit:
+            keep = limit - total
+            uv, d, n = uv[:keep], d[:keep], n[:keep]
+        buf_uv.append(uv), buf_d.append(d), buf_n.append(n)
+        have += len(d)
+        total += len(d)
+        while have >= size:
+            uv_all = np.concatenate(buf_uv)
+            d_all = np.concatenate(buf_d)
+            n_all = np.concatenate(buf_n)
+            yield uv_all[:size], d_all[:size], n_all[:size]
+            buf_uv, buf_d, buf_n = [uv_all[size:]], [d_all[size:]], [n_all[size:]]
+            have -= size
+        if limit is not None and total >= limit:
+            break
+    if have:
+        yield np.concatenate(buf_uv), np.concatenate(buf_d), np.concatenate(buf_n)
+
+
+def _pooled_chunks(source, chunk_k, limit=None):
+    """pyuvimage's reader, noise pooled, as plain triples (unflagged samples)."""
+    from pyuvimage import streaming as stm
+    from pyuvimage.uvdata import pooled_noise
+
+    total = 0
+    for ch in stm.iter_chunks(source, chunk_k):
+        if len(ch) == 0:
+            continue
+        uv, d, n = ch.uv, ch.data, pooled_noise(ch.noise)
+        if limit is not None and total + len(d) > limit:
+            keep = limit - total
+            uv, d, n = uv[:keep], d[:keep], n[:keep]
+        total += len(d)
+        yield uv, d, n
+        if limit is not None and total >= limit:
+            return
+
+
+def _compare(name, ours, theirs):
+    ours = np.asarray(ours, dtype=float)
+    theirs = np.asarray(theirs, dtype=float)
+    peak = float(np.max(np.abs(ours))) or 1.0
+    diff = float(np.max(np.abs(ours - theirs)))
+    return {"term": name, "shape": list(ours.shape), "max_abs_diff": diff,
+            "peak": peak, "max_diff_over_peak": diff / peak}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("dataset", help="a pyuvimage .npz (or dataset directory)")
+    ap.add_argument("--fov", type=float, required=True, help="field of view [arcsec]")
+    ap.add_argument("--pixel-scale", default="auto")
+    ap.add_argument("--chunk-k", type=int, default=4096,
+                    help="pyuvimage reader chunk (as `pyuvimage fit --chunk-k`)")
+    ap.add_argument("--aa-chunk", type=int, default=65536,
+                    help="fixed chunk length handed to from_stream")
+    ap.add_argument("--aa-transformer", choices=("nufft", "dft"), default="nufft")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="stop after this many samples (both sides)")
+    ap.add_argument("--out", default=None, help="write the report as JSON here")
+    a = ap.parse_args(argv)
+
+    import autoarray as aa
+    from pyuvimage import streaming as stm
+    from pyuvimage.api import BASELINE_PERCENTILE
+    from pyuvimage.grids import resolve_geometry
+
+    if not hasattr(aa.Interferometer, "from_stream"):
+        raise SystemExit(
+            f"this autoarray ({aa.__file__}) has no Interferometer.from_stream; "
+            "install PyAutoArray main")
+
+    header = stm.scan_header(a.dataset, a.chunk_k)
+    geometry = resolve_geometry(
+        fov_arcsec=a.fov, max_baseline_wavelengths=header.max_baseline_wavelengths,
+        pixel_scale=a.pixel_scale,
+        effective_baseline_wavelengths=header.baseline_percentile_wavelengths(
+            BASELINE_PERCENTILE),
+    )
+    mask = aa.Mask2D.all_false(shape_native=geometry.shape_native,
+                               pixel_scales=geometry.pixel_scale)
+    n_total = header.n_samples if a.limit is None else min(a.limit, header.n_samples)
+    print(f"{a.dataset}: {header.n_samples} samples ({header.n_chan} channels, "
+          f"{header.n_spw} spw); comparing on {n_total}")
+    print(f"image grid {geometry.shape_native} at {geometry.pixel_scale:.4g}\"/pix")
+
+    # -- pyuvimage
+    t0 = time.time()
+    acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
+    for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
+        acc.add(stm.VisibilityChunk(uv=uv, data=d, noise=n))
+    ours = acc.finish()
+    t_ours = time.time() - t0
+    print(f"pyuvimage TermsAccumulator: {t_ours:.1f} s "
+          f"({1e6 * t_ours / max(ours.n_vis, 1):.1f} us/sample)")
+
+    # -- autoarray
+    if a.aa_transformer == "dft":
+        transformer_class = aa.TransformerDFT
+    else:
+        transformer_class = aa.TransformerNUFFT
+    t0 = time.time()
+    dataset = aa.Interferometer.from_stream(
+        _rechunked(_pooled_chunks(a.dataset, a.chunk_k, a.limit), a.aa_chunk),
+        real_space_mask=mask, transformer_class=transformer_class, eps=1e-12,
+    )
+    t_theirs = time.time() - t0
+    theirs = dataset.sparse_terms
+    print(f"autoarray from_stream ({transformer_class.__name__}): {t_theirs:.1f} s "
+          f"({1e6 * t_theirs / max(theirs.n_vis, 1):.1f} us/sample)")
+
+    rows = [
+        _compare("w-tilde kernel", ours.kernel, theirs.nufft_precision_operator),
+        _compare("dirty image (D)", ours.dirty_image, theirs.dirty_image_native),
+        _compare("dirty beam", ours.beam_raw, theirs.dirty_beam_native),
+    ]
+    scalars = {
+        name: {"pyuvimage": float(getattr(ours, mine)),
+               "autoarray": float(getattr(theirs, upstream)),
+               "relative_diff": float(abs(getattr(ours, mine) - getattr(theirs, upstream))
+                                      / max(abs(getattr(theirs, upstream)), 1e-300))}
+        for name, mine, upstream in (
+            ("sum_weights", "sum_weights", "sum_weights"),
+            ("data_term", "data_term", "data_term"),
+            ("noise_normalization", "noise_normalization", "noise_normalization"),
+            ("n_vis", "n_vis", "n_vis"),
+        )
+    }
+    print()
+    for r in rows:
+        print(f"  {r['term']:<16} max |diff| / peak = {r['max_diff_over_peak']:.2e}")
+    for name, s in scalars.items():
+        print(f"  {name:<16} relative diff     = {s['relative_diff']:.2e}")
+    report = {
+        "dataset": str(a.dataset), "n_samples_compared": int(ours.n_vis),
+        "image_shape": list(geometry.shape_native), "pixel_scale": geometry.pixel_scale,
+        "seconds": {"pyuvimage": t_ours, "autoarray_from_stream": t_theirs},
+        "aa_transformer": transformer_class.__name__, "aa_chunk": a.aa_chunk,
+        "arrays": rows, "scalars": scalars,
+        "provenance": {k: (list(v) if isinstance(v, tuple) else v) for k, v in {
+            "shape_native": theirs.shape_native, "pixel_scales": theirs.pixel_scales,
+            "origin": theirs.origin, "eps": theirs.eps,
+            "transformer_class_name": theirs.transformer_class_name,
+            "phase_centre": theirs.phase_centre}.items()},
+    }
+    if a.out:
+        Path(a.out).write_text(json.dumps(report, indent=2))
+        print(f"\nreport written to {a.out}")
+    return report
+
+
+if __name__ == "__main__":
+    main()
