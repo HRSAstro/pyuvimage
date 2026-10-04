@@ -344,13 +344,16 @@ def make_demo_dataset(
     found spurious point detections. A first run of the tool should not be in
     that regime.
 
-    Note the residual map still reads a structure ratio near 0.56. That is the
-    small-mock artefact documented in design-notes.md, not overfitting: with
-    1200 visibilities behind a 48x48 image grid the map has far more pixels
-    than independent measurements, so its rms is set by the beam's correlated
-    structure rather than by chi^2/N. More visibilities make it *worse*, not
-    better -- measured 0.56 at 2400 and 0.14 at 3600 -- so it is not a knob to
-    turn here.
+    At the default 1200 visibilities the delivered fit reads a structure
+    ratio near 0.5. This was put down to the residual map of a small mock not
+    being white; that is wrong. Pure noise through the same imager reads
+    0.95-1.02 (5 realisations, 4 Oct 2026), so 0.5 means the model has
+    absorbed noise. It is what `--criterion auto` -> `discrepancy` does at
+    4.2 data points per mesh pixel when the model cannot represent all of the
+    truth (built here on a 32x32 mesh, fitted on 24x24): chi^2 = N is reached
+    by fitting noise. `structure` there leaves signal instead (chi^2/N 1.30).
+    At 4800 visibilities (16.7 per pixel) auto takes `structure` and the map
+    is white (1.06), so `pyuvimage demo` uses 4800.
 
     `point_flux_jy` is off by default so the mock stays a plain extended
     source for regression tests; the CLI demo turns it on.

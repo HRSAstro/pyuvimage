@@ -691,7 +691,13 @@ def main(argv: list[str] | None = None) -> int:
         from .api import run
         from .mock import make_demo_dataset
 
-        uvd, truth, _, comps = make_demo_dataset(point_flux_jy=0.004)
+        # 4800 visibilities: 16.7 data points per model pixel, so the run is in
+        # the well-constrained regime real data are, `--criterion auto` takes
+        # `structure`, and the residual map comes out white (ratio 1.06). At
+        # the generator's default 1200 (4.2 per pixel) auto takes
+        # `discrepancy`, and chi^2 = N is then reached by absorbing noise:
+        # residual map 0.51 sigma, which looks like -- and is -- overfitting.
+        uvd, truth, _, comps = make_demo_dataset(n_vis=4800, point_flux_jy=0.004)
         # the demo shows the tool as configured, point components included:
         # its mock contains one true point source that no pixel grid can hold
         res = run(uvd, fov=3.0, out=args.out, point_sources=True)
