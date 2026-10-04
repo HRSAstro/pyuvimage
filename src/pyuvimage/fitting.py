@@ -2294,8 +2294,14 @@ class LinearSystem:
             data_term = float(terms.data_term)
             noise_normalization = float(terms.noise_normalization)
         else:
-            data = inversion.dataset.data.array
-            noise = inversion.dataset.noise_map.array
+            # the fit's own dataset first: from autoarray 2026.10 a sparse
+            # inversion's `dataset` is a `DatasetInterface` that carries no
+            # data or noise arrays
+            source = next(
+                ds for ds in (dataset, inversion.dataset)
+                if ds is not None and getattr(ds, "data", None) is not None)
+            data = np.asarray(getattr(source.data, "array", source.data))
+            noise = np.asarray(getattr(source.noise_map, "array", source.noise_map))
             # the same expression `fast_chi_squared` evaluates, on the same arrays
             data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
                 data.imag**2.0 / noise.imag**2.0

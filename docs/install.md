@@ -3,7 +3,7 @@
 [← back to the README](../README.md)
 
 ```bash
-pip install -e .            # core (numpy backend; numba and autoarray's git head, see below)
+pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see below)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax
 ```
@@ -11,7 +11,7 @@ pip install -e ".[jax]"     # + JAX/nufftax
 Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
 `version: python_version_check: False` in a local `config/general.yaml`).
 
-## numba, and autoarray's development head
+## numba, and the autoarray release
 
 Two things decide how long a positivity-on fit takes, and neither is
 pyuvimage's code. Both concern autoarray's non-negative least-squares solver
@@ -25,16 +25,30 @@ decorator is a no-op and the kernels run as pure Python — 9 s of a 44 s cold
 solve when profiled. pyuvimage warns at the start of a run if numba is
 missing; `pip install numba` is the whole fix.
 
-**autoarray `main`** (September 2026) rewrote the same solver: the factor is
+**autoarray 2026.10.2.1** is the minimum. It is the first release with the
+solver rewrite below, and the first with autoarray's own streaming
+accumulation (`sparse_terms_from_chunks` / `Interferometer.from_stream`),
+which the streamed path now uses: on ALMaQUEST CO(1-0) it matched
+pyuvimage's own accumulation to 3e-13 and ran 25% faster. `pip install -e .`
+pulls it in. One trap: an autoarray installed earlier from git (which the
+previous version of these instructions asked for) reports version
+`9999.0.0.dev0`, which pip counts as newer than any release, so a plain
+upgrade leaves it in place. Replace it explicitly:
+
+```bash
+pip install --force-reinstall --no-deps "autoarray>=2026.10.2.1" "autogalaxy>=2026.10.2.1"
+python -c "from autoarray.inversion.inversion.interferometer import inversion_interferometer_util as u; print(hasattr(u, 'sparse_terms_from_chunks'))"   # True
+```
+
+With an older autoarray the streamed path still runs, on pyuvimage's own
+accumulation, and says so once at the start.
+
+The solver rewrite (September 2026, in that release): the factor is
 updated in place instead of being copied with `np.insert`/`np.delete` on every
 iteration (17 s of that same 44 s), the warm-start repair is correct, and a
 process-wide memo seeds each framework solve from the passive set of the
 previous one with the same mesh — so the delivered fit of a second adaptive
-pass, or of each cube channel, starts from the last one's answer. None of it
-is in a release yet and the version string was not bumped, so
-`pip install -U autoarray` does nothing; the core dependency therefore
-points at the git head (`autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray`)
-until the next release, and `pip install -e .` installs it. Measured on
+pass, or of each cube channel, starts from the last one's answer. Measured on
 J0116 (50×50 mesh): delivered fits 72 s and 109 s → 1 s and 2 s; the test
 suite 920 s → 92 s. `AUTOARRAY_NNLS_WARM_START=0` switches the memo off if
 it ever needs ruling out. pyuvimage's own seeding of its probe solves

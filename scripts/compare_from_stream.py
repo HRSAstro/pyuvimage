@@ -15,7 +15,10 @@ sigma_re and sigma_im and pyuvimage's sparse path pools them anyway. Each side
 then uses its own transform:
 
   pyuvimage   one batched type-1 NUFFT per `NUFFT_BATCH` samples, for every
-              image term and the kernel (`TermsAccumulator(fast=True)`)
+              image term and the kernel (`TermsAccumulator(fast=True)` with
+              autoarray's accumulation switched off: since this comparison,
+              the accumulator uses autoarray's whenever it is installed, and
+              its own type-1 path is the fallback for older autoarray)
   autoarray   per chunk: the kernel builder (`method="nufft"`) and two
               adjoints through a transformer built over that chunk
               (`TransformerNUFFT` by default; `--aa-transformer dft` uses the
@@ -152,12 +155,17 @@ def main(argv=None):
     print(f"image grid {geometry.shape_native} at {geometry.pixel_scale:.4g}\"/pix")
 
     # -- pyuvimage
-    print("streaming the pyuvimage side...")
+    print("streaming the pyuvimage side (its own type-1 accumulation)...")
     t0 = time.time()
-    acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
-    for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
-        acc.add(stm.VisibilityChunk(uv=uv, data=d, noise=n))
-    ours = acc.finish()
+    upstream, stm.autoarray_streaming = stm.autoarray_streaming, lambda: None
+    stm._WARNED_OLD_AUTOARRAY = True          # this is on purpose; no warning
+    try:
+        acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
+        for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
+            acc.add(stm.VisibilityChunk(uv=uv, data=d, noise=n))
+        ours = acc.finish()
+    finally:
+        stm.autoarray_streaming = upstream
     t_ours = time.time() - t0
     print(f"pyuvimage TermsAccumulator: {t_ours:.1f} s "
           f"({1e6 * t_ours / max(ours.n_vis, 1):.1f} us/sample)")

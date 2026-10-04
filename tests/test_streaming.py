@@ -827,3 +827,39 @@ def test_point_grids_need_the_fast_path_and_an_even_oversample(ragged):
     if stm.nufftax_available():
         with pytest.raises(ValueError, match="even"):
             stm.TermsAccumulator(geom, mask, ag.TransformerDFT, point_oversample=3)
+
+
+@pytest.mark.skipif(not stm.nufftax_available() or stm.autoarray_streaming() is None,
+                    reason="needs nufftax and autoarray >= AUTOARRAY_STREAMING_RELEASE")
+def test_the_fast_path_is_autoarrays_streaming_and_matches_our_own(ragged, monkeypatch, caplog):
+    """With pooled noise every batch goes through autoarray's
+    `sparse_terms_from_chunks`; pyuvimage's own type-1 accumulation (what an
+    older autoarray falls back to) gives the same terms to rounding."""
+    import logging
+
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    upstream = stm.autoarray_streaming()
+    calls = []
+
+    def spy(chunks, **kw):
+        chunks = list(chunks)
+        calls.append(len(chunks[0][1]))
+        return upstream(chunks, **kw)
+
+    monkeypatch.setattr(stm, "autoarray_streaming", lambda: spy)
+    theirs = stm.accumulate_sparse_terms(
+        stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
+    # every batch, the padded last one included, has the one compiled length
+    assert calls and set(calls) == {stm.NUFFT_BATCH}
+
+    monkeypatch.setattr(stm, "autoarray_streaming", lambda: None)
+    monkeypatch.setattr(stm, "_WARNED_OLD_AUTOARRAY", False)
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        ours = stm.accumulate_sparse_terms(
+            stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
+    assert "pip install --force-reinstall" in caplog.text
+    for name in ("kernel", "dirty_image", "beam_raw", "data_dirty_raw"):
+        x, y = getattr(ours, name), getattr(theirs, name)
+        np.testing.assert_allclose(y, x, rtol=0, atol=1e-11 * np.abs(x).max(), err_msg=name)
+    assert theirs.data_term == ours.data_term and theirs.n_vis == ours.n_vis

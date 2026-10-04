@@ -89,6 +89,41 @@ def nufftax_available() -> bool:
     return _nufftax() is not None
 
 
+#: the first autoarray release with `sparse_terms_from_chunks` /
+#: `Interferometer.from_stream` (PyAutoLabs discussion #13)
+AUTOARRAY_STREAMING_RELEASE = "2026.10.2.1"
+
+
+def autoarray_streaming():
+    """autoarray's `sparse_terms_from_chunks`, or None on an older release."""
+    try:
+        from autoarray.inversion.inversion.interferometer import (
+            inversion_interferometer_util as su,
+        )
+    except Exception:  # pragma: no cover
+        return None
+    return getattr(su, "sparse_terms_from_chunks", None)
+
+
+_WARNED_OLD_AUTOARRAY = False
+
+
+def _warn_old_autoarray() -> None:
+    global _WARNED_OLD_AUTOARRAY
+    if _WARNED_OLD_AUTOARRAY:
+        return
+    _WARNED_OLD_AUTOARRAY = True
+    logger.warning(
+        "this autoarray has no streaming accumulation (sparse_terms_from_chunks, "
+        "autoarray >= %s); using pyuvimage's own, which gives the same terms "
+        "about 25%% slower. To use autoarray's: pip install --force-reinstall "
+        "--no-deps \"autoarray>=%s\" (--force-reinstall because an autoarray "
+        "installed from git reports version 9999.0.0.dev0, which pip treats as "
+        "newer than any release).",
+        AUTOARRAY_STREAMING_RELEASE, AUTOARRAY_STREAMING_RELEASE,
+    )
+
+
 def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
                 pixel_scale_arcsec: float, centred: bool = False,
                 eps: float = NUFFT_EPS) -> np.ndarray:
@@ -693,7 +728,29 @@ class RowTracker:
 class TermsAccumulator:
     """Folds chunks into `SparseTerms`, one `add` at a time.
 
-    Per chunk a transformer is built over that chunk's uv (the DFT here is
+    **The fast path** (nufftax installed; the default) buffers samples into
+    batches of exactly `NUFFT_BATCH` and hands each to autoarray's own
+    streaming accumulation, `sparse_terms_from_chunks` -- the kernel by its
+    type-1 NUFFT builder, the dirty image and beam through a
+    `TransformerNUFFT` over the batch. Compared on ALMaQUEST CO(1-0) (1.34M
+    samples) it matched pyuvimage's own type-1 accumulation to 3e-13 of the
+    peak and ran 25% faster (`scripts/compare_from_stream.py`,
+    `claude/autoarray-from-stream-comparison.md`), so it is used whenever
+    the installed autoarray has it (>= `AUTOARRAY_STREAMING_RELEASE`). The
+    last batch is padded to full length with samples of infinite sigma --
+    zero weight, so they add exactly nothing -- so JAX compiles one batch
+    shape per run rather than one per remainder (one per channel in cube
+    mode).
+
+    pyuvimage's own type-1 accumulation (`kernel_image`, `type1_image`) is
+    still used for the oversampled point-component grids, which autoarray
+    does not build, and for any batch whose sigma_re and sigma_im differ
+    (autoarray refuses those: its kernel is built from sigma_re alone; the
+    sparse path pools them, so this is only an unpooled caller's case). On
+    an autoarray older than `AUTOARRAY_STREAMING_RELEASE` it does the whole
+    job, with a one-time warning naming the pip command.
+
+    **The slow path** (`fast=False`): per chunk a transformer is built over that chunk's uv (the DFT here is
     n_image x chunk_k, freed with the chunk) and three adjoints are taken:
     the weighted data (for D), the DirtyImager-weighted data and the weights
     (for the products). The kernel accumulation is autoarray's own
@@ -789,7 +846,7 @@ class TermsAccumulator:
             self._buf.append((uv, d, sr, si))
             self._buf_n += n
             if self._buf_n >= NUFFT_BATCH:
-                self._flush()
+                self._flush(full_batches_only=True)
             self._add_scalars(d, sr, si, n)
             return
         # -- the kernel, from autoarray's own accumulation on this chunk
@@ -822,31 +879,83 @@ class TermsAccumulator:
                                  + np.sum(np.log(2 * np.pi * si ** 2)))
         self.n_vis += n
 
-    def _flush(self) -> None:
-        """The buffered samples' contribution to every image term."""
+    def _flush(self, full_batches_only: bool = False) -> None:
+        """The buffered samples' contribution to every image term, a batch of
+        exactly `NUFFT_BATCH` at a time; with ``full_batches_only`` the
+        remainder stays buffered for the next `add`."""
         if not self._buf:
             return
         uv = np.concatenate([b[0] for b in self._buf])
         d = np.concatenate([b[1] for b in self._buf])
         sr = np.concatenate([b[2] for b in self._buf])
         si = np.concatenate([b[3] for b in self._buf])
-        self._buf, self._buf_n = [], 0
+        n = len(d)
+        stop = (n // NUFFT_BATCH) * NUFFT_BATCH if full_batches_only else n
+        for lo in range(0, stop, NUFFT_BATCH):
+            hi = min(lo + NUFFT_BATCH, stop)
+            self._flush_batch(uv[lo:hi], d[lo:hi], sr[lo:hi], si[lo:hi])
+        if stop < n:
+            self._buf = [(uv[stop:], d[stop:], sr[stop:], si[stop:])]
+            self._buf_n = n - stop
+        else:
+            self._buf, self._buf_n = [], 0
+
+    def _flush_batch(self, uv, d, sr, si) -> None:
         pix = float(self.geometry.pixel_scale)
         w = sr ** -2.0
-        self.kernel += kernel_image(uv, w, self.shape, pix)
         weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
-        dirty = type1_image(uv, weighted, self.shape, pix)
-        self.dirty += dirty
-        self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
-        # with equal sigma_re and sigma_im -- always, once pooled -- the
-        # products' weighting is the fit's, and the two images are one
-        self.data_dirty += (dirty if np.array_equal(sr, si)
-                            else type1_image(uv, d * w, self.shape, pix))
+        upstream = autoarray_streaming()
+        if upstream is not None and np.array_equal(sr, si):
+            self._add_upstream(upstream, uv, d, sr)
+        else:
+            if upstream is None:
+                _warn_old_autoarray()
+            self.kernel += kernel_image(uv, w, self.shape, pix)
+            dirty = type1_image(uv, weighted, self.shape, pix)
+            self.dirty += dirty
+            self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
+            # with equal sigma_re and sigma_im the products' weighting is the
+            # fit's, and the two images are one
+            self.data_dirty += (dirty if np.array_equal(sr, si)
+                                else type1_image(uv, d * w, self.shape, pix))
         if self.q:
             self.kernel_fine += kernel_image(
                 uv, w, self.kernel_fine_shape, pix / self.q, zero_nyquist=False)
             self.dirty_fine += type1_image(
                 uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
+
+    def _add_upstream(self, sparse_terms_from_chunks, uv, d, sigma) -> None:
+        """One batch through autoarray's `sparse_terms_from_chunks`.
+
+        Only its image terms are taken: the scalars are pyuvimage's own
+        (`_add_scalars`, identical sums), and padding would put infinities in
+        its noise normalisation. With sigma_re == sigma_im the data dirty
+        image of the products (weight 1/sigma_re^2) is the fit's dirty image.
+        """
+        n = len(d)
+        if n < NUFFT_BATCH:
+            # zero-weight padding: 1/inf^2 is exactly 0, so every term gains
+            # exactly nothing, and JAX sees the one batch length it compiled
+            pad = NUFFT_BATCH - n
+            uv = np.concatenate([uv, np.zeros((pad, 2))])
+            d = np.concatenate([d, np.zeros(pad, dtype=complex)])
+            sigma = np.concatenate([sigma, np.full(pad, np.inf)])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = sparse_terms_from_chunks(
+                [(uv, d, sigma * (1 + 1j))], real_space_mask=self.mask,
+                eps=NUFFT_EPS,
+            )
+        kernel = np.asarray(t.nufft_precision_operator, dtype=np.float64)
+        if kernel.shape != self.kernel.shape:
+            raise RuntimeError(
+                f"autoarray's streamed kernel is {kernel.shape}, expected "
+                f"{self.kernel.shape}: the mask's unmasked extent is smaller "
+                "than the image grid")
+        dirty = np.asarray(t.dirty_image_native, dtype=np.float64)
+        self.kernel += kernel
+        self.dirty += dirty
+        self.beam += np.asarray(t.dirty_beam_native, dtype=np.float64)
+        self.data_dirty += dirty
 
     def finish(self) -> SparseTerms:
         self._flush()

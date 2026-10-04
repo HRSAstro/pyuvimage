@@ -15,12 +15,12 @@ dependencies = [
     "scipy",
     "astropy",
     "matplotlib",
-    "autogalaxy",
-    # autoarray's development head: the in-place non-negative solver and its
-    # cross-fit warm-start memo (Sep 2026) took a J0116 fit's solves from
-    # 72-109 s to 1-2 s. Not in a release yet and the version string was not
-    # bumped, so it has to come from git (see docs/install.md).
-    "autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray",
+    # PyAutoLabs releases in lockstep; 2026.10.2.1 is the first with both the
+    # streaming accumulation the streamed path uses (`sparse_terms_from_chunks`)
+    # and the in-place non-negative solver with its warm-start memo (J0116
+    # solves 72-109 s -> 1-2 s). See docs/install.md.
+    "autogalaxy>=2026.10.2.1",
+    "autoarray>=2026.10.2.1",
     # the same solver's Cholesky-update kernels are numba; without it they run
     # as pure Python and every positive-only solve is several times slower
     "numba",

@@ -12,7 +12,7 @@ prior whose hyperparameters are optimised automatically.
 ## Install
 
 ```bash
-pip install -e .            # core (numpy backend; numba and autoarray's git head, see docs/install.md)
+pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see docs/install.md)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
 ```
