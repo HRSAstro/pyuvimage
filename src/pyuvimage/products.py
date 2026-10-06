@@ -150,6 +150,7 @@ class ProductSet:
     reconvolved_pbcor: np.ndarray | None = None
     points: list = None          # analytic point components, if fitted
     uncertainty_terms: dict | None = None   # the pieces of `uncertainty`
+    source_flux: dict | None = None         # `api._source_flux`: flux and its significance
 
 
 
@@ -306,7 +307,9 @@ def write_products(
             "ERRWHI": (_window(terms)[1],
                        "systematic window, dex above fitted lambda"),
             "ERRWMEA": (bool(terms) and terms.get("systematic_spread_dex") is None,
-                        "window measured from chi2, not fixed"),
+                        "window measured, not fixed"),
+            "ERRWMET": (str(terms.get("systematic_window_metric", "chi^2")),
+                        "window measured in chi2 or the structure ratio"),
             "ERRDEBL": (bool(terms.get("deblocked", False)),
                         "checkerboard replaced by its envelope"),
         }
@@ -321,7 +324,13 @@ def write_products(
             ]
         snr_stack = (np.stack([to_fits_orientation(s_) for s_ in snr])
                      if is_cube else to_fits_orientation(snr[0]))
-        w("snr.fits", snr_stack, hdr(n_img, geometry.pixel_scale, ""))
+        snr_extra = {
+            "SNRTYPE": ("per-pixel", "model / total 1-sigma, pixel by pixel"),
+            "COMMENT": "Per-pixel S/N reads low on a model sampled finer than the "
+                       "beam: neighbouring pixels are anticorrelated. Quote fluxes "
+                       "from regions; fit_parameters.json source_flux has one.",
+        }
+        w("snr.fits", snr_stack, hdr(n_img, geometry.pixel_scale, "", extra=snr_extra))
     if products[0].pb is not None:
         w("pb.fits", stack("pb"),
           hdr(n_img, geometry.pixel_scale, ""))

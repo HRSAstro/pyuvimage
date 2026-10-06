@@ -199,3 +199,57 @@ def test_the_loud_warning_still_wins_above_the_threshold(caplog):
         _report_dynamic_range(_at_ratio(2.0), 100_000, criterion="discrepancy")
     assert _lines(caplog, logging.WARNING)
     assert "--criterion structure" not in caplog.text
+
+
+# --- the systematic window of a `structure` fit ---------------------------------
+
+def test_the_structure_ratio_scatter_matches_noise_realisations():
+    """`structure_ratio_scatter` against the ratio's actual scatter over pure
+    noise: the systematic window of a `structure` fit uses it as its
+    tolerance, so it has to be the real noise scale, not a guess."""
+    from pyuvimage import mock
+    from pyuvimage.fitting import structure_ratio_scatter
+    from pyuvimage.pointsource import ARCSEC_TO_RAD
+
+    uvd, *_ = mock.make_demo_dataset(n_vis=600, point_flux_jy=0.0)
+    uv, d, n = uvd.flattened()
+    w = 1 / n.real ** 2
+    N, fov = 24, 3.0
+    pix = fov / N
+    iy, ix = np.mgrid[0:N, 0:N]
+
+    def phases(y, x):
+        return np.exp(2j * np.pi * ARCSEC_TO_RAD * (
+            np.outer(uv[:, 0], x.ravel()) + np.outer(uv[:, 1], y.ravel())))
+
+    E = phases(((N - 1) / 2 - iy) * pix, (ix - (N - 1) / 2) * pix)
+    beam = (np.real(w @ phases((N / 2 - iy) * pix, (ix - N / 2) * pix))
+            / w.sum()).reshape(N, N)
+    imager = SimpleNamespace(dirty_beam=beam, inside=np.ones((N, N), bool))
+    rms = 1 / np.sqrt(w.sum())
+    rng = np.random.default_rng(0)
+    ratios = []
+    for _ in range(400):
+        z = rng.normal(size=len(d)) * n.real + 1j * rng.normal(size=len(d)) * n.imag
+        ratios.append(np.std(np.real((w * z) @ E) / w.sum()) / rms)
+    assert structure_ratio_scatter(imager) == pytest.approx(np.std(ratios), rel=0.25)
+
+
+@pytest.mark.parametrize("criterion, metric", [
+    ("structure", "structure ratio"),
+    ("structure->evidence (ratio unreachable)", "structure ratio"),
+    ("structure->discrepancy (ratio unreachable)", "chi^2"),
+    ("discrepancy", "chi^2"),
+    ("discrepancy->evidence (unreachable target)", "chi^2"),
+    ("evidence", "chi^2"),
+])
+def test_the_window_is_measured_in_what_chose_the_strength(criterion, metric):
+    """On REBELS-25 (3e6 data) chi^2 moved < 400 across 12 decades against a
+    tolerance of 2442, so a chi^2 window opened to +/-6 dex and the
+    systematic swallowed the model (snr.fits <= 1.3 on a 15-sigma source).
+    A strength `structure` chose is bracketed by the structure ratio."""
+    from pyuvimage.fitting import PriorScan, SingleFit
+
+    sf = SingleFit(fit=None, geometry=None, prior={}, scan=PriorScan(criterion=criterion),
+                   imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
+    assert sf._window_metric()[0] == metric

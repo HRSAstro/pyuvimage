@@ -3,8 +3,17 @@
 [← back to the README](../README.md)
 
 One map, `uncertainty.fits`, in Jy/pixel: the best total 1σ per pixel the fit
-can estimate, so that `model.fits / uncertainty.fits` (written for you as
-`snr.fits`) is directly usable as a significance map.
+can estimate. `model.fits / uncertainty.fits` is written for you as
+`snr.fits`, but read it with care. It is a *per-pixel* significance, and on a
+model sampled finer than the beam neighbouring pixels are strongly
+anticorrelated: each one is poorly determined while their sum is not. On
+REBELS-25 (0.03" pixels, 0.24" beam) the peak pixel sits at ~3σ while the
+source is a 14.5σ detection. **Quote fluxes from regions.** Every run reports
+one: `source_flux` in `fit_parameters.json`, and a line in the log — the flux
+inside the region where the model convolved with the restoring beam exceeds
+3× the rms, with its statistical error from the full posterior covariance
+(`SingleFit.aperture_uncertainty`) and its prior systematic across the same
+window as the map (`aperture_systematic`).
 
 **What goes into it.** Two terms, added in quadrature, with the medians of
 each written to the FITS header so you can see the split without recomputing
@@ -13,9 +22,10 @@ anything:
 | term | header key | what it is | how it is obtained |
 |---|---|---|---|
 | statistical | `ERRSTAT` | how well the data pin this pixel down, given the prior | `sqrt(diag(M C M^T))` with `C = (F+H)^-1`, the closed-form posterior covariance |
-| prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed | how far the pixel moves when the regularisation strength is varied over the range χ² cannot distinguish |
+| prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed | how far the pixel moves when the regularisation strength is varied over the range the data cannot distinguish |
 | | `ERRWLO`, `ERRWHI` | (record that range, in dex either side of the fitted strength) | |
 | | `ERRWMEA` | (`T` if the range was measured, `F` if a fixed window was asked for) | |
+| | `ERRWMET` | (what the range was measured in: `chi^2` or `structure ratio`) | |
 | | `ERRDEBL` | (records that the checkerboard was removed) | |
 
 Rule of thumb from the mocks: the statistical term dominates in smooth
@@ -48,6 +58,21 @@ is within one σ(χ²) = √(2N) of the fitted strength's, found by walking outw
 in half decades. It is floored at ±0.5 dex — the walk cannot resolve a reach
 finer than one step, and this is the fixed window the method used before — and
 capped at ±6 dex, by which point the model no longer resembles the data.
+
+**When `structure` chose the strength, the window is measured in the
+structure ratio instead.** `--criterion auto` picks `structure` precisely
+because χ² has gone flat, and a flat χ² then declares every strength
+admissible. On REBELS-25 (3×10⁶ data points) χ² moved by less than 400 across
+twelve decades against σ(χ²) = 2442: the window opened to ±6 dex, the
+strongest prior in it had smoothed the source away, the systematic equalled
+the model everywhere, and `snr.fits` never exceeded 1.3 on a 15σ source. Over
+the same range the structure ratio went 0.80 → 1.48. So a `structure` fit's
+window is the set of strengths whose structure ratio is within its own noise
+scatter of the fitted one, σ(ratio) = √(Σ beam² / 2 n_pixels)
+(`structure_ratio_scatter`; checked against 300 noise realisations on three
+mocks to 10%). On REBELS-25 that is 0.027 and the window is ±0.5 dex. A fit
+that fell back from `structure` to `discrepancy` is in the weakly constrained
+regime where the ratio is not calibrated, and keeps the χ² window.
 
 **And the window is sampled, not just its edges.** A pixel's deviation is not
 monotonic in the scale factor: the model with the prior turned up to nonsense

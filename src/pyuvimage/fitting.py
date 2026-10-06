@@ -2920,6 +2920,31 @@ def structure_ratio(fit: ag.FitInterferometer, imager, n_data: int) -> float:
     return _structure_ratio_from_map(resid_map, chi2, imager, n_data)
 
 
+def structure_ratio_scatter(imager) -> float:
+    """The 1-sigma scatter of the structure ratio from noise alone.
+
+    The ratio is the rms of a residual map over its expectation. A residual
+    of pure noise is a Gaussian field whose correlation is the normalised
+    dirty beam rho, and the sample variance of such a field over an area A
+    has relative variance 2 int(rho^2) / A; the rms has half that relative
+    error, so
+
+        sigma(ratio) = sqrt( sum(beam^2) / (2 n_pixels) )
+
+    with the sums over the image grid. Checked against 300 noise
+    realisations on three mock configurations: 0.041 vs 0.045 predicted,
+    0.041 vs 0.047, 0.024 vs 0.023. On REBELS-25 (~190 beams in a 3.5" field)
+    it is 0.05.
+    """
+    beam = np.asarray(imager.dirty_beam, dtype=float)
+    inside = getattr(imager, "inside", None)
+    n_pixels = int(np.sum(inside)) if getattr(inside, "shape", None) == beam.shape \
+        else beam.size
+    if n_pixels <= 0:
+        return float("nan")
+    return float(np.sqrt(np.nansum(beam ** 2) / (2.0 * n_pixels)))
+
+
 def _structure_ratio(resid: np.ndarray, chi2: float, imager, n_data: int) -> float:
     """`structure_ratio` from the residual visibilities and chi^2 themselves."""
     try:
@@ -3448,10 +3473,49 @@ class SingleFit:
     #: it is caught ignoring the prior, and `fit_parameters.json` was
     #: reporting the request rather than what actually ran.
     positive_only: bool = True
+    #: the dirty imager, when the caller has one; the systematic window of a
+    #: `structure` fit is measured on residual maps (see `_admissible_scan`)
+    #: and builds one from the dataset otherwise
+    imager: object = field(default=None, repr=False, compare=False)
 
     @property
     def coefficient(self) -> float:
         return float(self.prior["coefficient"])
+
+    def _window_metric(self):
+        """What the systematic window is measured in: ``("chi^2", None)`` or
+        ``("structure ratio", imager)``.
+
+        chi^2 by default: a strength is admissible while chi^2 stays within
+        sqrt(2N) of the fitted value. That is the right test exactly where
+        chi^2 chose the strength, and the wrong one where `structure` did:
+        `--criterion auto` takes `structure` because chi^2 has gone flat, and
+        a flat chi^2 then declares every strength admissible. On REBELS-25
+        (3e6 data points) chi^2 moved by < 400 across 12 decades against a
+        tolerance of 2442, the window opened to +/-6 dex, the strongest prior
+        in it had smoothed the source to nothing, and the systematic equalled
+        the model everywhere: snr.fits never exceeded 1.3 on a 15-sigma source.
+        The structure ratio went 0.80 -> 1.48 over the same range.
+
+        So a fit whose strength `structure` chose has its window measured in
+        the structure ratio, with the ratio's own noise scatter as the
+        tolerance (`structure_ratio_scatter`). After a fallback to
+        `discrepancy` the fit is in the weakly constrained regime where the
+        ratio is not calibrated, and chi^2 is kept.
+        """
+        criterion = getattr(self.scan, "criterion", "") or ""
+        effective = getattr(self.scan, "effective_criterion", "")
+        if not criterion.startswith("structure") or effective == "discrepancy":
+            return "chi^2", None
+        imager = self.imager
+        if imager is None:
+            try:
+                imager = imager_for(self.fit.dataset)
+            except Exception as e:                # pragma: no cover
+                logger.debug("no imager for the structure window: %s", e)
+                return "chi^2", None
+            self.imager = imager
+        return "structure ratio", imager
 
     @property
     def system(self) -> LinearSystem:
@@ -3662,11 +3726,34 @@ class SingleFit:
             return -floor, floor, []
         if not np.isfinite(chi2_0):             # pragma: no cover - singular
             return -floor, floor, []
-        tolerance = np.sqrt(2.0 * system.n_data)
+        metric_name, imager = self._window_metric()
+        if imager is not None:
+            n_data = system.n_data
+
+            def metric(values) -> float:
+                chi2 = system.chi_squared(values)
+                return _structure_ratio_from_map(
+                    system.residual_dirty_image(values, imager), chi2,
+                    imager, n_data)
+
+            tolerance = structure_ratio_scatter(imager)
+            if not (np.isfinite(tolerance) and tolerance > 0):
+                metric_name, imager = "chi^2", None
+        if imager is None:
+            metric = system.chi_squared
+            tolerance = np.sqrt(2.0 * system.n_data)
+        try:
+            metric_0 = metric(base)
+        except Exception:                       # pragma: no cover - singular
+            return -floor, floor, []
+        if not np.isfinite(metric_0):           # pragma: no cover
+            return -floor, floor, []
+        self.__dict__["_systematic_window_metric"] = (metric_name, float(tolerance))
         logger.info(
             "measuring the prior-systematic window (%s solves in half-decade "
-            "steps, up to +/-%g dex)...",
+            "steps, up to +/-%g dex, until the %s moves by %.3g)...",
             "non-negative" if positive else "unconstrained", max_dex,
+            metric_name, tolerance,
         )
 
         lo = hi = 0.0
@@ -3678,7 +3765,7 @@ class SingleFit:
                 values = solved(dex)
                 if values is None:
                     break                       # the rescaled system is singular
-                moved = abs(system.chi_squared(values) - chi2_0)
+                moved = abs(metric(values) - metric_0)
                 if not np.isfinite(moved) or moved > tolerance:
                     break
                 reach = dex
@@ -3799,8 +3886,10 @@ class SingleFit:
             if spread_dex is None:
                 lo, hi, samples = self._admissible_scan()
                 window = (lo, hi)
-                # the walk already solved at each of these
-                images = (self._image_from_values(v) for _, v in samples)
+                # the walk already solved at each of these; kept for
+                # `aperture_systematic`, which needs the images, not a maximum
+                images = [self._image_from_values(v) for _, v in samples]
+                self.__dict__["_window_images"] = images
             else:
                 window = (-float(spread_dex), float(spread_dex))
                 images = (self.model_image_at_scale(10.0**d) for d in window)
@@ -3851,6 +3940,10 @@ class SingleFit:
                 float(spread_dex) if spread_dex is not None else None),
             "systematic_window_dex": list(
                 self.__dict__.get("_systematic_window_dex", (np.nan, np.nan))),
+            "systematic_window_metric": self.__dict__.get(
+                "_systematic_window_metric", ("chi^2", float("nan")))[0],
+            "systematic_window_tolerance": self.__dict__.get(
+                "_systematic_window_metric", ("chi^2", float("nan")))[1],
             "deblocked": bool(deblock),
         }
         return total, terms
@@ -3864,6 +3957,20 @@ class SingleFit:
                 return slice(start, start + n)
             start += n
         raise KeyError("linear object not found in the inversion")
+
+    def aperture_systematic(self, region: np.ndarray) -> float | None:
+        """The prior systematic on the summed flux inside a region [Jy]:
+        the largest change of that sum across the measured window (the same
+        sampled strengths as `prior_systematic`). None until the window has
+        been measured -- it is not walked again just for this."""
+        images = self.__dict__.get("_window_images")
+        if images is None:
+            return None
+        region = np.asarray(region, dtype=bool)
+        base = float(np.sum(self.model_image[region]))
+        return float(max(
+            (abs(float(np.sum(img[region])) - base) for img in images if img is not None),
+            default=0.0))
 
     def aperture_uncertainty(self, region: np.ndarray) -> float:
         """1-sigma uncertainty on the summed flux inside a region [Jy].

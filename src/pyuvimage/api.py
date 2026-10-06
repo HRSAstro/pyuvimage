@@ -892,6 +892,7 @@ def run(
         channel_chi2_per_datum=channel_chi2 if mode == "cube" else None,
         transformer_requested=transformer,
     )
+    parameters["source_flux"] = _source_flux_records(products)
     # the record says which path ran; `run_streamed` writes a dict here
     parameters["streaming"] = False
     parameters["reload"] = bool(reload)
@@ -1289,6 +1290,7 @@ def run_streamed(
         prior_thin=prior_thin,
         channel_chi2_per_datum=channel_chi2 if cube else None,
     )
+    parameters["source_flux"] = _source_flux_records(products)
     parameters["streaming"] = {
         "chunk_k": chunk_k, "n_visibilities_streamed": int(header.n_samples),
         "seconds_streaming": float(terms.seconds), "reload": bool(reload),
@@ -1828,6 +1830,81 @@ STRUCTURE_RATIO_OVERFIT = 0.85
 STRUCTURE_RATIO_SUGGEST = 1.25
 
 
+#: the source region for `_source_flux`: where the model convolved with the
+#: restoring beam exceeds this many times the image rms
+SOURCE_REGION_SIGMA = 3.0
+
+
+def _source_flux(sf, model_image, beam, rms, pixel_scale) -> dict | None:
+    """The model's flux in the source region, with its significance.
+
+    Per-pixel S/N (`snr.fits`) reads low on any model sampled finer than the
+    beam: neighbouring pixels are strongly anticorrelated, so each one is
+    poorly determined while their sum is not. On REBELS-25 the peak pixel was
+    at 4 sigma statistical while the source within 0.5" was at 14.5 sigma.
+    This reports the sum, with its proper error: the statistical part from
+    the full posterior covariance (`SingleFit.aperture_uncertainty`) and the
+    prior systematic as the largest change of the sum across the measured
+    window (`aperture_systematic`, available once the uncertainty map has
+    been made).
+
+    The region is where the model convolved with the restoring beam exceeds
+    `SOURCE_REGION_SIGMA` x rms, keeping only the connected piece around the
+    brightest pixel. It is computed from the model, not from the restored
+    image, so residual noise does not add islands. Point-augmented fits are
+    skipped: their mesh covariance is not the delivered model's.
+    """
+    from scipy import ndimage
+
+    if hasattr(sf, "solution") or not hasattr(sf, "aperture_uncertainty"):
+        return None
+    try:
+        smooth = beam_mod.restore(model_image, np.zeros_like(model_image),
+                                  beam, pixel_scale)
+        above = smooth > SOURCE_REGION_SIGMA * rms
+        if not above.any():
+            return None
+        labels, _ = ndimage.label(above)
+        peak = np.unravel_index(np.nanargmax(np.where(above, smooth, -np.inf)),
+                                smooth.shape)
+        region = labels == labels[peak]
+        flux = float(np.sum(model_image[region]))
+        stat = float(sf.aperture_uncertainty(region))
+        sys_ = sf.aperture_systematic(region)
+        total = float(np.hypot(stat, sys_)) if sys_ is not None else None
+    except Exception as e:                         # never let this kill a fit
+        logger.debug("source flux failed: %s", e)
+        return None
+    record = {
+        "region": f"model (x) restoring beam > {SOURCE_REGION_SIGMA:g} rms, "
+                  "connected to the peak",
+        "n_pixels": int(region.sum()),
+        "area_arcsec2": float(region.sum() * pixel_scale ** 2),
+        "flux_jy": flux,
+        "flux_error_stat_jy": stat,
+        "flux_error_sys_jy": sys_,
+        "flux_error_jy": total,
+        "snr_stat": flux / stat if stat > 0 else None,
+        "snr": flux / total if total else None,
+    }
+    logger.info(
+        "source flux %.4g Jy in %.3g arcsec^2 (%s): +- %.2g statistical%s = "
+        "%.1f sigma. Per-pixel S/N (snr.fits) is far lower on a model "
+        "sampled finer than the beam -- neighbouring pixels are "
+        "anticorrelated -- so quote fluxes from regions, not pixels.",
+        flux, record["area_arcsec2"], record["region"], stat,
+        "" if sys_ is None else f" +- {sys_:.2g} prior systematic",
+        record["snr"] if record["snr"] else record["snr_stat"],
+    )
+    return record
+
+
+def _source_flux_records(products):
+    """`fit_parameters.json`'s ``source_flux``: one record, or one per plane."""
+    records = [getattr(p, "source_flux", None) for p in products]
+    return records[0] if len(records) == 1 else records
+
+
 def _report_dynamic_range(
     p, n_data: int | None = None, criterion: str | None = None
 ) -> None:
@@ -1956,6 +2033,11 @@ def _products_for(
         resid_dirty = imager.dirty_image(resid_vis)
     uncertainty = None
     uncertainty_terms = None
+    # the systematic window of a `structure` fit is measured on residual maps;
+    # hand the fit the imager already built rather than have it build another
+    base_fit = getattr(sf, "_sf", sf)
+    if getattr(base_fit, "imager", "absent") is None:
+        base_fit.imager = imager
     if uncertainty_map:
         try:
             uncertainty, uncertainty_terms = sf.model_uncertainty_total()
@@ -1998,7 +2080,9 @@ def _products_for(
         model_pbcor = primary_beam.pb_correct(model_image, pb)
         reconvolved_pbcor = primary_beam.pb_correct(reconvolved, pb)
 
+    source_flux = _source_flux(sf, model_image, bf, rms, geometry.pixel_scale)
     return ProductSet(
+        source_flux=source_flux,
         model_mesh=model_mesh,
         model_image=model_image,
         uncertainty=uncertainty,
