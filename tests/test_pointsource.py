@@ -540,3 +540,35 @@ def test_an_unretuned_point_fit_reports_the_coefficient_unchanged():
     aug = PointAugmentedFit(mesh, SimpleNamespace(points=[],
                                                  regularization_factor=1.0))
     assert aug.prior["coefficient"] == pytest.approx(5.0e3)
+
+
+def test_the_snr_map_uses_the_joint_mesh_point_covariance():
+    """`PointAugmentedFit.beam_snr` builds the joint covariance of mesh and
+    amplitudes from the marginal pieces; it must be the inverse of the
+    bordered system (the cross-term is what keeps a point and the mesh under
+    it from being counted as independent)."""
+    from scipy.linalg import cho_solve
+
+    from pyuvimage import fitting, mock
+    from pyuvimage.beam import BeamFit
+    from pyuvimage.pointsource import PointAugmentedFit, fit_point_sources
+
+    uvd, _, geom, _ = mock.make_demo_dataset(n_vis=600, point_flux_jy=0.004, seed=3)
+    uv, d, n = uvd.flattened()
+    ds = fitting.make_dataset(uv, d, n, geom)
+    sf = fitting.fit_dataset(ds, geom, reg_kind="matern", positive_only=False,
+                             prior={"coefficient": 1e7, "scale": 0.25, "nu": 1.5})
+    sol = fit_point_sources(sf.fit.inversion, ds, geom, beam_fwhm=0.3)
+    assert sol.points
+    pa = PointAugmentedFit(sf, sol)
+    sysm = sol.system
+    P, B, _ = sysm._column_terms(sol.grid_positions)
+    C = sysm._point_gram(sol.grid_positions, None, P)
+    bordered = np.block([[sysm.F + sysm.h_scale * sysm.H, B], [B.T, C]])
+    Csa = -cho_solve(sysm._cho, B) @ sol.amplitude_covariance
+    joint = np.block([[pa.posterior_covariance, Csa], [Csa.T, sol.amplitude_covariance]])
+    inv = np.linalg.inv(bordered)
+    # 1e-10: the solve's ridge on the Schur complement
+    np.testing.assert_allclose(joint, inv, rtol=0, atol=1e-9 * np.abs(inv).max())
+    snr, sigma = pa.beam_snr(BeamFit(0.3, 0.3, 0.0))
+    assert np.isfinite(snr).all() and np.nanmax(snr) > 50

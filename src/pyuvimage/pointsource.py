@@ -1517,6 +1517,47 @@ class PointAugmentedFit:
         M_inv = cho_solve(sysm._cho, np.eye(sysm.n_mesh), check_finite=False)
         return M_inv @ sysm.F @ M_inv
 
+    def beam_snr(self, beam) -> tuple[np.ndarray, np.ndarray]:
+        """`SingleFit.beam_snr` for the extended model *plus* the points.
+
+        The points enter the smoothed model as the restoring beam at their
+        fitted positions -- exactly what the restored image adds -- and the
+        error uses the joint covariance of mesh and amplitudes, whose
+        cross-term matters: a point and the mesh under it trade flux, so
+        their errors are anticorrelated and adding them independently would
+        overstate the error at the point. The prior systematic is the mesh
+        fit's own window, as in `uncertainty.fits`.
+        """
+        from scipy.linalg import cho_solve
+        from scipy.signal import fftconvolve
+
+        from .beam import gaussian_kernel
+
+        sf, sol = self._sf, self.solution
+        if not sol.grid_positions:
+            return sf.beam_snr(beam)
+        kernel = gaussian_kernel(beam, sf.geometry.pixel_scale,
+                                 tuple(sf.geometry.shape_native))
+        sysm = sol.system
+        _, B, _ = sysm._column_terms(sol.grid_positions)
+        MinvB = cho_solve(sysm._cho, B, check_finite=False)
+        Caa = np.asarray(sol.amplitude_covariance)
+        Csa = -MinvB @ Caa
+        joint = np.block([[self.posterior_covariance, Csa], [Csa.T, Caa]])
+        geom = sf.geometry
+        unit = [restore_points(geom.shape_native, geom.pixel_scale,
+                               [PointSource(p.d_ra, p.d_dec, flux=1.0,
+                                            flux_error=0.0)], beam)
+                for p in self.points]
+        extra = np.asarray(unit)
+        smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
+        smooth = smooth + np.tensordot(np.asarray(sol.amplitudes), extra, axes=1)
+        stat = sf.smoothed_std(kernel, cov=joint, extra=extra)
+        sigma = np.hypot(stat, sf._smoothed_systematic(kernel))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            snr = np.where(sigma > 0, smooth / sigma, 0.0)
+        return snr, sigma
+
     @property
     def posterior_covariance(self) -> np.ndarray:
         """Mesh covariance marginalised over the point amplitudes.

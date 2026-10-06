@@ -54,7 +54,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `--no-uncertainty` | off (map **on**) | Skip `uncertainty.fits` and `snr.fits`. |
+| `--no-uncertainty` | off (map **on**) | Skip `uncertainty.fits` and `snr.fits` (the S/N map needs the prior-systematic window the uncertainty map measures). |
 
 **Solver / data**
 

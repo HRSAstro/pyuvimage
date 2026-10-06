@@ -151,6 +151,7 @@ class ProductSet:
     points: list = None          # analytic point components, if fitted
     uncertainty_terms: dict | None = None   # the pieces of `uncertainty`
     source_flux: dict | None = None         # `api._source_flux`: flux and its significance
+    snr: np.ndarray | None = None           # S/N at the restoring beam's resolution (`beam_snr`)
 
 
 
@@ -315,22 +316,27 @@ def write_products(
         }
         w("uncertainty.fits", stack("uncertainty"),
           hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra=unc_extra))
-        with np.errstate(invalid="ignore", divide="ignore"):
-            snr = [
-                np.where(p.uncertainty > 0, p.model_image / p.uncertainty, 0.0)
-                if p.uncertainty is not None
-                else np.full(np.shape(p.model_image), np.nan)
-                for p in products
-            ]
+        # S/N at the restoring beam's resolution, not model / uncertainty
+        # pixel by pixel: a model sampled finer than the beam has strongly
+        # anticorrelated neighbours, so the per-pixel ratio read ~1/3 of the
+        # true S/N on a 40-sigma mock disc and <= 1.3 on a 15-sigma source,
+        # with artefacts wherever the error map has structure
+        snr = [
+            p.snr if getattr(p, "snr", None) is not None
+            else np.full(np.shape(p.model_image), np.nan)
+            for p in products
+        ]
         snr_stack = (np.stack([to_fits_orientation(s_) for s_ in snr])
                      if is_cube else to_fits_orientation(snr[0]))
         snr_extra = {
-            "SNRTYPE": ("per-pixel", "model / total 1-sigma, pixel by pixel"),
-            "COMMENT": "Per-pixel S/N reads low on a model sampled finer than the "
-                       "beam: neighbouring pixels are anticorrelated. Quote fluxes "
-                       "from regions; fit_parameters.json source_flux has one.",
+            "SNRTYPE": ("beam", "model (x) restoring beam / its own 1-sigma"),
+            "COMMENT": "S/N at the resolution of the restoring beam (BMAJ, BMIN, "
+                       "BPA): the model convolved with the beam, over the 1-sigma "
+                       "of that smoothed model from the full posterior covariance "
+                       "plus the prior systematic. Points are included.",
         }
-        w("snr.fits", snr_stack, hdr(n_img, geometry.pixel_scale, "", extra=snr_extra))
+        w("snr.fits", snr_stack, hdr(n_img, geometry.pixel_scale, "",
+                                     beam=products[0].beam, extra=snr_extra))
     if products[0].pb is not None:
         w("pb.fits", stack("pb"),
           hdr(n_img, geometry.pixel_scale, ""))

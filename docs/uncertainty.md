@@ -3,12 +3,31 @@
 [← back to the README](../README.md)
 
 One map, `uncertainty.fits`, in Jy/pixel: the best total 1σ per pixel the fit
-can estimate. `model.fits / uncertainty.fits` is written for you as
-`snr.fits`, but read it with care. It is a *per-pixel* significance, and on a
-model sampled finer than the beam neighbouring pixels are strongly
-anticorrelated: each one is poorly determined while their sum is not. On
-REBELS-25 (0.03" pixels, 0.24" beam) the peak pixel sits at ~3σ while the
-source is a 14.5σ detection. **Quote fluxes from regions.** Every run reports
+can estimate. **It is not the denominator of a significance map.** On a model
+sampled finer than the beam neighbouring pixels are strongly anticorrelated:
+each one is poorly determined while their sum is not. On REBELS-25 (0.03"
+pixels, 0.24" beam) `model / uncertainty` peaked at ~3 on a 14.5σ source, and
+on a 40σ mock disc at 12.6.
+
+**`snr.fits` is S/N at the restoring beam's resolution** (`SingleFit.beam_snr`):
+the model convolved with the restoring beam — the restored image without its
+residuals, in Jy/beam — over the 1σ of *that smoothed model*. The statistical
+part is propagated from the full posterior covariance, sqrt(diag(K M C Mᵀ Kᵀ))
+(`smoothed_std`), never by smoothing the per-pixel error map; the prior
+systematic is the largest change of the smoothed model across the same
+measured window as `uncertainty.fits`. With point components the points are
+added as the restoring beam at their fitted positions, and the error uses the
+joint covariance of mesh and amplitudes, whose cross-term is negative (a
+point and the mesh beneath it trade flux). On the mock disc it peaks at 40.8
+against a true 39.3 and 9.6 → 11.1 at a quarter of the brightness, with the
+3σ and 5σ contours where the truth puts them; on REBELS-25 the peak is 10
+(`figures/snr_maps_mock.png`, made by `scripts/figure_snr_maps.py`). Where the
+prior systematic dominates — the slope of a bright compact source, which moves
+most with the prior strength — the map dips, honestly: 18σ against a true 27σ
+at 0.25″ from the peak of the bright mock. The header carries the beam it
+refers to.
+
+**For a number to quote, use a region.** Every run reports
 one: `source_flux` in `fit_parameters.json`, and a line in the log — the flux
 inside the region where the model convolved with the restoring beam exceeds
 3× the rms, with its statistical error from the full posterior covariance

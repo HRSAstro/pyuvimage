@@ -3611,6 +3611,90 @@ class SingleFit:
             ).native
         )
 
+    def smoothed_std(self, kernel: np.ndarray, cov: np.ndarray | None = None,
+                     extra: np.ndarray | None = None, batch: int = 64) -> np.ndarray:
+        """sqrt(diag(K M C M^T K^T)): the 1-sigma of the model convolved with
+        `kernel`, on the native image grid, from the full covariance.
+
+        Smoothing the per-pixel error map instead would be wrong, and badly:
+        the posterior is strongly correlated between neighbouring pixels
+        (anticorrelated across the interpolation), so the error of a sum is
+        nothing like the sum of the errors. With C = L L^T the variance is the
+        sum over L's columns of the squared smoothed image of M L[:, j], so
+        the image-by-mesh matrix K M is never held -- a batch of columns at a
+        time, `batch` FFT convolutions per step.
+
+        ``cov`` defaults to `posterior_covariance` (the same covariance as
+        `model_uncertainty`). ``extra``, shape (k, Ny, Nx), appends k more
+        parameters whose images are already smoothed -- analytic point
+        components, whose columns of ``cov`` follow the mesh's
+        (`PointAugmentedFit.beam_snr`).
+        """
+        from scipy.signal import fftconvolve
+
+        cov = self.posterior_covariance if cov is None else np.asarray(cov)
+        try:
+            L = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            w, V = np.linalg.eigh(0.5 * (cov + cov.T))
+            L = V * np.sqrt(np.clip(w, 0.0, None))
+        mask = self.fit.dataset.real_space_mask
+        shape = tuple(int(n) for n in self.geometry.shape_native)
+        unmasked = np.flatnonzero(~np.asarray(mask).astype(bool).ravel())
+        objs = [(np.asarray(obj.mapping_matrix), self._parameter_slice(obj))
+                for obj, _ in self.fit.inversion.reconstruction_dict.items()]
+        n_mesh = sum(sl.stop - sl.start for _, sl in objs)
+        var = np.zeros(shape)
+        for lo in range(0, L.shape[1], batch):
+            cols = slice(lo, min(lo + batch, L.shape[1]))
+            k = cols.stop - cols.start
+            slim = sum(M @ L[sl, cols] for M, sl in objs)          # (n_slim, k)
+            native = np.zeros((k, shape[0] * shape[1]))
+            native[:, unmasked] = slim.T
+            img = fftconvolve(native.reshape(k, *shape), kernel[None],
+                              mode="same", axes=(1, 2))
+            if extra is not None and len(extra):
+                img = img + np.tensordot(L[n_mesh:, cols].T, extra, axes=1)
+            var += np.sum(img ** 2, axis=0)
+        return np.sqrt(var)
+
+    def beam_snr(self, beam) -> tuple[np.ndarray, np.ndarray]:
+        """(S/N, 1-sigma) of the model at the resolution of the restoring
+        `beam` (a `beam.BeamFit`).
+
+        The model convolved with the (peak-normalised) restoring beam, over
+        its own error: the statistical part from the full covariance
+        (`smoothed_std`) and the prior systematic as the largest change of
+        the smoothed model across the measured window -- the window
+        `prior_systematic` walked, so this needs the uncertainty map first
+        and is statistical only otherwise. `snr.fits`. The smoothing is the
+        restored image's own (`beam.restore`), so the numerator is the
+        restored image without its residuals, in Jy/beam.
+        """
+        from scipy.signal import fftconvolve
+
+        from .beam import gaussian_kernel
+
+        kernel = gaussian_kernel(beam, self.geometry.pixel_scale,
+                                 tuple(self.geometry.shape_native))
+        smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
+        stat = self.smoothed_std(kernel)
+        sigma = np.hypot(stat, self._smoothed_systematic(kernel))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            snr = np.where(sigma > 0, smooth / sigma, 0.0)
+        return snr, sigma
+
+    def _smoothed_systematic(self, kernel: np.ndarray) -> np.ndarray:
+        from scipy.signal import fftconvolve
+
+        base = np.nan_to_num(self.model_image)
+        worst = np.zeros_like(base)
+        for img in self.__dict__.get("_window_images") or []:
+            if img is not None:
+                worst = np.maximum(worst, np.abs(fftconvolve(
+                    np.nan_to_num(img) - base, kernel, mode="same")))
+        return worst
+
     @functools.cached_property
     def model_uncertainty_sampling(self) -> np.ndarray:
         """1-sigma scatter of the model image over noise realisations.

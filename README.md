@@ -61,7 +61,7 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `model_reconvolved_pbcor.fits` | Jy/beam | primary-beam-corrected version of it |
 | `residual.fits` | σ | (data − model) dirty image / rms (rms in header `RMS`) |
 | `uncertainty.fits` | Jy/pixel | total 1σ per pixel — see below |
-| `snr.fits` | — | `model / uncertainty`, ready to use as a significance map |
+| `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (full covariance plus prior systematic), points included |
 | `dirty_image.fits` | Jy/beam | naturally weighted dirty image of the data |
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
 | `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D), centred on the phase centre — not on the image centre when `--image-centre` is used |
@@ -141,9 +141,12 @@ residual of 3.9–5.0σ; see [docs/design-notes.md](docs/design-notes.md).
 
 ## The uncertainty map
 
-`uncertainty.fits` is the total 1σ per pixel, so `snr.fits` (written for you)
-is directly usable as a significance map. Two terms, added in quadrature, with
-the median of each in the FITS header:
+`uncertainty.fits` is the total 1σ per pixel. Do not divide the model by it
+for a significance map: on a model sampled finer than the beam, neighbouring
+pixels are strongly anticorrelated and the per-pixel ratio reads far too low.
+`snr.fits` is the significance map, at the restoring beam's resolution (see
+[docs/uncertainty.md](docs/uncertainty.md)). Two terms, added in quadrature,
+with the median of each in the FITS header:
 
 | term | header key | what it answers |
 |---|---|---|

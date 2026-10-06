@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -2081,7 +2082,18 @@ def _products_for(
         reconvolved_pbcor = primary_beam.pb_correct(reconvolved, pb)
 
     source_flux = _source_flux(sf, model_image, bf, rms, geometry.pixel_scale)
+    snr = None
+    if uncertainty is not None and hasattr(sf, "beam_snr"):
+        started = time.time()
+        try:
+            snr, _ = sf.beam_snr(bf)
+            logger.info(
+                "S/N map at the restoring beam's resolution: peak %.1f (%.0f s)",
+                float(np.nanmax(snr)), time.time() - started)
+        except Exception as e:          # never let the S/N map kill a fit
+            logger.warning("S/N map failed: %s: %s", type(e).__name__, e)
     return ProductSet(
+        snr=snr,
         source_flux=source_flux,
         model_mesh=model_mesh,
         model_image=model_image,

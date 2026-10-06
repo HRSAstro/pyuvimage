@@ -253,3 +253,44 @@ def test_the_window_is_measured_in_what_chose_the_strength(criterion, metric):
     sf = SingleFit(fit=None, geometry=None, prior={}, scan=PriorScan(criterion=criterion),
                    imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
     assert sf._window_metric()[0] == metric
+
+
+# --- snr.fits: S/N at the restoring beam's resolution ---------------------------
+
+def test_the_smoothed_error_uses_the_full_covariance():
+    """`smoothed_std` is sqrt(diag(K M C M^T K^T)), computed without ever
+    forming K M: checked against the explicit product on a small fit. A
+    pixel's error smoothed afterwards would be a different (wrong) number."""
+    import logging as _logging
+    from scipy.signal import fftconvolve
+
+    from pyuvimage import fitting, mock
+    from pyuvimage.beam import BeamFit, gaussian_kernel
+
+    _logging.disable(_logging.CRITICAL)
+    try:
+        uvd, _, geom, _ = mock.make_demo_dataset(n_vis=300, mesh_n=8, seed=2)
+        uv, d, n = uvd.flattened()
+        ds = fitting.make_dataset(uv, d, n, geom)
+        sf = fitting.fit_dataset(ds, geom, reg_kind="matern",
+                                 prior={"coefficient": 1e6, "scale": 0.4, "nu": 1.5},
+                                 positive_only=False)
+    finally:
+        _logging.disable(_logging.NOTSET)
+    beam = BeamFit(bmaj_arcsec=0.5, bmin_arcsec=0.4, bpa_deg=30.0)
+    shape = tuple(sf.geometry.shape_native)
+    kernel = gaussian_kernel(beam, sf.geometry.pixel_scale, shape)
+    (obj, _), = list(sf.fit.inversion.reconstruction_dict.items())
+    M = np.asarray(obj.mapping_matrix)
+    KM = np.stack([fftconvolve(M[:, j].reshape(shape), kernel, mode="same").ravel()
+                   for j in range(M.shape[1])], axis=1)
+    want = np.sqrt(np.einsum("ij,jk,ik->i", KM, sf.posterior_covariance, KM)).reshape(shape)
+    got = sf.smoothed_std(kernel, batch=7)
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-12 * want.max())
+    smoothed_pixel_errors = fftconvolve(sf.model_uncertainty, kernel, mode="same")
+    assert not np.allclose(smoothed_pixel_errors, want, rtol=0.1)
+
+    snr, sigma = sf.beam_snr(beam)
+    smooth = fftconvolve(sf.model_image, kernel, mode="same")
+    np.testing.assert_allclose(snr * sigma, smooth, rtol=1e-10, atol=1e-14)
+    assert np.all(sigma >= want - 1e-15)    # the systematic only ever adds
