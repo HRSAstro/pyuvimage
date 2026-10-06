@@ -1,0 +1,143 @@
+---
+ src/pyuvimage/streaming.py | 80 ++++++++++++++++++++++++--------------
+ 1 file changed, 51 insertions(+), 29 deletions(-)
+
+diff --git a/src/pyuvimage/streaming.py b/src/pyuvimage/streaming.py
+index bf092cf..e5131cb 100644
+--- a/src/pyuvimage/streaming.py
++++ b/src/pyuvimage/streaming.py
+@@ -70,14 +70,23 @@ NUFFT_BATCH = 65536
+ NUFFT_EPS = 1.0e-12
+ 
+ 
+-def nufftax_available() -> bool:
++def _nufftax():
++    """The nufftax module, or None.
++
++    Imported directly rather than through autoarray's private loader, which
++    not every autoarray release has (Hannah's did not: collection failed on
++    `su._load_nufftax`). Its only extra is a vmap shim this module never
++    needs -- every transform here is a single unbatched call.
++    """
+     try:
+-        from autoarray.inversion.inversion.interferometer import (
+-            inversion_interferometer_util as su,
+-        )
+-    except Exception:  # pragma: no cover
+-        return False
+-    return su._load_nufftax() is not None
++        import nufftax
++    except Exception:
++        return None
++    return nufftax
++
++
++def nufftax_available() -> bool:
++    return _nufftax() is not None
+ 
+ 
+ def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
+@@ -103,12 +112,11 @@ def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
+     modes ``m in [-N/2, N/2)``; rows run toward -y, so ``y_k`` enters with a
+     minus sign, and the half-pixel offset of an image grid is a phase on c.
+     """
+-    from autoarray.inversion.inversion.interferometer import (
+-        inversion_interferometer_util as su,
+-    )
+     import jax.numpy as jnp
+ 
+-    nufftax = su._load_nufftax()
++    nufftax = _nufftax()
++    if nufftax is None:
++        raise RuntimeError("type1_image needs nufftax")
+     ny, nx = (int(v) for v in shape)
+     if ny % 2 or nx % 2:
+         raise ValueError(f"type1_image needs even sizes, got {shape}")
+@@ -126,6 +134,34 @@ def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
+     return np.asarray(np.real(f), dtype=np.float64)
+ 
+ 
++def kernel_image(uv: np.ndarray, weights: np.ndarray, shape: tuple[int, int],
++                 pixel_scale_arcsec: float, eps: float = NUFFT_EPS,
++                 zero_nyquist: bool = True) -> np.ndarray:
++    """The w-tilde preload K(lag) = sum w cos(2 pi u.lag), (2Ny, 2Nx), in
++    autoarray's FFT-wrapped order: index (i, j) is the lag (dy, dx) = (+i, -j)
++    pixels, wrapped. `nufft_precision_operator_from`'s array, by one type-1
++    NUFFT -- built here so the fast path depends on no particular autoarray
++    release's builder signature, only on nufftax.
++
++    K is even, so (+i, -j) reads the same as (-i, +j), which on the centred
++    grid of `type1_image` is row Ny + i, column Nx + j; `ifftshift` moves that
++    to (i, j).
++
++    autoarray leaves the lag of exactly +-N pixels (row Ny, column Nx) at
++    zero -- it is ambiguous, and no pixel pair in the image is that far
++    apart -- and ``zero_nyquist`` matches it. The point grids keep it: their
++    spline reads across it.
++    """
++    ny, nx = (int(v) for v in shape)
++    centred = type1_image(uv, np.asarray(weights, dtype=np.complex128),
++                          (2 * ny, 2 * nx), pixel_scale_arcsec, centred=True, eps=eps)
++    out = np.fft.ifftshift(centred)
++    if zero_nyquist:
++        out[ny, :] = 0.0
++        out[:, nx] = 0.0
++    return out
++
++
+ #: the fine kernel's lag margin beyond one field width, as a fraction of it
+ #: (see `TermsAccumulator`); a quarter covers 4 sigma of the widest Gaussian
+ #: the unresolved test tries (1.5 beam sigma) once the field is ~4 beams
+@@ -726,8 +762,6 @@ class TermsAccumulator:
+             # the circular convolution must find the sky there, not the
+             # opposite edge (3.5% on Dp at 0.27" from the edge of a 3" field)
+             self.dirty_fine = np.zeros((2 * fine[0], 2 * fine[1]), dtype=np.float64)
+-            # only the pixel spacing of this grid is used by the builder
+-            self.grid_radians_fine = np.asarray(self.grid_radians)[:2, :2] / self.q
+         self._buf: list = []
+         self._buf_n = 0
+ 
+@@ -792,23 +826,15 @@ class TermsAccumulator:
+         """The buffered samples' contribution to every image term."""
+         if not self._buf:
+             return
+-        from autoarray.inversion.inversion.interferometer import (
+-            inversion_interferometer_util as sparse_util,
+-        )
+-
+         uv = np.concatenate([b[0] for b in self._buf])
+         d = np.concatenate([b[1] for b in self._buf])
+         sr = np.concatenate([b[2] for b in self._buf])
+         si = np.concatenate([b[3] for b in self._buf])
+         self._buf, self._buf_n = [], 0
+         pix = float(self.geometry.pixel_scale)
+-        self.kernel += np.asarray(sparse_util.nufft_precision_operator_from(
+-            noise_map_real=sr, uv_wavelengths=uv,
+-            shape_masked_pixels_2d=self.shape, grid_radians_2d=self.grid_radians,
+-            method="nufft", eps=NUFFT_EPS,
+-        ))
+-        weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
+         w = sr ** -2.0
++        self.kernel += kernel_image(uv, w, self.shape, pix)
++        weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
+         dirty = type1_image(uv, weighted, self.shape, pix)
+         self.dirty += dirty
+         self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
+@@ -817,12 +843,8 @@ class TermsAccumulator:
+         self.data_dirty += (dirty if np.array_equal(sr, si)
+                             else type1_image(uv, d * w, self.shape, pix))
+         if self.q:
+-            self.kernel_fine += np.asarray(sparse_util.nufft_precision_operator_from(
+-                noise_map_real=sr, uv_wavelengths=uv,
+-                shape_masked_pixels_2d=self.kernel_fine_shape,
+-                grid_radians_2d=self.grid_radians_fine,
+-                method="nufft", eps=NUFFT_EPS,
+-            ))
++            self.kernel_fine += kernel_image(
++                uv, w, self.kernel_fine_shape, pix / self.q, zero_nyquist=False)
+             self.dirty_fine += type1_image(
+                 uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
+ 
+-- 
+2.43.0
+

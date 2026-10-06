@@ -1,0 +1,183 @@
+From 95e27a89c91d6929660858e4a380c5fdb7912b8a Mon Sep 17 00:00:00 2001
+From: HRSAstro <hrstacey@icloud.com>
+Date: Tue, 6 Oct 2026 18:24:24 +0000
+Subject: [PATCH] Cube channels measure the systematic window by the MFS
+ criterion
+
+Frozen-prior fits had no scan, so the window fell back to chi^2 and
+opened to +/-6 dex (24 non-negative solves per channel on REBELS-25).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8
+---
+ src/pyuvimage/api.py          |  5 +++++
+ src/pyuvimage/fitting.py      | 33 +++++++++++++++++++++++++++++++--
+ tests/test_structure_ratio.py | 34 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+), 2 deletions(-)
+
+diff --git a/src/pyuvimage/api.py b/src/pyuvimage/api.py
+index f1e7d7a..772090e 100644
+--- a/src/pyuvimage/api.py
++++ b/src/pyuvimage/api.py
+@@ -771,6 +771,7 @@ def run(
+         _report_dynamic_range(products[0], n_data_all, criterion)
+     else:
+         frozen = dict(mfs_fit.prior)
++        window_criterion = getattr(mfs_fit, "criterion_used", None)
+         # Points carried into the cube: the MFS pass decides *where* they
+         # are, each channel fits its own amplitude at those fixed positions.
+         # Until 1 Sep 2026 the channels were fitted with no point components
+@@ -844,6 +845,8 @@ def run(
+                 ds_c, geometry, reg_kind=reg, prior=frozen,
+                 positive_only=positive_only, enforce_positive=enforce_positive,
+                 criterion=criterion, nu=nu,
++                # the window is measured the way the MFS chose the prior
++                window_criterion=window_criterion,
+                 envelope=envelope,
+                 chi2_target=chi2_target,
+                 # one summary line per channel below; the per-fit warning
+@@ -1236,6 +1239,7 @@ def run_streamed(
+     else:
+         # -- the channels: `run`'s cube loop, each on its own stub ----------
+         frozen = dict(mfs_fit.prior)
++        window_criterion = getattr(mfs_fit, "criterion_used", None)
+         logger.info(
+             "cube mode: source prior frozen from the MFS fit (%s)",
+             ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
+@@ -1265,6 +1269,7 @@ def run_streamed(
+                 stub_c, geometry, reg_kind=reg, prior=frozen,
+                 positive_only=positive_only, enforce_positive=enforce_positive,
+                 criterion=criterion, nu=nu, envelope=envelope,
++                window_criterion=window_criterion,
+                 chi2_target=chi2_target, warn_on_chi2=False,
+             )
+             n_data_c = 2 * int(terms_c.n_vis)
+diff --git a/src/pyuvimage/fitting.py b/src/pyuvimage/fitting.py
+index 802b0dc..b627d3b 100644
+--- a/src/pyuvimage/fitting.py
++++ b/src/pyuvimage/fitting.py
+@@ -3477,6 +3477,10 @@ class SingleFit:
+     #: `structure` fit is measured on residual maps (see `_admissible_scan`)
+     #: and builds one from the dataset otherwise
+     imager: object = field(default=None, repr=False, compare=False)
++    #: the criterion that chose the prior when this fit did not choose it
++    #: itself (`scan` is None): a cube channel, whose prior is frozen from the
++    #: MFS fit, measures its systematic window the way the MFS did
++    window_criterion: str = ""
+ 
+     @property
+     def coefficient(self) -> float:
+@@ -3502,9 +3506,16 @@ class SingleFit:
+         tolerance (`structure_ratio_scatter`). After a fallback to
+         `discrepancy` the fit is in the weakly constrained regime where the
+         ratio is not calibrated, and chi^2 is kept.
++
++        A fit with a frozen prior has no scan of its own and follows
++        `window_criterion`, the criterion of the fit its prior came from. Cube
++        channels used to fall back to chi^2 here, and on REBELS-25 every
++        channel's window then opened to +/-6 dex: 24 non-negative solves per
++        channel, most of the cube's run time, and a systematic as large as
++        the model.
+         """
+-        criterion = getattr(self.scan, "criterion", "") or ""
+-        effective = getattr(self.scan, "effective_criterion", "")
++        criterion = self.criterion_used
++        effective = PriorScan(criterion=criterion).effective_criterion
+         if not criterion.startswith("structure") or effective == "discrepancy":
+             return "chi^2", None
+         imager = self.imager
+@@ -3517,6 +3528,14 @@ class SingleFit:
+             self.imager = imager
+         return "structure ratio", imager
+ 
++    @property
++    def criterion_used(self) -> str:
++        """The criterion that chose this fit's prior: its own scan's, or the
++        one handed down with a frozen prior (`window_criterion`)."""
++        if self.scan is not None:
++            return getattr(self.scan, "criterion", "") or ""
++        return self.window_criterion or ""
++
+     @property
+     def system(self) -> LinearSystem:
+         """F, D and the constants this fit was solved on (see `LinearSystem`)."""
+@@ -4131,6 +4150,7 @@ def fit_dataset(
+     chi2_target: float = 1.0,
+     warn_on_chi2: bool = True,
+     system: LinearSystem | None = None,
++    window_criterion: str | None = None,
+ ) -> SingleFit:
+     """Fit one Interferometer dataset (one channel, or the MFS stack).
+ 
+@@ -4150,6 +4170,11 @@ def fit_dataset(
+     ``system`` is the coefficient-invariant `LinearSystem` for this dataset
+     and mesh. Built here when not given; the adaptive first pass hands its own
+     to the second so F and D are built once per fit, not once per stage.
++
++    ``window_criterion`` is, for a fixed ``prior``, the criterion that chose
++    it (the MFS fit's `SingleFit.criterion_used` for a cube channel); the
++    systematic window is measured by it (`SingleFit._window_metric`). Without
++    it a fixed prior is taken as chosen by ``criterion`` once resolved.
+     """
+     mesh_shape = geometry.mesh_shape
+     n_data = n_data_of(dataset)
+@@ -4578,7 +4603,11 @@ def fit_dataset(
+                 chi2_final / n_data, chi2_target,
+             )
+ 
++    if scan is None and window_criterion is None:
++        window_criterion = resolve_criterion(
++            criterion, n_data, int(np.prod(mesh_shape)))
+     return SingleFit(
+         fit=fit, geometry=geometry, prior=prior, scan=scan,
+         positive_only=bool(positive_only),
++        window_criterion=window_criterion or "",
+     )
+diff --git a/tests/test_structure_ratio.py b/tests/test_structure_ratio.py
+index 945d8e0..ae864dd 100644
+--- a/tests/test_structure_ratio.py
++++ b/tests/test_structure_ratio.py
+@@ -255,6 +255,40 @@ def test_the_window_is_measured_in_what_chose_the_strength(criterion, metric):
+     assert sf._window_metric()[0] == metric
+ 
+ 
++@pytest.mark.parametrize("criterion, metric", [
++    ("structure", "structure ratio"),
++    ("structure->discrepancy (ratio unreachable)", "chi^2"),
++    ("discrepancy", "chi^2"),
++    ("", "chi^2"),
++])
++def test_a_frozen_prior_window_follows_the_criterion_that_chose_it(criterion, metric):
++    """Cube channels have no scan (the prior is frozen from the MFS fit). They
++    fell back to chi^2, and on REBELS-25 each channel's window opened to
++    +/-6 dex: 24 non-negative solves per channel, most of the run time."""
++    from pyuvimage.fitting import SingleFit
++
++    sf = SingleFit(fit=None, geometry=None, prior={}, scan=None,
++                   window_criterion=criterion,
++                   imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
++    assert sf.criterion_used == criterion
++    assert sf._window_metric()[0] == metric
++
++
++def test_fit_dataset_records_the_criterion_of_a_fixed_prior():
++    from pyuvimage import fitting, mock
++
++    uvd, _, geometry, _ = mock.make_demo_dataset(n_vis=60, mesh_n=8, seed=5)
++    uv, d, n = uvd.flattened()
++    ds = fitting.make_dataset(uv, d, n, geometry, transformer="dft")
++    prior = {"coefficient": 1.0, "scale": 0.3}
++    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
++                             positive_only=False)
++    assert sf.scan is None and sf.criterion_used == "structure"
++    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
++                             positive_only=False, window_criterion="discrepancy")
++    assert sf.criterion_used == "discrepancy"
++
++
+ # --- snr.fits: S/N at the restoring beam's resolution ---------------------------
+ 
+ def test_the_smoothed_error_uses_the_full_covariance():
+-- 
+2.43.0
+

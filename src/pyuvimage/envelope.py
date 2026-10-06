@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from autoarray.inversion.regularization.abstract import AbstractRegularization
 from autoarray.inversion.regularization.matern_kernel import (
     MaternKernel,
     apply_jitter,
@@ -465,3 +466,104 @@ def _cached_gibbs_inverse(pts, ell, weights, jitter, key):
         _COV_CACHE.pop(next(iter(_COV_CACHE)))
     _COV_CACHE[ckey] = inv
     return inv
+
+
+class PrimaryBeamPrior(AbstractRegularization):
+    """A source prior on the **true** sky, applied to the apparent-sky model.
+
+    The model pyuvimage solves for is the apparent sky ``a = P t``: the true
+    sky ``t`` times the primary beam ``P = diag(pb)`` at each mesh pixel. A
+    prior ``H`` placed directly on ``a`` (the default) treats the dimmed
+    emission near the edge of the PB as genuinely faint, so a source reaching
+    the PB edge is smoothed and suppressed there by a prior that knows nothing
+    about the dish.
+
+    Putting the PB into the response instead -- ``A' = A P``, solving for
+    ``t`` -- gives ``F' = P F P`` and ``D' = P D``. Rewritten for ``a`` that is
+
+        (F + P^-1 H P^-1) a = D
+
+    so folding the PB into F is exactly this prior on the apparent sky: ``H``
+    on the true sky, carried to ``a`` by the change of variables. Nothing else
+    changes -- F, D, the solvers, positivity (pb > 0), chi^2 and the products
+    (``model`` is still apparent, ``model_pbcor = model / pb``). The evidence
+    is the evidence of the true-sky prior, because the marginal likelihood
+    does not depend on how the model is parameterised.
+
+    Valid while the PB is constant across one mesh pixel (it varies on the
+    PB scale, ~25 arcsec at ALMA band 6; mesh pixels are ~0.05 arcsec).
+
+    The PB is a Gaussian of FWHM ``fwhm`` [arcsec] centred at ``centre``
+    ``(y, x)`` [arcsec] in the mesh's own coordinates (the phase centre:
+    ``(-y0, -x0)`` after a recentre by ``(y0, x0)``), evaluated on the mesh
+    pixel centres themselves -- autoarray's rectangular mesh spans the image
+    grid's pixel *centres*, so its pixels are not quite the field / n_mesh a
+    grid computed from the geometry would assume. Clipped below at ``floor``:
+    without one a pixel at pb -> 0 is pinned to zero by a prior weight of
+    1/pb^2, and the matrix's conditioning goes with it.
+
+    An adaptive inner prior (`AdaptiveMatern`, `GibbsMatern`) follows a
+    first-pass model, which is apparent; its brightness map is divided by the
+    PB on first use, so that it too describes the true sky.
+    """
+
+    def __init__(self, inner, fwhm: float, centre=(0.0, 0.0), floor: float = 0.1):
+        super().__init__()
+        self.inner = inner
+        self.fwhm = float(fwhm)
+        self.centre = (float(centre[0]), float(centre[1]))
+        self.floor = float(floor)
+        self.pb = None
+
+    def __getattr__(self, item):
+        # coefficient, scale, nu, ... are the inner prior's
+        if item in ("inner", "pb", "fwhm", "centre", "floor"):
+            raise AttributeError(item)
+        return getattr(self.inner, item)
+
+    def __eq__(self, other):
+        return (isinstance(other, PrimaryBeamPrior) and self.inner == other.inner
+                and (self.fwhm, self.centre, self.floor)
+                == (other.fwhm, other.centre, other.floor))
+
+    def __hash__(self):
+        return id(self)
+
+    def pb_at(self, yx: np.ndarray) -> np.ndarray:
+        """The PB at ``(y, x)`` positions [arcsec], floored."""
+        yx = np.asarray(yx, dtype=float)
+        sigma = self.fwhm / SIGMA_TO_FWHM
+        r2 = (yx[:, 0] - self.centre[0]) ** 2 + (yx[:, 1] - self.centre[1]) ** 2
+        return np.clip(np.exp(-0.5 * r2 / sigma**2), self.floor, 1.0)
+
+    def _pb_for(self, linear_obj) -> np.ndarray:
+        yx = np.asarray(linear_obj.source_plane_mesh_grid.array)
+        if self.pb is None or self.pb.size != yx.shape[0]:
+            self.pb = self.pb_at(yx)
+            b = getattr(self.inner, "brightness", None)
+            if b is not None and np.size(b) == self.pb.size:
+                t = np.asarray(b, dtype=float) / self.pb
+                self.inner.brightness = t / (t.max() if t.max() > 0 else 1.0)
+        return self.pb
+
+    def regularization_matrix_from(self, linear_obj, xp=np) -> np.ndarray:
+        r = 1.0 / self._pb_for(linear_obj)
+        H = self.inner.regularization_matrix_from(linear_obj, xp=xp)
+        return H * r[:, None] * r[None, :]
+
+    def regularization_weights_from(self, linear_obj, xp=np):
+        pb = self._pb_for(linear_obj)
+        return self.inner.regularization_weights_from(linear_obj, xp=xp) / pb
+
+    def log_det_regularization_matrix_term_from(self, linear_obj, xp=np):
+        pb = self._pb_for(linear_obj)
+        inner = self.inner.log_det_regularization_matrix_term_from(linear_obj, xp=xp)
+        if inner is None:
+            return None
+        return float(inner) - 2.0 * float(np.sum(np.log(pb)))
+
+    def regularization_term_from(self, linear_obj, reconstruction, xp=np):
+        pb = self._pb_for(linear_obj)
+        return self.inner.regularization_term_from(
+            linear_obj, np.asarray(reconstruction) / pb, xp=xp
+        )

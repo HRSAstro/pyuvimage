@@ -1,0 +1,97 @@
+From a644020b3737dfb1914a2073897c833c45d7cfc2 Mon Sep 17 00:00:00 2001
+From: HRSAstro <hrstacey@icloud.com>
+Date: Fri, 2 Oct 2026 10:13:11 +0000
+Subject: [PATCH] Compare the cross-terms to rounding, not to the bit
+
+Three tests failed on macOS (Accelerate BLAS, its FFT vectorisation) while
+passing on Linux: the sparse/dense cross-term checks held at 1e-15 of the
+peak, and the batched (W~ M)^T was compared bit for bit. Neither identity
+is guaranteed across BLAS/FFT builds; both now allow 1e-13 of the peak.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8
+---
+ docs/point-sources.md            | 2 +-
+ src/pyuvimage/pointsource.py     | 4 +++-
+ tests/test_pointsource_sparse.py | 8 ++++++--
+ tests/test_streamed_points.py    | 8 ++++++--
+ 4 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/docs/point-sources.md b/docs/point-sources.md
+index 724b30a..24aa7d2 100644
+--- a/docs/point-sources.md
++++ b/docs/point-sources.md
+@@ -214,7 +214,7 @@ image, 3136 mesh pixels) a new trial position costs 60 ms and a full scan
+ The in-memory point stage on her 9.1M samples took 2 h 13 min. Part of that
+ was `cross_on_grid`: autoarray transforms all 3136 mapping columns in one
+ call, ~5 GB of FFT transients — more than her laptop had. It is now built in
+-batches (same numbers to the bit), on both paths.
++batches (same numbers to rounding), on both paths.
+ 
+ **Limits.** The amplitude covariance is conditional on the prior, so a point
+ sitting on bright extended emission has an error bar that is only as good as
+diff --git a/src/pyuvimage/pointsource.py b/src/pyuvimage/pointsource.py
+index f435842..61d49e2 100644
+--- a/src/pyuvimage/pointsource.py
++++ b/src/pyuvimage/pointsource.py
+@@ -364,7 +364,9 @@ class SparseMesh:
+         112x112 grid and 3136 mesh pixels that is 5 GB of transients for a
+         315 MB answer -- an OOM kill in 7 GB here, and on her 3.6 GB laptop
+         the likeliest reason the in-memory point stage took 2 h 13 min.
+-        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to the bit.
++        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to rounding
++        (bit-identical with SciPy's pocketfft on Linux; the FFT library may
++        vectorise a different batch size differently elsewhere).
+         """
+         extent = self.mask.extent_index_for_masked_pixel
+         n_image, n_mesh = self.mapping_matrix.shape
+diff --git a/tests/test_pointsource_sparse.py b/tests/test_pointsource_sparse.py
+index 23d31bd..75c47d2 100644
+--- a/tests/test_pointsource_sparse.py
++++ b/tests/test_pointsource_sparse.py
+@@ -117,7 +117,11 @@ def test_the_cross_terms_match_the_dense_matrix(systems):
+ 
+     B_dense = dense.mesh.cross(Pw)
+     B_sparse = sparse.mesh.cross(Pw)
+-    assert np.allclose(B_sparse, B_dense, rtol=0, atol=1e-15 * np.max(np.abs(B_dense)))
++    # rounding, not identity: the dense side is one BLAS GEMM and the sparse
++    # side an adjoint transform then a projection, and the two accumulate in
++    # different orders. 1e-15 held with OpenBLAS but not with macOS's
++    # Accelerate; 1e-13 is still four decades below any error that matters
++    assert np.allclose(B_sparse, B_dense, rtol=0, atol=1e-13 * np.max(np.abs(B_dense)))
+ 
+ 
+ @sparse_only
+@@ -141,7 +145,7 @@ def test_a_gaussian_column_matches_too(systems):
+     Pw = dense.w_stack[:, None] * P
+     B_dense, B_sparse = dense.mesh.cross(Pw), sparse.mesh.cross(Pw)
+     assert np.allclose(
+-        B_sparse, B_dense, rtol=0, atol=1e-15 * np.max(np.abs(B_dense)))
++        B_sparse, B_dense, rtol=0, atol=1e-13 * np.max(np.abs(B_dense)))   # see above
+ 
+ 
+ # --- and the whole solve ----------------------------------------------------
+diff --git a/tests/test_streamed_points.py b/tests/test_streamed_points.py
+index 90ba497..f72ac26 100644
+--- a/tests/test_streamed_points.py
++++ b/tests/test_streamed_points.py
+@@ -199,10 +199,14 @@ def test_cross_on_grid_batches_without_changing_the_answer(case, monkeypatch):
+     whole = SparseMesh(inv, ds).cross_on_grid(ys, xs)
+     monkeypatch.setattr(pointsource, "SCAN_CHUNK_BYTES", 1)   # one column per batch
+     batched = SparseMesh(inv, ds).cross_on_grid(ys, xs)
+-    np.testing.assert_array_equal(batched, whole)
++    # bit-identical with pocketfft on Linux, but not guaranteed: an FFT
++    # library may vectorise a different batch size differently (it does on
++    # Hannah's macOS build), so rounding is the honest bound
++    tol = 1e-13 * np.abs(whole).max()
++    np.testing.assert_allclose(batched, whole, rtol=0, atol=tol)
+     # and a strict subset of the grid is the matching columns
+     sub = SparseMesh(inv, ds).cross_on_grid(ys[::7], xs[::7])
+-    np.testing.assert_array_equal(sub, whole[:, ::7])
++    np.testing.assert_allclose(sub, whole[:, ::7], rtol=0, atol=tol)
+ 
+ 
+ def test_streamed_run_with_points_matches_the_in_memory_run(tmp_path):
+-- 
+2.43.0
+

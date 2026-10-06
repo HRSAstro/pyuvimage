@@ -1,0 +1,21 @@
+The streamed path's fast accumulation now hands each batch of exactly
+NUFFT_BATCH samples to autoarray's own streaming accumulation (released in
+2026.10.2.1), which matched pyuvimage's type-1 accumulation to 3e-13 of the
+peak on ALMaQUEST CO(1-0) and ran 25% faster on Hannah's Mac. The last
+batch is padded with zero-weight (infinite sigma) samples so JAX compiles
+one batch length. pyuvimage's own type-1 path remains for the point
+components' oversampled grids, for unpooled batches with unequal sigmas
+(which autoarray refuses), and as the fallback on an older autoarray,
+with a one-time warning giving the pip command.
+
+pyproject: autoarray and autogalaxy >= 2026.10.2.1, replacing the git
+head (the release has the solver rewrite the git pin was for). docs/install.md
+explains replacing a git-installed autoarray, which reports 9999.0.0.dev0.
+
+From autoarray 2026.10 a sparse inversion's `dataset` is a DatasetInterface
+without data arrays; LinearSystem.from_inversion reads data and noise from
+the fit's own dataset first. compare_from_stream.py keeps comparing
+pyuvimage's own accumulation against from_stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8

@@ -1,0 +1,11 @@
+Load nufftax directly; build the streamed kernel by type-1 NUFFT
+
+Collection failed on autoarray releases without the private
+`inversion_interferometer_util._load_nufftax`. nufftax is now imported
+directly, and the fast path's w-tilde kernels (image and point grids) are
+one type-1 NUFFT each (`streaming.kernel_image`) rather than autoarray's
+builder with `method="nufft"`, so the fast path depends only on nufftax.
+Matches autoarray's kernel to 1e-12, including its zeroed +-N lag.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8

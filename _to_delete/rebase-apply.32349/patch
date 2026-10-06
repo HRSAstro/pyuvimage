@@ -1,0 +1,1903 @@
+---
+ README.md                        |   1 +
+ docs/large-datasets.md           |   4 +-
+ docs/parameters.md               |  11 +-
+ docs/point-sources.md            |  30 +-
+ src/pyuvimage/api.py             | 498 ++++++++++++++++++-------------
+ src/pyuvimage/cli.py             |   3 +-
+ src/pyuvimage/pointsource.py     |  59 +++-
+ src/pyuvimage/streamed_points.py | 353 ++++++++++++++++++++++
+ src/pyuvimage/streaming.py       | 200 ++++++++++++-
+ tests/test_streamed_points.py    | 248 +++++++++++++++
+ tests/test_streaming.py          |  60 +++-
+ 11 files changed, 1220 insertions(+), 247 deletions(-)
+ create mode 100644 src/pyuvimage/streamed_points.py
+ create mode 100644 tests/test_streamed_points.py
+
+diff --git a/README.md b/README.md
+index 305ac53..1722553 100644
+--- a/README.md
++++ b/README.md
+@@ -326,6 +326,7 @@ Two paths, chosen by `--inversion auto` at 5000 visibilities:
+ 
+ The streamed variant (`streaming="auto"`, the default: taken whenever the
+ dataset is a file, the inversion is sparse and there are no point components
++in cube mode
+ — `--no-streaming` holds the data in memory instead, `--streaming` refuses an
+ unsupported combination rather than falling back, and `--reload` re-reads a
+ file whose cached terms should not be trusted) accumulates the w-tilde kernel,
+diff --git a/docs/large-datasets.md b/docs/large-datasets.md
+index 8fefeb0..6f600a9 100644
+--- a/docs/large-datasets.md
++++ b/docs/large-datasets.md
+@@ -156,8 +156,8 @@ Everything above is about making `n_vis × n_mesh` small enough to hold.
+ streaming pass over the visibilities builds a small kernel, and the memory
+ then depends on the image size and the mesh but **not** on the number of
+ visibilities. Ruby continuum at fov 3, mesh 16: 0.3 s and ~1.7 GB against
+-25.4 s dense, for an identical `chi^2`. It needs JAX, is MFS only, and cannot
+-be combined with `--point-sources` — see
++25.4 s dense, for an identical `chi^2`. It needs JAX, and works in cube mode
++and with `--point-sources` (streamed too, in MFS) — see
+ [parameters.md](parameters.md#the-sparse-w-tilde-inversion). Where it applies,
+ it is the answer to this whole section.
+ 
+diff --git a/docs/parameters.md b/docs/parameters.md
+index b04fd6f..7286bd9 100644
+--- a/docs/parameters.md
++++ b/docs/parameters.md
+@@ -64,7 +64,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
+ | `--enforce-positive` | off | Keep positivity even when the solver looks unreliable. **Note:** positivity applies to the mesh-only solve. With `--point-sources`, the bordered system is eliminated by an unconstrained Cholesky solve, so the delivered mesh may contain small negative values whatever this is set to (measured on the demo: 0 negative mesh pixels without points, 78 carrying 0.59% of the flux with them). The point amplitudes are unaffected. pyuvimage warns when this applies. By default pyuvimage probes the non-negative solver and **silently falls back to the unconstrained solve** if it is ignoring the prior or fitting far worse — see below. Use this when a strictly non-negative model matters more than the best image. |
+ | `--inversion` | **auto** | How the curvature matrix `F` is built. `auto` takes `sparse` at or above 5000 visibilities and `dense` below, and falls back to `dense` whenever sparse cannot give the same answer — JAX missing, a transformer whose adjoint is not scale-consistent, or σ_re and σ_im differing by more than 5% — logging which and why. Naming `sparse` explicitly raises instead of falling back. `dense` forms the `n_vis x n_mesh` mapping matrix — the allocation that limits every large dataset. `sparse` uses the w-tilde formalism: one streaming pass over the visibilities builds a small translation-invariant kernel, and `F` is then assembled from it by FFT, so its cost stops depending on the number of visibilities. Works in MFS and cube mode, and with `--point-sources` (their cross-terms come from one adjoint transform per point column, never the dense matrix — see below). Needs JAX. Experimental: it has not yet been compared against `dense` under conditions that would establish they agree. See below. |
+ | `--kernel-cache` | beside the output | `--inversion sparse` only: where w-tilde kernels are kept. The kernel depends on the uv coverage, the noise and the geometry and nothing else, so re-fitting the same field with different regularisation reuses it. |
+-| `--streaming` / `--no-streaming` | **auto** | Read the visibilities once, in chunks, and hold nothing per visibility. The w-tilde kernel, the dirty images and the χ² constants are accumulated in one pass — cached beside the output or in `--kernel-cache` — and the fit runs on them alone, so memory does not depend on the visibility count: a 200-million-sample MFS cube fits in about a gigabyte. The cost is time (one pass over every sample; a cached re-fit reads none). `auto` streams whenever the run can be streamed — a dataset on disk, the sparse inversion (at or above the same 5000-visibility threshold `--inversion auto` uses, or named), no `--point-sources` (their columns are analytic in uv and the streamed pass keeps nothing per visibility to evaluate them against — the sparse *inversion* still runs, only the streaming load is held back) — and otherwise runs in memory, logging why (`streaming auto -> in memory: …`). Cube mode streams one channel at a time into one set of terms per channel (cached per channel; the shared prior is fitted on their sum, or under `--cube-prior channel` on a 1-in-n_chan Bernoulli thinning accumulated in the same pass); `--image-centre` applies the same phase ramp per chunk, and `auto` images the whole stream once to find the source (cached). `--streaming` names it, so an unsupported combination refuses rather than falling back; `--no-streaming` is the in-memory path regardless. |
++| `--streaming` / `--no-streaming` | **auto** | Read the visibilities once, in chunks, and hold nothing per visibility. The w-tilde kernel, the dirty images and the χ² constants are accumulated in one pass — cached beside the output or in `--kernel-cache` — and the fit runs on them alone, so memory does not depend on the visibility count: a 200-million-sample MFS cube fits in about a gigabyte. The cost is time (one pass over every sample; a cached re-fit reads none). `auto` streams whenever the run can be streamed — a dataset on disk, the sparse inversion (at or above the same 5000-visibility threshold `--inversion auto` uses, or named), no `--point-sources` in cube mode (MFS points stream: the pass also accumulates the kernel and dirty image on grids 8× finer than the image, which roughly doubles its time; needs nufftax) — and otherwise runs in memory, logging why (`streaming auto -> in memory: …`). Cube mode streams one channel at a time into one set of terms per channel (cached per channel; the shared prior is fitted on their sum, or under `--cube-prior channel` on a 1-in-n_chan Bernoulli thinning accumulated in the same pass); `--image-centre` applies the same phase ramp per chunk, and `auto` images the whole stream once to find the source (cached). `--streaming` names it, so an unsupported combination refuses rather than falling back; `--no-streaming` is the in-memory path regardless. |
+ | `--no-pynufft-shift` | off | Reproduce the uncorrected upstream pynufft transformer (no half-pixel phase ramp). Self-consistent, but the sky lands half a pixel from the WCS in both axes; pynufft backend only. For comparison — see [large-datasets.md](large-datasets.md). |
+ | `--reload` | off | Read the visibilities again even when the streamed terms (or the w-tilde kernel) for this file and geometry are cached, and replace the cache. The cache is keyed on the file's path, size and modification time, so this is for a file rewritten in place with both unchanged, or for ruling the cache out. |
+ | `--chunk-k` | 4096 | streaming only: visibilities per chunk. Larger is faster and costs more per chunk (the per-chunk DFT is `n_image × N` complex). |
+@@ -357,10 +357,11 @@ differ by more than 2%.
+   accepted positions are refined and solved through the exact route, so no
+   delivered number rests on it.
+ 
+-  What still holds back is **streaming**, not sparse: a point column is an
+-  analytic function of uv, and the streamed pass keeps no per-visibility data
+-  to evaluate it against. `--point-sources` therefore runs sparse but in
+-  memory, which costs ~136 B per visibility and not the 21.6 GB it used to.
++  Streaming no longer holds them back either (MFS): every term a point
++  column needs is a value of the w-tilde kernel K(lag) or of the data's dirty
++  image, and the streamed pass accumulates both on grids 8× finer than the
++  image, from which they are read by spline to 2e-9 (see
++  [point-sources.md](point-sources.md)). Cube mode with points runs in memory.
+ * ~~It is MFS only.~~ **Cube mode works.** Each channel's uv coordinates are
+   the same baselines in metres scaled by its own frequency, so each channel
+   needs its own kernel — but a channel's build streams only that channel's
+diff --git a/docs/point-sources.md b/docs/point-sources.md
+index e2ba486..724b30a 100644
+--- a/docs/point-sources.md
++++ b/docs/point-sources.md
+@@ -192,13 +192,29 @@ inversion's own `F` already makes — and a lattice that is not on the grid
+ declines it and falls back. It is only the detector: accepted positions are
+ refined and solved through the exact per-column route.
+ 
+-**Streaming is the part still held back**, and for a different reason: a point
+-column is an analytic function of uv, and all three of its terms are sums over
+-samples the streamed pass has already discarded. The accumulated terms hold
+-those sums only on the image grid, and a point's whole reason for existing is
+-that it is not on the grid. So `--point-sources` runs the sparse inversion in
+-memory: ~136 B per visibility for the data, rather than the `n_vis x n_mesh`
+-matrix it used to need.
++**Streaming works too (MFS).** A point column is an analytic function of uv,
++but all three of its terms are values of two image-plane functions the
++streaming pass can accumulate once — the kernel K(lag) = sum w cos(2 pi u.lag)
++and the data's dirty image Dd(x):
++
++    B_p = M^T k_p,  k_p[i] = K(x_i - p)      C_pq = K(p - q)      Dp_p = Dd(p)
++
++and a Gaussian width is a convolution of K or Dd with that Gaussian. The pass
++accumulates both on grids 8x finer than the image (type-1 NUFFTs, so the
++extra cost is ~2x the plain pass, not the 50x a per-chunk DFT would be), and
++`streamed_points.StreamedAugmentedSystem` reads them with a quintic spline:
++2e-9 of K(0), so on 1.8e7 chi^2 the refinement and the unresolved test see
++the same surface. The kernel grid reaches a quarter-field beyond one field
++width of lag so widened columns near the edge do not read the circular wrap.
++Pinned against the in-memory system: identical detections, positions within
++Nelder-Mead's own tolerance, fluxes to 1e-6. On a Teresa-sized field (112x112
++image, 3136 mesh pixels) a new trial position costs 60 ms and a full scan
++4-10 s, in under 2 GB. Cube mode with points still runs in memory.
++
++The in-memory point stage on her 9.1M samples took 2 h 13 min. Part of that
++was `cross_on_grid`: autoarray transforms all 3136 mapping columns in one
++call, ~5 GB of FFT transients — more than her laptop had. It is now built in
++batches (same numbers to the bit), on both paths.
+ 
+ **Limits.** The amplitude covariance is conditional on the prior, so a point
+ sitting on bright extended emission has an error bar that is only as good as
+diff --git a/src/pyuvimage/api.py b/src/pyuvimage/api.py
+index ce3be16..9cc40a1 100644
+--- a/src/pyuvimage/api.py
++++ b/src/pyuvimage/api.py
+@@ -40,6 +40,10 @@ logger = logging.getLogger("pyuvimage")
+ # excess and came back at 11.5 Jy in a 0.09 Jy field: 128 times the field.
+ POINT_EXPLAINED_FRACTION = 0.5
+ POINT_FLUX_SANITY = 2.0
++# How much finer than the image the streamed pass grids the kernel and the
++# dirty image for point components (`streamed_points`): at 8 a quintic spline
++# reads both to 2e-9 of the peak, against 3e-12 at 16 for 4x the grid.
++POINT_OVERSAMPLE = 8
+ 
+ # Which baseline length the automatic mesh scale is sized from. The longest
+ # baseline is the information limit, but on a real array only a handful of
+@@ -88,7 +92,8 @@ def resolve_streaming(
+     `auto` streams whenever streaming can give the same answer as the
+     in-memory path, which since parity was established on JAX is every case
+     `run_streamed` supports: a dataset on disk (an in-memory UVData is
+-    already held, so there is nothing to save), no point components, and the
++    already held, so there is nothing to save), no point components in cube
++    mode, and the
+     sparse inversion -- which under `inversion="auto"` means the same
+     visibility threshold `resolve_inversion` applies, so a small dataset
+     still takes the dense path it always did. Cube mode and recentring both
+@@ -119,20 +124,22 @@ def resolve_streaming(
+             "the dataset is already in memory, so streaming it would save "
+             "nothing"
+         )
+-    if point_sources:
+-        # Not the mapping matrix any more -- the sparse inversion fits points
+-        # without it (`pointsource.SparseMesh`). What streaming cannot give
+-        # them is the visibilities themselves: a point column is an analytic
+-        # function of uv, and its three terms (A^T W P, P^T W P, P^T W d) are
+-        # sums over samples the streamed pass has already discarded. The
+-        # accumulated terms hold those sums only on the image grid, and a
+-        # point's whole reason for existing is that it is not on the grid.
++    if point_sources and mode == "cube":
++        # MFS points stream (`streamed_points`): their terms are sums over
++        # visibilities like everything else, accumulated on fine grids. The
++        # cube's per-channel point fits are not wired to that yet.
+         return _hold(
+-            "point components are analytic in the uv plane, and the streamed "
+-            "pass keeps no per-visibility data for them to be evaluated "
+-            "against. The sparse inversion still runs -- only the streaming "
+-            "load is held back"
++            "point components in cube mode are fitted per channel, which the "
++            "streamed cube does not do yet"
+         )
++    if point_sources:
++        from . import streaming as stm
++
++        if not stm.nufftax_available():
++            return _hold(
++                "streamed point components need nufftax for their "
++                "oversampled grids, and it is not installed"
++            )
+     if inversion == "dense":
+         return _hold("--inversion dense was asked for")
+     reason = fitting.sparse_inversion_diagnosis()
+@@ -310,8 +317,8 @@ def run(
+             fit runs on them alone. Memory then does not depend on the number
+             of visibilities at all -- a 200-million-sample MFS cube fits in
+             about a gigabyte. "auto" (default) streams whenever the run can be
+-            streamed -- a dataset on disk, MFS, the sparse inversion, no point
+-            components, no recentring -- and otherwise holds the data as
++            streamed -- a dataset on disk, the sparse inversion, no point
++            components in cube mode -- and otherwise holds the data as
+             before, saying which and why (`resolve_streaming`). True refuses
+             an unsupported combination rather than falling back; False is
+             the in-memory path regardless. See `run_streamed`.
+@@ -377,7 +384,9 @@ def run(
+             pb_correction=pb_correction, dish_diameter=dish_diameter,
+             pb_factor=pb_factor, uncertainty_map=uncertainty_map, write=write,
+             mode=mode, inversion=inversion, image_centre=image_centre,
+-            point_sources=point_sources, chunk_k=chunk_k, reload=reload,
++            point_sources=point_sources, point_significance=point_significance,
++            max_points=max_points, point_retune=point_retune,
++            chunk_k=chunk_k, reload=reload,
+             header=header, cube_prior=cube_prior, transformer=transformer,
+         )
+     uvd = (
+@@ -707,196 +716,35 @@ def run(
+     # Optional analytic point components, solved in the same linear system.
+     # Opt-in: never added unless asked for, and auto-detected candidates are
+     # kept only above `point_significance`.
++    # (`_point_stage`, shared with `run_streamed`).
+     point_solution = None
+-    # A mesh fit far above the target means the model cannot describe the data,
+-    # and fitting points to that residual can produce nonsense: on the
+-    # out-of-field test it returned an 11.5 Jy "source" in a 0.09 Jy field, at
+-    # 76 sigma. This used to be a pre-emptive skip, but that got the causality
+-    # backwards -- an unmodelled compact source is itself one of the commonest
+-    # reasons chi^2 is high, and refusing to fit it guarantees the fit stays
+-    # bad. The demo is exactly that case: a 4 mJy point no 24x24 mesh can hold
+-    # puts the fit at chi^2/N = 2.87, and the skip then withheld the one thing
+-    # that would have fixed it.
+-    #
+-    # So fit, then judge the answer -- which is testable in a way the
+-    # precondition is not. A real point explains the excess and has a sane
+-    # flux; the out-of-field artefact explains little and is many times the
+-    # field's own flux.
+-    speculative = (
+-        bool(point_sources)
+-        and mfs_fit.chi_squared / (2 * len(d)) > 2.0 * chi2_target
+-    )
+-    if speculative:
+-        logger.warning(
+-            "the pixelized model sits at chi^2/N = %.4g against a target of "
+-            "%.3g. Fitting point components anyway, since an unmodelled "
+-            "compact source is a common cause of exactly this -- but the "
+-            "result will be discarded unless it explains the excess and has "
+-            "a credible flux.",
+-            mfs_fit.chi_squared / (2 * len(d)), chi2_target,
+-        )
+     if point_sources:
+         from .pointsource import fit_point_sources
+ 
+-        positions = point_sources if isinstance(point_sources, list) else None
+-        logger.info(
+-            "fitting analytic point sources (%s)...",
+-            "user positions" if positions else
+-            f"auto-detect above {point_significance:.1f} sigma",
+-        )
+-        # positions arrive as image (x, y); pointsource speaks sky
+-        from .pointsource import image_to_sky as _img2sky
+-
+-        positions = (
+-            [_img2sky(*q) for q in positions] if positions else positions
+-        )
+-
+-        def _fit_points(fit_obj):
+-            return fit_point_sources(
+-                fit_obj.fit.inversion, mfs_dataset, geometry,
+-                positions=positions, significance=point_significance,
+-                max_points=max_points,
+-                dirty_imager=imager,
+-                beam_fwhm=beam_size,
+-                # Re-tune on the criterion the search used, now that the
+-                # points are in the model. It used to run for `discrepancy`
+-                # only, so on large data (where `auto` picks `structure`) the
+-                # coefficient stayed where the *mesh-only* search left it --
+-                # tuned to let the mesh chase the point's residual -- and the
+-                # delivered fit overfitted. A coefficient the user fixed is
+-                # theirs, and is not re-tuned.
+-                retune=(
+-                    bool(point_retune) and coefficient == "auto"
+-                    and criterion in ("discrepancy", "structure")
+-                ),
+-                retune_criterion=(
+-                    criterion if criterion in ("discrepancy", "structure")
+-                    else "discrepancy"
+-                ),
++        mfs_fit, point_solution = _point_stage(
++            mfs_fit, point_sources, n_data=2 * len(d), geometry=geometry,
++            imager=imager, beam_size=beam_size,
++            point_significance=point_significance, max_points=max_points,
++            point_retune=point_retune, coefficient=coefficient,
++            criterion=criterion, chi2_target=chi2_target, reg=reg,
++            envelope=envelope, positive_only=positive_only,
++            fit_points=lambda fit_obj, **kw: fit_point_sources(
++                fit_obj.fit.inversion, mfs_dataset, geometry, **kw),
++            refit=lambda envelope_np: fitting.fit_dataset(
++                mfs_dataset, geometry, reg_kind=reg, criterion=criterion,
++                # `prior=None` here re-optimised the coefficient even
++                # when the user had fixed it with --lambda
++                positive_only=positive_only, prior=fixed_prior, nu=nu,
++                fixed_scale=beam_scale, envelope=envelope_np,
+                 chi2_target=chi2_target,
+-            )
+-
+-        point_solution = _fit_points(mfs_fit)
+-
+-        # An adaptive prior follows a first-pass brightness map, and that map
+-        # has the point smeared into it -- so the prior is loosest exactly
+-        # where the point sits, and the mesh underneath is free to soak up the
+-        # point's flux.  Measured: the 3 mJy point sitting on the bright
+-        # 0.25" blob came back at 30-56% of its true flux.  Once the points
+-        # are known, rebuild the brightness map from the *extended* model
+-        # alone (which excludes them by construction) and refit.
+-        if (
+-            point_solution.points
+-            and reg in fitting.ADAPTIVE_REGULARIZATIONS
+-            and envelope is not None
+-            and envelope.get("brightness") is None
+-        ):
+-            logger.info(
+-                "  refitting with the adaptive prior tracking the extended "
+-                "model only (the first-pass map included the point sources)"
+-            )
+-            extended_only = np.clip(
+-                np.asarray(point_solution.mesh_values).ravel(), 0.0, None)
+-            envelope_np = {**envelope, "brightness": extended_only}
+-            try:
+-                mfs_refit = fitting.fit_dataset(
+-                    mfs_dataset, geometry, reg_kind=reg, criterion=criterion,
+-                    # `prior=None` here re-optimised the coefficient even
+-                    # when the user had fixed it with --lambda
+-                    positive_only=positive_only, prior=fixed_prior, nu=nu,
+-                    fixed_scale=beam_scale, envelope=envelope_np,
+-                    chi2_target=chi2_target,
+-                    warn_on_chi2=False,  # the point fit follows; see above
+-                    # Was omitted here, and this is the fit that gets kept
+-                    # whenever point components are found -- so
+-                    # --enforce-positive was silently ignored on exactly the
+-                    # runs that use it. Measured on the demo: both with and
+-                    # without the flag the delivered model had ~70 negative
+-                    # mesh pixels.
+-                    enforce_positive=enforce_positive,
+-                )
+-                refit_solution = _fit_points(mfs_refit)
+-            except Exception as e:
+-                logger.warning(
+-                    "  adaptive refit failed (%s: %s); keeping the first "
+-                    "solution", type(e).__name__, e,
+-                )
+-            else:
+-                if refit_solution.points:
+-                    mfs_fit, point_solution = mfs_refit, refit_solution
+-                elif point_solution.points:
+-                    # The refit is the better-posed of the two (its prior map
+-                    # does not have the point smeared into it), and it kept
+-                    # nothing -- now usually because the component came back
+-                    # negative and was dropped. Keeping the first solution's
+-                    # point would deliver exactly the component the refit
+-                    # exists to correct.
+-                    logger.warning(
+-                        "  the refit with the extended-only prior map kept no "
+-                        "point component; delivering the pixelized model alone"
+-                    )
+-                    point_solution = refit_solution
+-
+-        if speculative and point_solution.points:
+-            # Judge the answer, now that there is one to judge. Two tests, both
+-            # of which the out-of-field artefact fails badly and a real point
+-            # passes easily.
+-            before = mfs_fit.chi_squared / (2 * len(d))
+-            after = point_solution.chi_squared / (2 * len(d))
+-            extended = float(
+-                np.sum(np.clip(np.asarray(point_solution.mesh_values), 0.0, None))
+-            )
+-            point_flux = point_solution.total_point_flux
+-            explained = (before - after) / max(before - chi2_target, 1e-30)
+-            plausible = point_flux <= POINT_FLUX_SANITY * max(extended, 1e-30)
+-            if explained >= POINT_EXPLAINED_FRACTION and plausible:
+-                logger.info(
+-                    "  the point components explain %.0f%% of the excess "
+-                    "chi^2 (%.3f -> %.3f) and carry %.4g Jy against the "
+-                    "extended model's %.4g Jy: keeping them",
+-                    100 * explained, before, after, point_flux, extended,
+-                )
+-            else:
+-                logger.warning(
+-                    "discarding the fitted point component(s): they explain "
+-                    "%.0f%% of the excess chi^2 (%.3f -> %.3f) and carry "
+-                    "%.4g Jy against the extended model's %.4g Jy. That is "
+-                    "the signature of fitting structure the mesh cannot "
+-                    "describe -- emission outside --fov is the usual cause -- "
+-                    "rather than of a real source. Fix the fit first (usually "
+-                    "--fov).",
+-                    100 * explained, before, after, point_flux, extended,
+-                )
+-                point_solution = None
+-
+-        if point_solution is not None and point_solution.points:
+-            from .pointsource import PointAugmentedFit
+-
+-            if positive_only:
+-                # `PointExtendedSystem.solve` eliminates the mesh block with a
+-                # Cholesky solve -- `cho_solve`, unconstrained -- so the mesh
+-                # values that come back with point components present are not
+-                # non-negative, whatever was asked for. Measured on the demo:
+-                # 0 negative mesh pixels without points, 78 with them (0.59%
+-                # of the flux) even under --enforce-positive.
+-                #
+-                # Say so rather than silently returning a model that does not
+-                # satisfy the constraint the user set.
+-                logger.warning(
+-                    "positivity does not extend to the mesh once point "
+-                    "components are fitted: the bordered system is solved by "
+-                    "Cholesky elimination, which is unconstrained, so the "
+-                    "delivered mesh may contain small negative values. The "
+-                    "point amplitudes themselves are unaffected."
+-                )
+-            mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
+-            logger.info(
+-                "  %d point source(s), total %.4g Jy; chi2/N now %.3f",
+-                len(point_solution.points), point_solution.total_point_flux,
+-                point_solution.chi_squared / (2 * len(d)),
+-            )
+-        else:
+-            logger.info("  no point source passed the significance cut")
++                warn_on_chi2=False,  # the point fit follows; see `_point_stage`
++                # Was omitted here, and this is the fit that gets kept
++                # whenever point components are found -- so
++                # --enforce-positive was silently ignored on exactly the
++                # runs that use it.
++                enforce_positive=enforce_positive,
++            ),
++        )
+ 
+     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
+     n_data = 2 * len(d)
+@@ -1091,6 +939,9 @@ def run_streamed(
+     inversion: str = "auto",
+     image_centre="0,0",
+     point_sources=False,
++    point_significance: float = 5.0,
++    max_points: int = 5,
++    point_retune: bool = True,
+     chunk_k: int | None = None,
+     use_jax_kernel: bool = False,
+     reload: bool = False,
+@@ -1116,7 +967,12 @@ def run_streamed(
+     stub, as `run` does it. Recentring is the same phase ramp `run` applies,
+     chunk by chunk (`streaming.recentred`); "auto" images the whole stream
+     once to find the source. What it still refuses: point components
+-    (dense-only anyway) and `--inversion dense` (nothing to stream *to*).
++    in cube mode, and `--inversion dense` (nothing to stream *to*).
++
++    Point components (MFS) run on the same terms: the pass also accumulates
++    the kernel and the dirty image on grids `POINT_OVERSAMPLE` times finer
++    than the image, and every term the bordered system needs is read off
++    them (`streamed_points.StreamedAugmentedSystem`).
+ 
+     `use_jax_kernel` hands the per-chunk kernel accumulation to autoarray's
+     JAX backend; the default NumPy backend is bit-identical to the in-memory
+@@ -1132,12 +988,17 @@ def run_streamed(
+         raise ValueError("mode must be 'mfs' or 'cube'")
+     if cube_prior not in ("channel", "mfs"):
+         raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
+-    if point_sources:
++    point_sources = normalise_point_sources(point_sources)
++    if point_sources and mode == "cube":
+         raise NotImplementedError(
+-            "point components cannot run on the streaming path: their "
+-            "columns are analytic in uv, and the streamed pass keeps no "
+-            "per-visibility data to evaluate them against. --inversion "
+-            "sparse fits them in memory (--no-streaming)")
++            "point components in cube mode are fitted per channel against "
++            "the MFS positions, which the streamed cube does not do yet; "
++            "--no-streaming runs it in memory")
++    if point_sources and not stm.nufftax_available():
++        raise RuntimeError(
++            "streamed point components need nufftax: their terms are read "
++            "off oversampled grids that only the type-1 NUFFT makes "
++            "affordable. Install nufftax, or --no-streaming")
+     if inversion == "dense":
+         raise ValueError("streaming has nothing to stream to on the dense path")
+     reason = fitting.sparse_inversion_diagnosis()
+@@ -1257,6 +1118,9 @@ def run_streamed(
+             dataset, geometry, mask, chunk_transformer, cache_dir=kernel_cache_dir,
+             chunk_k=chunk_k, use_jax=use_jax_kernel, mask_shape=mask_shape,
+             pool_noise=pool, reuse_cache=not reload, centre=shift,
++            # point components are read off grids this much finer than the
++            # image (`streamed_points`), accumulated in the same pass
++            point_oversample=POINT_OVERSAMPLE if point_sources else 0,
+         )
+     n_data = 2 * int(terms.n_vis)     # what the MFS / prior fit is measured on
+     if terms.n_vis:
+@@ -1273,7 +1137,8 @@ def run_streamed(
+     beam_scale = None
+     envelope = None
+     beam_size = None
+-    if reg in fitting.KERNEL_REGULARIZATIONS or reg in fitting.ENVELOPE_REGULARIZATIONS:
++    if (point_sources or reg in fitting.KERNEL_REGULARIZATIONS
++            or reg in fitting.ENVELOPE_REGULARIZATIONS):
+         b = beam_mod.fit_beam(imager.dirty_beam, geometry.pixel_scale)
+         beam_size = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
+     if reg in fitting.KERNEL_REGULARIZATIONS:
+@@ -1315,8 +1180,37 @@ def run_streamed(
+         positive_only=positive_only, enforce_positive=enforce_positive,
+         criterion=criterion, nu=nu, fixed_scale=beam_scale, envelope=envelope,
+         optimise_envelope=optimise_env, chi2_target=chi2_target,
++        warn_on_chi2=not point_sources,   # judged after the points, as in `run`
+     )
+     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
++    point_solution = None
++    if point_sources:
++        from .pointsource import fit_point_sources
++        from .streamed_points import StreamedAugmentedSystem
++
++        def _fit_points(fit_obj, **kw):
++            # the bordered system from the terms alone: no visibility is read
++            system = StreamedAugmentedSystem(
++                fit_obj.fit.inversion, stub, terms, imager)
++            return fit_point_sources(
++                fit_obj.fit.inversion, stub, geometry, system=system, **kw)
++
++        mfs_fit, point_solution = _point_stage(
++            mfs_fit, point_sources, n_data=n_data, geometry=geometry,
++            imager=imager, beam_size=beam_size,
++            point_significance=point_significance, max_points=max_points,
++            point_retune=point_retune, coefficient=coefficient,
++            criterion=criterion, chi2_target=chi2_target, reg=reg,
++            envelope=envelope, positive_only=positive_only,
++            fit_points=_fit_points,
++            refit=lambda envelope_np: fitting.fit_dataset(
++                stub, geometry, reg_kind=reg, criterion=criterion,
++                positive_only=positive_only, prior=fixed_prior, nu=nu,
++                fixed_scale=beam_scale, envelope=envelope_np,
++                chi2_target=chi2_target, warn_on_chi2=False,
++                enforce_positive=enforce_positive,
++            ),
++        )
+     if mfs_fit.chi_squared / n_data > 1.3 * chi2_target:
+         logger.warning(
+             "the delivered model sits at chi^2/N = %.3g against a target of "
+@@ -1389,7 +1283,8 @@ def run_streamed(
+     parameters = _parameter_record(
+         header, geometry, mode, reg, criterion, chi2_target, positive_only,
+         chunk_transformer.__name__, oversample, dish, pb_factor, pb_correction,
+-        mfs_fit, scan, envelope=envelope, inversion="sparse",
++        mfs_fit, scan, envelope=envelope, point_solution=point_solution,
++        inversion="sparse",
+         n_data_fitted=n_data, transformer_requested="streamed",
+         prior_thin=prior_thin,
+         channel_chi2_per_datum=channel_chi2 if cube else None,
+@@ -1414,6 +1309,186 @@ def run_streamed(
+     )
+ 
+ 
++def _point_stage(
++    mfs_fit, point_sources, *, n_data, geometry, imager, beam_size,
++    point_significance, max_points, point_retune, coefficient, criterion,
++    chi2_target, reg, envelope, positive_only, fit_points, refit,
++):
++    """Fit analytic point components to an MFS fit; return (fit, solution).
++
++    Shared by `run` and `run_streamed`, which differ only in how a point fit
++    and an adaptive refit are made: ``fit_points(fit_obj, **kwargs)`` runs
++    `pointsource.fit_point_sources` against that fit's inversion (in memory
++    on the dataset, streamed on a `StreamedAugmentedSystem`), and
++    ``refit(envelope)`` refits the mesh with the given adaptive envelope.
++    The fit comes back wrapped in `PointAugmentedFit` when points were kept.
++
++    A mesh fit far above the target means the model cannot describe the data,
++    and fitting points to that residual can produce nonsense: on the
++    out-of-field test it returned an 11.5 Jy "source" in a 0.09 Jy field, at
++    76 sigma. This used to be a pre-emptive skip, but that got the causality
++    backwards -- an unmodelled compact source is itself one of the commonest
++    reasons chi^2 is high, and refusing to fit it guarantees the fit stays
++    bad. The demo is exactly that case: a 4 mJy point no 24x24 mesh can hold
++    puts the fit at chi^2/N = 2.87, and the skip then withheld the one thing
++    that would have fixed it.
++
++    So fit, then judge the answer -- which is testable in a way the
++    precondition is not. A real point explains the excess and has a sane
++    flux; the out-of-field artefact explains little and is many times the
++    field's own flux.
++    """
++    speculative = mfs_fit.chi_squared / n_data > 2.0 * chi2_target
++    if speculative:
++        logger.warning(
++            "the pixelized model sits at chi^2/N = %.4g against a target of "
++            "%.3g. Fitting point components anyway, since an unmodelled "
++            "compact source is a common cause of exactly this -- but the "
++            "result will be discarded unless it explains the excess and has "
++            "a credible flux.",
++            mfs_fit.chi_squared / n_data, chi2_target,
++        )
++    positions = point_sources if isinstance(point_sources, list) else None
++    logger.info(
++        "fitting analytic point sources (%s)...",
++        "user positions" if positions else
++        f"auto-detect above {point_significance:.1f} sigma",
++    )
++    # positions arrive as image (x, y); pointsource speaks sky
++    from .pointsource import image_to_sky as _img2sky
++
++    positions = [_img2sky(*q) for q in positions] if positions else positions
++
++    def _fit_points(fit_obj):
++        return fit_points(
++            fit_obj,
++            positions=positions, significance=point_significance,
++            max_points=max_points,
++            dirty_imager=imager,
++            beam_fwhm=beam_size,
++            # Re-tune on the criterion the search used, now that the points
++            # are in the model. It used to run for `discrepancy` only, so on
++            # large data (where `auto` picks `structure`) the coefficient
++            # stayed where the *mesh-only* search left it -- tuned to let the
++            # mesh chase the point's residual -- and the delivered fit
++            # overfitted. A coefficient the user fixed is theirs, and is not
++            # re-tuned.
++            retune=(
++                bool(point_retune) and coefficient == "auto"
++                and criterion in ("discrepancy", "structure")
++            ),
++            retune_criterion=(
++                criterion if criterion in ("discrepancy", "structure")
++                else "discrepancy"
++            ),
++            chi2_target=chi2_target,
++        )
++
++    point_solution = _fit_points(mfs_fit)
++
++    # An adaptive prior follows a first-pass brightness map, and that map has
++    # the point smeared into it -- so the prior is loosest exactly where the
++    # point sits, and the mesh underneath is free to soak up the point's
++    # flux.  Measured: the 3 mJy point sitting on the bright 0.25" blob came
++    # back at 30-56% of its true flux.  Once the points are known, rebuild the
++    # brightness map from the *extended* model alone (which excludes them by
++    # construction) and refit.
++    if (
++        point_solution.points
++        and reg in fitting.ADAPTIVE_REGULARIZATIONS
++        and envelope is not None
++        and envelope.get("brightness") is None
++    ):
++        logger.info(
++            "  refitting with the adaptive prior tracking the extended "
++            "model only (the first-pass map included the point sources)"
++        )
++        extended_only = np.clip(
++            np.asarray(point_solution.mesh_values).ravel(), 0.0, None)
++        try:
++            mfs_refit = refit({**envelope, "brightness": extended_only})
++            refit_solution = _fit_points(mfs_refit)
++        except Exception as e:
++            logger.warning(
++                "  adaptive refit failed (%s: %s); keeping the first "
++                "solution", type(e).__name__, e,
++            )
++        else:
++            if refit_solution.points:
++                mfs_fit, point_solution = mfs_refit, refit_solution
++            elif point_solution.points:
++                # The refit is the better-posed of the two (its prior map does
++                # not have the point smeared into it), and it kept nothing --
++                # now usually because the component came back negative and
++                # was dropped. Keeping the first solution's point would
++                # deliver exactly the component the refit exists to correct.
++                logger.warning(
++                    "  the refit with the extended-only prior map kept no "
++                    "point component; delivering the pixelized model alone"
++                )
++                point_solution = refit_solution
++
++    if speculative and point_solution.points:
++        # Judge the answer, now that there is one to judge. Two tests, both of
++        # which the out-of-field artefact fails badly and a real point passes
++        # easily.
++        before = mfs_fit.chi_squared / n_data
++        after = point_solution.chi_squared / n_data
++        extended = float(
++            np.sum(np.clip(np.asarray(point_solution.mesh_values), 0.0, None))
++        )
++        point_flux = point_solution.total_point_flux
++        explained = (before - after) / max(before - chi2_target, 1e-30)
++        plausible = point_flux <= POINT_FLUX_SANITY * max(extended, 1e-30)
++        if explained >= POINT_EXPLAINED_FRACTION and plausible:
++            logger.info(
++                "  the point components explain %.0f%% of the excess "
++                "chi^2 (%.3f -> %.3f) and carry %.4g Jy against the "
++                "extended model's %.4g Jy: keeping them",
++                100 * explained, before, after, point_flux, extended,
++            )
++        else:
++            logger.warning(
++                "discarding the fitted point component(s): they explain "
++                "%.0f%% of the excess chi^2 (%.3f -> %.3f) and carry "
++                "%.4g Jy against the extended model's %.4g Jy. That is "
++                "the signature of fitting structure the mesh cannot "
++                "describe -- emission outside --fov is the usual cause -- "
++                "rather than of a real source. Fix the fit first (usually "
++                "--fov).",
++                100 * explained, before, after, point_flux, extended,
++            )
++            point_solution = None
++
++    if point_solution is not None and point_solution.points:
++        from .pointsource import PointAugmentedFit
++
++        if positive_only:
++            # The bordered system eliminates the mesh block with a Cholesky
++            # solve -- `cho_solve`, unconstrained -- so the mesh values that
++            # come back with point components present are not non-negative,
++            # whatever was asked for. Measured on the demo: 0 negative mesh
++            # pixels without points, 78 with them (0.59% of the flux) even
++            # under --enforce-positive. Say so rather than silently returning
++            # a model that does not satisfy the constraint the user set.
++            logger.warning(
++                "positivity does not extend to the mesh once point "
++                "components are fitted: the bordered system is solved by "
++                "Cholesky elimination, which is unconstrained, so the "
++                "delivered mesh may contain small negative values. The "
++                "point amplitudes themselves are unaffected."
++            )
++        mfs_fit = PointAugmentedFit(mfs_fit, point_solution)
++        logger.info(
++            "  %d point source(s), total %.4g Jy; chi2/N now %.3f",
++            len(point_solution.points), point_solution.total_point_flux,
++            point_solution.chi_squared / n_data,
++        )
++    else:
++        logger.info("  no point source passed the significance cut")
++    return mfs_fit, point_solution
++
++
+ def _fixed_prior(
+     reg, coefficient, reg_scale, nu, beam_scale=None, optimise_envelope=False,
+ ) -> dict | None:
+@@ -1866,6 +1941,11 @@ def _products_for(
+         # `LinearSystem.residual_dirty_image`)
+         dirty_image = imager.dirty_image_of_data()
+         dirty_model = imager.dirty_image_of_model(model_image)
++        solution = getattr(sf, "solution", None)
++        if solution is not None and len(solution.grid_positions):
++            # the points' own dirty image, K(x - p) per point, off the grids
++            dirty_model = dirty_model + solution.system.point_dirty_image(
++                solution.grid_positions, solution.amplitudes) / imager._norm
+         resid_dirty = dirty_image - dirty_model
+     else:
+         data = np.asarray(dataset.data)
+diff --git a/src/pyuvimage/cli.py b/src/pyuvimage/cli.py
+index 77e7c94..f9fb3cf 100644
+--- a/src/pyuvimage/cli.py
++++ b/src/pyuvimage/cli.py
+@@ -314,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
+         "MFS cube fits in about a gigabyte. The cost is time: one pass over "
+         "every sample, and a cached re-fit reads none. This is the DEFAULT "
+         "whenever it applies (a dataset on disk, the sparse inversion, no "
+-        "--point-sources); cube mode and --image-centre stream too. Naming it "
++        "--point-sources in cube mode); cube mode, --image-centre and MFS "
++        "--point-sources stream too. Naming it "
+         "makes an unsupported combination refuse rather than fall back to the "
+         "in-memory path",
+     )
+diff --git a/src/pyuvimage/pointsource.py b/src/pyuvimage/pointsource.py
+index e4c2c92..f435842 100644
+--- a/src/pyuvimage/pointsource.py
++++ b/src/pyuvimage/pointsource.py
+@@ -348,15 +348,39 @@ class SparseMesh:
+         if index is None:
+             return None
+         if self._operated_mapping is None:
+-            self._operated_mapping = np.asarray(
++            self._operated_mapping = self._operated_mapping_T()
++        if index.size == self._operated_mapping.shape[1] and np.array_equal(
++                index, np.arange(index.size)):
++            return self._operated_mapping       # the whole grid: no copy
++        return self._operated_mapping[:, index]   # (n_mesh, L)
++
++    def _operated_mapping_T(self) -> np.ndarray:
++        """``(W~ M)^T``, (n_mesh, n_image_slim), built a batch of columns at
++        a time.
++
++        autoarray's `operated_matrix_slim_from` transforms every column at
++        once: zero-padded to (2Ny, 2Nx), forward and inverse real FFTs and
++        their product, ~128 bytes per image pixel per column. On Teresa's
++        112x112 grid and 3136 mesh pixels that is 5 GB of transients for a
++        315 MB answer -- an OOM kill in 7 GB here, and on her 3.6 GB laptop
++        the likeliest reason the in-memory point stage took 2 h 13 min.
++        Batched to `SCAN_CHUNK_BYTES`, the answer is the same to the bit.
++        """
++        extent = self.mask.extent_index_for_masked_pixel
++        n_image, n_mesh = self.mapping_matrix.shape
++        ny, nx = (int(s) for s in self.mask.shape_native)
++        per_column = 128 * ny * nx
++        batch = int(max(1, min(n_mesh, SCAN_CHUNK_BYTES // per_column)))
++        out = np.empty((n_mesh, n_image))
++        for lo in range(0, n_mesh, batch):
++            hi = min(lo + batch, n_mesh)
++            out[lo:hi] = np.asarray(
+                 self.sparse_operator.operated_matrix_slim_from(
+-                    matrix_slim=self.mapping_matrix,
+-                    extent_index_for_masked_pixel=(
+-                        self.mask.extent_index_for_masked_pixel
+-                    ),
++                    matrix_slim=self.mapping_matrix[:, lo:hi],
++                    extent_index_for_masked_pixel=extent,
+                 )
+-            )                                  # (n_image_slim, n_mesh)
+-        return self._operated_mapping.T[:, index]   # (n_mesh, L)
++            ).T
++        return out
+ 
+ 
+ def mesh_operator(inversion, dataset):
+@@ -478,6 +502,11 @@ class AugmentedSystem:
+         """P^T W Q for stacked real column sets: P.real^T W_re Q.real + imag."""
+         return P.T @ (self.w_stack[:, None] * Q)
+ 
++    def _point_gram(self, positions, sigmas, P: np.ndarray) -> np.ndarray:
++        """C = P^T W P, the point columns' own Gram matrix. (The streamed
++        system, which has no P, reads it off the kernel instead.)"""
++        return self._curv(P, P)
++
+     def _dvec(self, P: np.ndarray) -> np.ndarray:
+         """P^T W d for a stacked real column set."""
+         return P.T @ self.wd_stack
+@@ -719,7 +748,7 @@ class AugmentedSystem:
+             return s, np.array([]), float(chi2), np.zeros((0, 0))
+ 
+         P, B, Dp = self._column_terms(positions, sigmas)
+-        C = self._curv(P, P)
++        C = self._point_gram(positions, sigmas, P)
+ 
+         # Schur complement: eliminate the mesh block, which is already factorised
+         MinvB = cho_solve(self._cho, B, check_finite=False)
+@@ -865,6 +894,11 @@ def augmented_structure_ratio(
+         mesh, amps, chi2, _ = system.solve(positions)
+     except (np.linalg.LinAlgError, ValueError):
+         return None
++    if hasattr(system, "residual_dirty_image"):     # streamed: image plane only
++        resid_map = system.residual_dirty_image(mesh, positions, amps, imager)
++        ratio = fitting._structure_ratio_from_map(
++            resid_map, chi2, imager, system.n_data)
++        return float(ratio) if np.isfinite(ratio) else None
+     model = system.model_visibilities(mesh, positions, amps)
+     resid = (system.d_re + 1j * system.d_im) - model
+     ratio = fitting._structure_ratio(resid, chi2, imager, system.n_data)
+@@ -1004,11 +1038,17 @@ def fit_point_sources(
+     chi2_target: float = 1.0,
+     retune_criterion: str = "discrepancy",
+     check_positions: bool = True,
++    system: AugmentedSystem | None = None,
+ ):
+     """Fit analytic point components alongside the pixelized model.
+ 
+     Parameters
+     ----------
++    system
++        A prebuilt bordered system, used instead of building one from
++        ``inversion`` and ``dataset`` -- the streamed path passes a
++        `streamed_points.StreamedAugmentedSystem`, with ``dirty_imager`` the
++        kernel imager its structure retune reads.
+     positions
+         Optional list of (dRA, dDec) offsets in arcsec.  Supplied positions are
+         kept (and refined, if ``refine``) regardless of significance -- the
+@@ -1042,7 +1082,8 @@ def fit_point_sources(
+ 
+         b = fit_beam(dirty_imager.dirty_beam, geometry.pixel_scale)
+         beam_fwhm = float(np.sqrt(b.bmaj_arcsec * b.bmin_arcsec))
+-    system = AugmentedSystem(inversion, dataset)
++    if system is None:
++        system = AugmentedSystem(inversion, dataset)
+ 
+     if retune and retune_criterion == "structure" and dirty_imager is None:
+         from .beam import DirtyImager
+diff --git a/src/pyuvimage/streamed_points.py b/src/pyuvimage/streamed_points.py
+new file mode 100644
+index 0000000..c153a7d
+--- /dev/null
++++ b/src/pyuvimage/streamed_points.py
+@@ -0,0 +1,353 @@
++"""Point components on the streamed path: the bordered system without visibilities.
++
++`pointsource.AugmentedSystem` needs three things per point column P_p (a
++unit point at p, optionally widened to a Gaussian of sigma s):
++
++    B_p  = A^T W P_p      the cross-term with the mesh
++    C_pq = P_p^T W P_q    the point-point Gram
++    Dp_p = P_p^T W d      the data term
++
++All three are sums over visibilities, and all three are values of two
++image-plane functions that the streaming pass can accumulate once:
++
++    K(D)  = sum_v w cos(2 pi (u Dx + v Dy))         the w-tilde kernel at lag D
++    Dd(x) = Re sum_v c exp(+2 pi i (u x + v y))     the data's dirty image,
++                                                    c = d_re/s_re^2 + i d_im/s_im^2
++
++    B_p  = M^T k_p,  k_p[i] = K(x_i - p)    (the dirty image of the column,
++                                             projected onto the mesh)
++    C_pq = K(p - q)
++    Dp_p = Dd(p)
++
++A Gaussian width multiplies each visibility by exp(-2 pi^2 s^2 |u|^2), which
++in the image plane is a convolution with a unit Gaussian G_s: K -> K * G_s
++for B and Dd -> Dd * G_s for Dp, and K * G_{sqrt(s1^2 + s2^2)} for a pair.
++
++Positions are continuous, so both functions are held on grids `oversample`
++times finer than the image (`SparseTerms.kernel_fine` / `dirty_fine`,
++accumulated by `streaming.TermsAccumulator`) and read off with a quintic
++spline. At q = 8 that is 2e-9 of K(0) (`claude/teresa-test-2.md`), which on
++Teresa's 1.8e7 chi^2 is far below the delta chi^2 of 1 the refinement and the
++unresolved test resolve.
++
++The w-tilde reduction assumes sigma_re == sigma_im, exactly as the streamed
++inversion's own F does; the streaming pass pools the noise when they differ.
++"""
++from __future__ import annotations
++
++import logging
++from collections import OrderedDict
++
++import numpy as np
++from scipy import ndimage
++from scipy.linalg import cho_factor, cho_solve
++
++from .pointsource import (
++    COLUMN_CACHE_BYTES,
++    AugmentedSystem,
++    SparseMesh,
++)
++
++logger = logging.getLogger(__name__)
++
++#: the spline order the grids are read with; 5 is what the 2e-9 was measured at
++SPLINE_ORDER = 5
++#: the boundary mode for both the prefilter and the lookups (they must agree)
++SPLINE_MODE = "mirror"
++#: Gaussian-widened grids kept at once (each the size of `kernel_fine`)
++WIDTH_CACHE = 6
++#: lattice columns per block in `scan`
++SCAN_BLOCK = 2048
++
++
++def _gaussian_smooth(array: np.ndarray, sigma_px: float) -> np.ndarray:
++    """Circular convolution with a unit-integral Gaussian of `sigma_px` pixels.
++
++    Done in Fourier space rather than with `ndimage.gaussian_filter`, whose
++    4-sigma truncation leaves a 3e-4 error in the taper -- larger than the
++    interpolation by five decades. The FFT form is the exact sampled Gaussian
++    (aliasing at exp(-2 pi^2 sigma_px^2), nothing for sigma_px >~ 1), and
++    the grids are band-limited far below their Nyquist, so this is the
++    continuous convolution. It wraps at the edges, which only reaches lags
++    within a few sigma of the grid's own edge.
++    """
++    fy = np.fft.fftfreq(array.shape[0])[:, None]
++    fx = np.fft.fftfreq(array.shape[1])[None, :]
++    taper = np.exp(-2.0 * np.pi**2 * sigma_px**2 * (fy**2 + fx**2))
++    return np.fft.ifft2(np.fft.fft2(array) * taper).real
++
++
++class PointGrids:
++    """K(dy, dx) and Dd(y, x) anywhere in the field, from `SparseTerms`.
++
++    Coordinates are the grid's (y, x) arcsec of `pointsource` (``sky_to_grid``).
++    The kernel grid is the fftshifted `kernel_fine`, zero lag at
++    ``[Ny q, Nx q]``; autoarray's builder puts lag (dy, dx) = (+i h, -j h) at
++    index (i, j), so a lag is at row ``Ny q + dy/h``, column ``Nx q - dx/h``.
++    The dirty grid is centred (`streaming.type1_image`): (y, x) at row
++    ``Ny q / 2 - y/h``, column ``Nx q / 2 + x/h``.
++    """
++
++    def __init__(self, terms):
++        q = int(getattr(terms, "oversample", 0) or 0)
++        if not q or terms.kernel_fine is None or terms.dirty_fine is None:
++            raise ValueError(
++                "these streamed terms carry no oversampled grids; accumulate "
++                "them with point_oversample > 0 (`streaming.sparse_terms_for`)")
++        self.q = q
++        self.h = float(terms.pixel_scale) / q
++        self._kernel = np.asarray(terms.kernel_fine, dtype=float)   # wraparound
++        self._dirty = np.asarray(terms.dirty_fine, dtype=float)     # centred
++        self.k0 = (self._kernel.shape[0] // 2, self._kernel.shape[1] // 2)
++        self.d0 = (self._dirty.shape[0] // 2, self._dirty.shape[1] // 2)
++        self._coeffs: OrderedDict = OrderedDict()
++
++    def _spline(self, kind: str, sigma: float) -> np.ndarray:
++        key = (kind, float(sigma))
++        hit = self._coeffs.get(key)
++        if hit is not None:
++            self._coeffs.move_to_end(key)
++            return hit
++        if kind == "K":
++            arr = self._kernel
++            if sigma > 0:
++                arr = _gaussian_smooth(arr, sigma / self.h)
++            arr = np.fft.fftshift(arr)
++        else:
++            arr = self._dirty
++            if sigma > 0:
++                arr = _gaussian_smooth(arr, sigma / self.h)
++        coeffs = ndimage.spline_filter(arr, order=SPLINE_ORDER, mode=SPLINE_MODE)
++        self._coeffs[key] = coeffs
++        # the two unwidened grids are always wanted; only widths are evicted
++        while len(self._coeffs) > WIDTH_CACHE + 2:
++            for k in self._coeffs:
++                if k[1] > 0:
++                    del self._coeffs[k]
++                    break
++            else:
++                break
++        return coeffs
++
++    def _read(self, coeffs, rows, cols) -> np.ndarray:
++        shape = np.shape(rows)
++        out = ndimage.map_coordinates(
++            coeffs, [np.ravel(rows), np.ravel(cols)], order=SPLINE_ORDER,
++            mode=SPLINE_MODE, prefilter=False)
++        return out.reshape(shape)
++
++    def kernel(self, dy, dx, sigma: float = 0.0) -> np.ndarray:
++        """K * G_sigma at lags (dy, dx) arcsec; ``sigma`` = 0 is K itself."""
++        dy = np.asarray(dy, dtype=float)
++        dx = np.asarray(dx, dtype=float)
++        return self._read(self._spline("K", sigma),
++                          self.k0[0] + dy / self.h, self.k0[1] - dx / self.h)
++
++    def dirty(self, y, x, sigma: float = 0.0) -> np.ndarray:
++        """Dd * G_sigma at grid positions (y, x) arcsec."""
++        y = np.asarray(y, dtype=float)
++        x = np.asarray(x, dtype=float)
++        return self._read(self._spline("D", sigma),
++                          self.d0[0] - y / self.h, self.d0[1] + x / self.h)
++
++
++class StreamedMesh(SparseMesh):
++    """`SparseMesh` over the stub dataset: `cross_on_grid` only.
++
++    The stub's eight visibilities are not the data, so the per-column routes
++    that transform through its transformer would be silently wrong; they
++    raise instead. `StreamedAugmentedSystem` never calls them.
++    """
++
++    def __init__(self, inversion, stub, n_vis: int):
++        super().__init__(inversion, stub)
++        self.n_vis = int(n_vis)
++
++    def cross(self, Pw):
++        raise NotImplementedError(
++            "the streamed bordered system has no visibilities to transform; "
++            "its cross-terms come from the kernel (`StreamedAugmentedSystem`)")
++
++    def forward(self, mesh_values):
++        raise NotImplementedError(
++            "the streamed path keeps no visibilities, so there are no model "
++            "visibilities to form; the residual is formed in the image plane "
++            "(`StreamedAugmentedSystem.residual_dirty_image`)")
++
++
++class StreamedAugmentedSystem(AugmentedSystem):
++    """`AugmentedSystem` from streamed terms: B, C, Dp read off the grids.
++
++    F, H and D are the stub inversion's, which the w-tilde operator built from
++    the same terms; chi2_const is d^T N^-1 d from the streaming pass. Every
++    solve, scan, refinement and retune in `pointsource` then runs unchanged
++    -- they only ever ask for these terms, never for a visibility.
++    """
++
++    def __init__(self, inversion, stub, terms, imager=None):
++        self.inversion = inversion
++        self.terms = terms
++        self.grids = PointGrids(terms)
++        self.imager = imager
++        self.mesh = StreamedMesh(inversion, stub, terms.n_vis)
++        self.mapping_matrix = self.mesh.mapping_matrix
++        self.n_vis = int(terms.n_vis)
++        self.F = np.asarray(inversion.curvature_matrix)
++        self.D = np.asarray(inversion.data_vector)
++        self.H = np.asarray(inversion.regularization_matrix)
++        self.n_mesh = self.F.shape[0]
++        self.n_data = 2 * self.n_vis
++        self.h_scale = 1.0
++        self._cho = cho_factor(self.F + self.H, lower=True, check_finite=False)
++        self._MinvD = None
++        self.chi2_const = float(terms.data_term)
++        self._columns: OrderedDict = OrderedDict()
++        self._column_cache_max = int(
++            min(4096, max(8, COLUMN_CACHE_BYTES // (8 * (self.n_mesh + 2)))))
++        self._lattice = None
++        # image-pixel centres in the mapping matrix's (slim) order
++        grid = np.asarray(self.mesh.mask.derive_grid.unmasked).reshape(-1, 2)
++        if grid.shape[0] != self.mapping_matrix.shape[0]:
++            raise ValueError(
++                "the mask's grid does not match the mapping matrix's rows")
++        self._pix_y = grid[:, 0].copy()
++        self._pix_x = grid[:, 1].copy()
++
++    # ---- the visibility-space members, which do not exist here -----------
++    @property
++    def w_stack(self):
++        raise AttributeError("the streamed system holds no visibilities")
++
++    d_stack = wd_stack = d_re = d_im = uv = w_stack
++
++    def _stacked_columns(self, ys, xs, sigmas=None):
++        raise NotImplementedError("the streamed system forms no visibility columns")
++
++    def columns_for(self, positions, sigma_arcsec=0.0):
++        raise NotImplementedError("the streamed system forms no visibility columns")
++
++    # ---- the column terms, from the grids --------------------------------
++    def _column_terms(self, positions, sigmas=None):
++        """(None, B, Dp): as the base class, with no visibility column P."""
++        positions = list(positions)
++        k = len(positions)
++        if sigmas is None:
++            sigmas = [0.0] * k
++        keys = [(float(y), float(x), float(s))
++                for (y, x), s in zip(positions, sigmas)]
++        for key in keys:
++            if key in self._columns:
++                continue
++            y, x, s = key
++            k_p = self.grids.kernel(self._pix_y - y, self._pix_x - x, s)
++            self._columns[key] = (
++                self.mapping_matrix.T @ k_p,
++                float(self.grids.dirty(y, x, s)),
++            )
++            while len(self._columns) > self._column_cache_max:
++                self._columns.popitem(last=False)
++        B = np.empty((self.n_mesh, k))
++        Dp = np.empty(k)
++        for j, key in enumerate(keys):
++            self._columns.move_to_end(key)
++            B[:, j], Dp[j] = self._columns[key]
++        return None, B, Dp
++
++    def _point_gram(self, positions, sigmas, P=None) -> np.ndarray:
++        """C_ij = (K * G_sqrt(si^2 + sj^2))(p_i - p_j)."""
++        positions = list(positions)
++        k = len(positions)
++        s = np.zeros(k) if sigmas is None else np.asarray(sigmas, dtype=float)
++        ys = np.array([p[0] for p in positions], dtype=float)
++        xs = np.array([p[1] for p in positions], dtype=float)
++        C = np.empty((k, k))
++        widths = np.sqrt(s[:, None] ** 2 + s[None, :] ** 2)
++        for w in np.unique(widths):
++            sel = widths == w
++            i, j = np.nonzero(sel)
++            C[i, j] = self.grids.kernel(ys[i] - ys[j], xs[i] - xs[j], float(w))
++        return 0.5 * (C + C.T)
++
++    def scan(self, positions, ys, xs, chunk: int | None = None):
++        """`AugmentedSystem.scan` with the lattice terms read off the grids.
++
++        Per trial column: b from `cross_on_grid` (or the grid kernel off the
++        image grid), c = K(0) = sum w, dp = Dd at the position, and the
++        accepted points' rows K(lattice - p).
++        """
++        ys = np.asarray(ys, dtype=float).ravel()
++        xs = np.asarray(xs, dtype=float).ravel()
++        if positions:
++            _, B0, Dp0 = self._column_terms(positions)
++            M = np.block([
++                [self.F + self.h_scale * self.H, B0],
++                [B0.T, self._point_gram(positions, None)],
++            ])
++            D_eff = np.concatenate([self.D, Dp0])
++        else:
++            M = self.F + self.h_scale * self.H
++            D_eff = self.D
++        M = M + np.eye(M.shape[0]) * 1e-12 * max(np.trace(M), 1e-30)
++        cho = cho_factor(M, lower=True, check_finite=False)
++        MinvD = cho_solve(cho, D_eff, check_finite=False)
++
++        b_all = self.mesh.cross_on_grid(ys, xs)
++        dp_all = self.grids.dirty(ys, xs)
++        c0 = float(self.grids.kernel(0.0, 0.0))
++        block = max(1, int(chunk or SCAN_BLOCK))
++        amp = np.empty(ys.size)
++        sig = np.empty(ys.size)
++        for lo in range(0, ys.size, block):
++            hi = min(lo + block, ys.size)
++            if b_all is not None:
++                b = b_all[:, lo:hi]
++            else:
++                b = self._column_terms(list(zip(ys[lo:hi], xs[lo:hi])))[1]
++            if positions:
++                rows = np.vstack([
++                    self.grids.kernel(ys[lo:hi] - py, xs[lo:hi] - px)
++                    for (py, px) in positions
++                ])
++                B = np.vstack([b, rows])
++            else:
++                B = b
++            r = dp_all[lo:hi] - B.T @ MinvD
++            MinvB = cho_solve(cho, B, check_finite=False)
++            sch = np.maximum(c0 - np.einsum("ij,ij->j", B, MinvB), 1e-30)
++            amp[lo:hi] = r / sch
++            sig[lo:hi] = np.abs(r) / np.sqrt(sch)
++        return amp, sig
++
++    # ---- the image-plane residual ----------------------------------------
++    def point_dirty_image(self, positions, amplitudes, sigmas=None) -> np.ndarray:
++        """Sum a_j (K * G_sj)(x - p_j) on the native image grid, unnormalised
++        (divide by sum w for Jy/beam, as `KernelDirtyImager` does)."""
++        ny, nx = self.terms.shape_native
++        pix = float(self.terms.pixel_scale)
++        iy, ix = np.mgrid[0:ny, 0:nx]
++        gy = ((ny - 1) / 2.0 - iy) * pix
++        gx = (ix - (nx - 1) / 2.0) * pix
++        out = np.zeros((ny, nx))
++        if sigmas is None:
++            sigmas = [0.0] * len(positions)
++        for (py, px), a, s in zip(positions, amplitudes, sigmas):
++            out += float(a) * self.grids.kernel(gy - py, gx - px, float(s))
++        return out
++
++    def residual_dirty_image(self, mesh_values, positions, amplitudes,
++                             imager=None) -> np.ndarray:
++        """dirty(data) - dirty(mesh model) - dirty(points) [Jy/beam]."""
++        imager = imager if imager is not None else self.imager
++        if imager is None:
++            raise ValueError("the streamed residual needs the kernel imager")
++        import autoarray as aa
++
++        slim = self.mapping_matrix @ np.asarray(mesh_values)
++        model = np.asarray(aa.Array2D(values=slim, mask=self.mesh.mask).native)
++        out = imager.dirty_image_of_data() - imager.dirty_image_of_model(model)
++        if len(positions):
++            out = out - self.point_dirty_image(positions, amplitudes) / imager._norm
++        return out
++
++    def model_visibilities(self, mesh_values, positions, amplitudes):
++        return self.mesh.forward(mesh_values)   # raises, with the reason
+diff --git a/src/pyuvimage/streaming.py b/src/pyuvimage/streaming.py
+index a1d88de..bf092cf 100644
+--- a/src/pyuvimage/streaming.py
++++ b/src/pyuvimage/streaming.py
+@@ -59,6 +59,81 @@ logger = logging.getLogger("pyuvimage")
+ #: next chunk.
+ STREAM_CHUNK_K = 4096
+ 
++#: Visibilities per type-1 NUFFT call on the fast accumulation path. Each
++#: call's cost is dominated by the FFT of the upsampled grid, which does not
++#: depend on how many samples were spread onto it, so samples are batched;
++#: the spreader's gather buffer is batch x nspread^2 complex (~200 MB at
++#: eps 1e-12), which sets the ceiling.
++NUFFT_BATCH = 65536
++
++#: Requested NUFFT precision on the fast path -- the kernel builder's own.
++NUFFT_EPS = 1.0e-12
++
++
++def nufftax_available() -> bool:
++    try:
++        from autoarray.inversion.inversion.interferometer import (
++            inversion_interferometer_util as su,
++        )
++    except Exception:  # pragma: no cover
++        return False
++    return su._load_nufftax() is not None
++
++
++def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
++                pixel_scale_arcsec: float, centred: bool = False,
++                eps: float = NUFFT_EPS) -> np.ndarray:
++    """``Re sum_k c_k exp(+2 pi i (u_k x + v_k y))`` on a uniform grid, by a
++    type-1 NUFFT -- the adjoint of the forward transform, on its plain
++    mathematical scale.
++
++    ``centred=False`` (an image): the grid is autoarray's native image grid,
++    row 0 at +y, pixel centres at ``y = ((Ny-1)/2 - row) pix`` and
++    ``x = (col - (Nx-1)/2) pix`` -- half-integer multiples of the pixel for
++    the even sizes pyuvimage builds. This is what `fitting.adjoint_image`
++    returns through a DFT, at O(n_vis nspread^2 + N log N) instead of
++    O(n_vis N); `tests/test_streaming_nufft.py` pins the two together.
++
++    ``centred=True``: samples at integer multiples of the pixel, ``y =
++    (Ny/2 - row) pix`` and ``x = (col - Nx/2) pix`` -- zero at
++    ``[Ny/2, Nx/2]``. Used for the oversampled grids point components are
++    interpolated from, whose samples should include the origin.
++
++    nufftax returns ``f[m2, m1] = sum c exp(i (m1 x_k + m2 y_k))`` on centred
++    modes ``m in [-N/2, N/2)``; rows run toward -y, so ``y_k`` enters with a
++    minus sign, and the half-pixel offset of an image grid is a phase on c.
++    """
++    from autoarray.inversion.inversion.interferometer import (
++        inversion_interferometer_util as su,
++    )
++    import jax.numpy as jnp
++
++    nufftax = su._load_nufftax()
++    ny, nx = (int(v) for v in shape)
++    if ny % 2 or nx % 2:
++        raise ValueError(f"type1_image needs even sizes, got {shape}")
++    pix = float(pixel_scale_arcsec) * ARCSEC_TO_RAD_STREAM
++    u = np.asarray(uv[:, 0], dtype=np.float64)
++    v = np.asarray(uv[:, 1], dtype=np.float64)
++    c = np.asarray(values, dtype=np.complex128)
++    if not centred:
++        # x = (m1 + 1/2) pix, y = -(m2 + 1/2) pix
++        c = c * np.exp(1j * np.pi * pix * (u - v))
++    f = nufftax.nufft2d1(
++        jnp.asarray(2.0 * np.pi * u * pix), jnp.asarray(-2.0 * np.pi * v * pix),
++        jnp.asarray(c), (nx, ny), eps, 1,
++    )
++    return np.asarray(np.real(f), dtype=np.float64)
++
++
++#: the fine kernel's lag margin beyond one field width, as a fraction of it
++#: (see `TermsAccumulator`); a quarter covers 4 sigma of the widest Gaussian
++#: the unresolved test tries (1.5 beam sigma) once the field is ~4 beams
++POINT_KERNEL_PAD = 0.25
++
++ARCSEC_TO_RAD_STREAM = np.pi / (180.0 * 3600.0)
++
++
+ @dataclass
+ class VisibilityChunk:
+     """One block of unflagged samples: uv in wavelengths, data and sigma.
+@@ -454,6 +529,12 @@ class SparseTerms:
+     shape_native: tuple[int, int] = (0, 0)
+     pixel_scale: float = 0.0
+     seconds: float = 0.0
++    # Point components (`streamed_points.py`): the kernel and the data's dirty
++    # image on a grid `oversample` times finer than the image, from which
++    # both are interpolated at sub-pixel positions. None when not asked for.
++    kernel_fine: np.ndarray | None = None   # (2 (Ny+pad) q, ...), wraparound, as `kernel`
++    dirty_fine: np.ndarray | None = None    # (2 Ny q, 2 Nx q), centred (`type1_image`)
++    oversample: int = 0
+ 
+     @property
+     def max_baseline(self) -> float:
+@@ -491,6 +572,12 @@ class SparseTerms:
+             reim_asymmetry_sum=float(sum(p.reim_asymmetry_sum for p in parts)),
+             shape_native=first.shape_native, pixel_scale=first.pixel_scale,
+             seconds=float(sum(p.seconds for p in parts)),
++            kernel_fine=(sum(p.kernel_fine for p in parts)
++                         if all(p.kernel_fine is not None for p in parts) else None),
++            dirty_fine=(sum(p.dirty_fine for p in parts)
++                        if all(p.dirty_fine is not None for p in parts) else None),
++            oversample=(first.oversample
++                        if all(p.kernel_fine is not None for p in parts) else 0),
+         )
+ 
+     # -- persistence -------------------------------------------------------
+@@ -504,6 +591,9 @@ class SparseTerms:
+             row_lengths=self.row_lengths, row_keep=self.row_keep,
+             shape_native=np.array(self.shape_native), pixel_scale=self.pixel_scale,
+             key=np.array(key),
++            **({} if self.kernel_fine is None else dict(
++                kernel_fine=self.kernel_fine, dirty_fine=self.dirty_fine,
++                oversample=np.array(self.oversample))),
+         )
+ 
+     @classmethod
+@@ -520,6 +610,10 @@ class SparseTerms:
+                 shape_native=tuple(int(v) for v in z["shape_native"]),
+                 pixel_scale=float(z["pixel_scale"]),
+             )
++            if "kernel_fine" in z.files:
++                terms.kernel_fine = z["kernel_fine"]
++                terms.dirty_fine = z["dirty_fine"]
++                terms.oversample = int(z["oversample"])
+             return terms, str(z["key"])
+ 
+ 
+@@ -586,7 +680,8 @@ class TermsAccumulator:
+     """
+ 
+     def __init__(self, geometry, mask, transformer_cls, *, use_jax: bool = False,
+-                 pool_noise: bool = False, rows: RowTracker | None = None):
++                 pool_noise: bool = False, rows: RowTracker | None = None,
++                 fast: bool | None = None, point_oversample: int = 0):
+         self.geometry = geometry
+         self.mask = mask
+         self.transformer_cls = transformer_cls
+@@ -603,6 +698,38 @@ class TermsAccumulator:
+         self.sum_w = self.data_term = self.noise_norm = self.asym = 0.0
+         self.n_vis = 0
+         self.t0 = time.time()
++        # The fast path: every image above is a type-1 NUFFT of the chunk,
++        # batched (`NUFFT_BATCH`). The per-chunk DFT it replaces costs
++        # n_image per sample: measured 2.4 ms/sample at 112x112, i.e. ~6 h
++        # for a 9.1M-sample dataset whose in-memory kernel build took 11 s.
++        self.fast = nufftax_available() if fast is None else bool(fast)
++        if point_oversample and not self.fast:
++            raise RuntimeError(
++                "point components on the streamed path need nufftax (the "
++                "oversampled grids are type-1 NUFFTs)")
++        self.q = int(point_oversample)
++        if self.q:
++            if self.q % 2:
++                raise ValueError("point_oversample must be even")
++            fine = (shape[0] * self.q, shape[1] * self.q)
++            # The kernel's lags reach one field width -- every pixel pair --
++            # plus a margin: a Gaussian-widened column convolves K with the
++            # width, and a pair nearly a field apart would otherwise read the
++            # circular wrap (3e-3 of B for a 0.2" width in a 3" field)
++            pad = int(np.ceil(POINT_KERNEL_PAD * max(shape)))
++            self.kernel_fine_shape = ((shape[0] + pad) * self.q, (shape[1] + pad) * self.q)
++            self.kernel_fine = np.zeros(
++                (2 * self.kernel_fine_shape[0], 2 * self.kernel_fine_shape[1]),
++                dtype=np.float64)
++            # twice the field, like the kernel: a Gaussian-widened column near
++            # the field's edge convolves Dd with values from beyond it, and
++            # the circular convolution must find the sky there, not the
++            # opposite edge (3.5% on Dp at 0.27" from the edge of a 3" field)
++            self.dirty_fine = np.zeros((2 * fine[0], 2 * fine[1]), dtype=np.float64)
++            # only the pixel spacing of this grid is used by the builder
++            self.grid_radians_fine = np.asarray(self.grid_radians)[:2, :2] / self.q
++        self._buf: list = []
++        self._buf_n = 0
+ 
+     def add(self, ch: VisibilityChunk) -> None:
+         from autoarray.inversion.inversion.interferometer import (
+@@ -624,6 +751,13 @@ class TermsAccumulator:
+         if self.pool_noise:
+             s = pooled_noise(s)
+         sr, si = s.real, s.imag
++        if self.fast:
++            self._buf.append((uv, d, sr, si))
++            self._buf_n += n
++            if self._buf_n >= NUFFT_BATCH:
++                self._flush()
++            self._add_scalars(d, sr, si, n)
++            return
+         # -- the kernel, from autoarray's own accumulation on this chunk
+         self.kernel += np.asarray(sparse_util.nufft_precision_operator_from(
+             noise_map_real=sr, uv_wavelengths=uv,
+@@ -644,14 +778,56 @@ class TermsAccumulator:
+         self.beam += np.asarray(adjoint_image(transformer, Visibilities(w.astype(complex))).native)
+         self.data_dirty += np.asarray(adjoint_image(transformer, Visibilities(d * w)).native)
+         del transformer
+-        # -- the scalars
++        self._add_scalars(d, sr, si, n)
++
++    def _add_scalars(self, d, sr, si, n) -> None:
++        w = sr ** -2.0
+         self.sum_w += float(np.sum(w))
+         self.data_term += float(np.sum(d.real ** 2 / sr ** 2) + np.sum(d.imag ** 2 / si ** 2))
+         self.noise_norm += float(np.sum(np.log(2 * np.pi * sr ** 2))
+                                  + np.sum(np.log(2 * np.pi * si ** 2)))
+         self.n_vis += n
+ 
++    def _flush(self) -> None:
++        """The buffered samples' contribution to every image term."""
++        if not self._buf:
++            return
++        from autoarray.inversion.inversion.interferometer import (
++            inversion_interferometer_util as sparse_util,
++        )
++
++        uv = np.concatenate([b[0] for b in self._buf])
++        d = np.concatenate([b[1] for b in self._buf])
++        sr = np.concatenate([b[2] for b in self._buf])
++        si = np.concatenate([b[3] for b in self._buf])
++        self._buf, self._buf_n = [], 0
++        pix = float(self.geometry.pixel_scale)
++        self.kernel += np.asarray(sparse_util.nufft_precision_operator_from(
++            noise_map_real=sr, uv_wavelengths=uv,
++            shape_masked_pixels_2d=self.shape, grid_radians_2d=self.grid_radians,
++            method="nufft", eps=NUFFT_EPS,
++        ))
++        weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
++        w = sr ** -2.0
++        dirty = type1_image(uv, weighted, self.shape, pix)
++        self.dirty += dirty
++        self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
++        # with equal sigma_re and sigma_im -- always, once pooled -- the
++        # products' weighting is the fit's, and the two images are one
++        self.data_dirty += (dirty if np.array_equal(sr, si)
++                            else type1_image(uv, d * w, self.shape, pix))
++        if self.q:
++            self.kernel_fine += np.asarray(sparse_util.nufft_precision_operator_from(
++                noise_map_real=sr, uv_wavelengths=uv,
++                shape_masked_pixels_2d=self.kernel_fine_shape,
++                grid_radians_2d=self.grid_radians_fine,
++                method="nufft", eps=NUFFT_EPS,
++            ))
++            self.dirty_fine += type1_image(
++                uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
++
+     def finish(self) -> SparseTerms:
++        self._flush()
+         lengths, keep = self.rows.lengths_and_keep()
+         return SparseTerms(
+             kernel=self.kernel, dirty_image=self.dirty, beam_raw=self.beam,
+@@ -661,6 +837,9 @@ class TermsAccumulator:
+             reim_asymmetry_sum=self.asym, shape_native=self.shape,
+             pixel_scale=float(self.geometry.pixel_scale),
+             seconds=time.time() - self.t0,
++            kernel_fine=self.kernel_fine if self.q else None,
++            dirty_fine=self.dirty_fine if self.q else None,
++            oversample=self.q,
+         )
+ 
+ 
+@@ -673,10 +852,11 @@ def accumulate_sparse_terms(
+     use_jax: bool = False,
+     pool_noise: bool = False,
+     log_every: int = 50,
++    point_oversample: int = 0,
+ ) -> SparseTerms:
+     """One pass: fold every chunk into `SparseTerms` (see `TermsAccumulator`)."""
+     acc = TermsAccumulator(geometry, mask, transformer_cls, use_jax=use_jax,
+-                           pool_noise=pool_noise)
++                           pool_noise=pool_noise, point_oversample=point_oversample)
+     for i, ch in enumerate(chunks):
+         acc.add(ch)
+         if log_every and (i + 1) % log_every == 0:
+@@ -802,7 +982,8 @@ def source_identity(source) -> str:
+ 
+ def terms_key(source, geometry, mask_shape: str = "square", pool_noise: bool = False,
+               centre: tuple[float, float] | None = None,
+-              channel: tuple[int, int] | None = None, thin: int = 1) -> str:
++              channel: tuple[int, int] | None = None, thin: int = 1,
++              oversample: int = 0) -> str:
+     """What names a `SparseTerms` cache entry.
+ 
+     The source's identity, the geometry, the mask, whether the noise was
+@@ -824,6 +1005,8 @@ def terms_key(source, geometry, mask_shape: str = "square", pool_noise: bool = F
+         geo["channel"] = [int(channel[0]), int(channel[1])]
+     if thin > 1:
+         geo["thin"] = int(thin)
++    if oversample:
++        geo["point_oversample"] = int(oversample)
+     return hashlib.sha1((ident + "|" + json.dumps(geo, sort_keys=True)).encode()).hexdigest()[:16]
+ 
+ 
+@@ -873,15 +1056,21 @@ def sparse_terms_for(
+     pool_noise: bool = False,
+     reuse_cache: bool = True,
+     centre: tuple[float, float] | None = None,
++    point_oversample: int = 0,
+ ) -> SparseTerms:
+     """The terms for `source`, from the cache when it has them, else one pass.
+ 
++    `point_oversample` > 0 also accumulates the oversampled kernel and dirty
++    image point components are interpolated from (`streamed_points.py`); it
++    is part of the key.
++
+     `reuse_cache=False` streams again regardless and overwrites the entry --
+     the cache is keyed on path, size and mtime, which a file rewritten in
+     place with the same size can defeat. `centre` (y0, x0 arcsec on the grid)
+     recentres every chunk on the way in (`recentred`); it is part of the key.
+     """
+-    key = terms_key(source, geometry, mask_shape, pool_noise, centre=centre)
++    key = terms_key(source, geometry, mask_shape, pool_noise, centre=centre,
++                    oversample=point_oversample)
+     path = terms_cache_path(cache_dir, key)
+     if reuse_cache:
+         terms = _load_cached(path, key, geometry)
+@@ -902,6 +1091,7 @@ def sparse_terms_for(
+         chunks = recentred(chunks, centre)
+     terms = accumulate_sparse_terms(
+         chunks, geometry, mask, transformer_cls, use_jax=use_jax, pool_noise=pool_noise,
++        point_oversample=point_oversample,
+     )
+     logger.info(
+         "  %d visibilities in %.1f s; kernel %s, %.2f MB", terms.n_vis,
+diff --git a/tests/test_streamed_points.py b/tests/test_streamed_points.py
+new file mode 100644
+index 0000000..90ba497
+--- /dev/null
++++ b/tests/test_streamed_points.py
+@@ -0,0 +1,248 @@
++"""Point components on the streamed path (`streamed_points`).
++
++The streamed pass keeps no visibilities, so a point column's three terms --
++A^T W P, P^T W P, P^T W d -- are read off the w-tilde kernel K and the data's
++dirty image Dd, accumulated on grids `oversample` times finer than the image.
++The in-memory `AugmentedSystem` evaluates the same sums visibility by
++visibility, and is the definition of correct: everything here pins the
++streamed system against it, and the grids against direct sums.
++"""
++import numpy as np
++import pytest
++
++import autogalaxy as ag
++
++from pyuvimage import fitting, mock
++from pyuvimage import streaming as stm
++from pyuvimage.pointsource import (
++    ARCSEC_TO_RAD,
++    AugmentedSystem,
++    SparseMesh,
++    augmented_structure_ratio,
++    detection_lattice,
++    fit_point_sources,
++)
++
++needs_sparse = pytest.mark.skipif(
++    fitting.sparse_inversion_diagnosis() is not None
++    or not stm.nufftax_available(),
++    reason="the sparse operator needs JAX, the fine grids nufftax",
++)
++pytestmark = needs_sparse
++
++PRIOR = {"coefficient": 1e7, "scale": 0.25, "nu": 1.5}
++Q = 8
++
++
++@pytest.fixture(scope="module")
++def case():
++    """One mock (equal sigma_re and sigma_im, as the w-tilde path needs),
++    fitted in memory and from its streamed terms with the same prior."""
++    from pyuvimage.streamed_points import StreamedAugmentedSystem
++
++    uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
++        n_vis=400, mesh_n=24, compact_flux=0.012, compact_centre=(0.8, -0.7))
++    uv, d, nz = uvd.flattened()
++    assert np.allclose(nz.real, nz.imag)
++    ds = fitting.with_sparse_operator(
++        fitting.make_dataset(uv, d, nz, geom), geometry=geom)
++    fit = fitting.fit_dataset(
++        ds, geom, reg_kind="matern", prior=PRIOR, positive_only=False)
++
++    terms = stm.accumulate_sparse_terms(
++        stm.iter_uvdata_chunks(uvd, 4096), geom, ds.real_space_mask,
++        ag.TransformerDFT, point_oversample=Q)
++    stub = stm.stub_dataset_from_terms(terms, geom, ds.real_space_mask)
++    imager = fitting.imager_for(stub)
++    sfit = fitting.fit_dataset(
++        stub, geom, reg_kind="matern", prior=PRIOR, positive_only=False)
++    return dict(
++        uv=uv, d=d, w=1.0 / nz.real**2, geom=geom, terms=terms,
++        mem=(fit.fit.inversion, ds), stub=stub, imager=imager,
++        streamed=(sfit.fit.inversion, stub, terms, imager),
++        system=StreamedAugmentedSystem(sfit.fit.inversion, stub, terms, imager),
++        StreamedAugmentedSystem=StreamedAugmentedSystem,
++    )
++
++
++# positions off the grid, one within 0.27" of the 3" field's edge (where the
++# circular Gaussian smoothing would wrap without the grids' margins)
++POSITIONS = [(0.813, 0.721), (-0.31, 0.47), (0.123, -1.234)]
++SIGMAS = [0.0, 0.07, 0.2]
++
++
++def _direct(case, y, x, s, kind):
++    uv, w, d = case["uv"], case["w"], case["d"]
++    taper = np.exp(-2 * np.pi**2 * (s * ARCSEC_TO_RAD) ** 2 * (uv**2).sum(1))
++    phase = 2 * np.pi * (uv[:, 0] * x + uv[:, 1] * y) * ARCSEC_TO_RAD
++    if kind == "K":
++        return np.sum(w * taper * np.cos(phase))
++    return np.real(np.sum(w * d * taper * np.exp(1j * phase)))
++
++
++def test_grids_reproduce_the_direct_sums(case):
++    """K(lag) and Dd(position), widened or not, to ~1e-9 of their peak --
++    including next to the field's edge, where an unpadded grid wrapped
++    (3.5% on Dd there before the margins)."""
++    from pyuvimage.streamed_points import PointGrids
++
++    g = PointGrids(case["terms"])
++    k0 = case["w"].sum()
++    d_peak = max(abs(_direct(case, y, x, 0.0, "D")) for y, x in POSITIONS)
++    for (y, x) in POSITIONS + [(1.4, -1.45)]:
++        for s in (0.0, 0.07, 0.2, 0.3):
++            assert g.kernel(y, x, s) == pytest.approx(
++                _direct(case, y, x, s, "K"), abs=1e-8 * k0)
++            # 0.3" in the corner is 6 sigma from the dirty grid's edge, and
++            # its wrap shows at 7e-8; the unresolved test's widest here is 0.22"
++            assert g.dirty(y, x, s) == pytest.approx(
++                _direct(case, y, x, s, "D"), abs=(1e-7 if s > 0.25 else 1e-8) * d_peak)
++    # a lag of most of a field, widened: needs the kernel's lag margin
++    # (`streaming.POINT_KERNEL_PAD`, 0.75" here: 5.7 sigma beyond this lag)
++    assert g.kernel(2.6, -2.5, 0.2) == pytest.approx(
++        _direct(case, 2.6, -2.5, 0.2, "K"), abs=1e-8 * k0)
++
++
++def test_no_grids_no_system(case):
++    from pyuvimage.streamed_points import PointGrids
++
++    plain = stm.accumulate_sparse_terms(
++        stm.iter_uvdata_chunks(mock.make_extended_plus_compact_dataset(
++            n_vis=50, mesh_n=6)[0], 4096),
++        case["geom"], case["stub"].real_space_mask, ag.TransformerDFT)
++    with pytest.raises(ValueError, match="point_oversample"):
++        PointGrids(plain)
++
++
++def test_column_terms_match_the_in_memory_system(case):
++    mem = AugmentedSystem(*case["mem"])
++    st = case["system"]
++    assert st.chi2_const == pytest.approx(mem.chi2_const, rel=1e-12)
++    np.testing.assert_allclose(st.F, mem.F, rtol=0, atol=1e-12 * np.abs(mem.F).max())
++    np.testing.assert_allclose(st.D, mem.D, rtol=0, atol=1e-12 * np.abs(mem.D).max())
++    P, Bm, Dm = mem._column_terms(POSITIONS, SIGMAS)
++    Cm = mem._point_gram(POSITIONS, SIGMAS, P)
++    none, Bs, Ds = st._column_terms(POSITIONS, SIGMAS)
++    assert none is None
++    np.testing.assert_allclose(Bs, Bm, rtol=0, atol=1e-8 * np.abs(Bm).max())
++    np.testing.assert_allclose(Ds, Dm, rtol=0, atol=1e-8 * np.abs(Dm).max())
++    np.testing.assert_allclose(st._point_gram(POSITIONS, SIGMAS), Cm,
++                               rtol=0, atol=1e-8 * case["w"].sum())
++
++
++def test_solve_scan_and_structure_match_the_in_memory_system(case):
++    mem = AugmentedSystem(*case["mem"])
++    st = case["system"]
++    for positions in ([], POSITIONS[:1], POSITIONS[:2]):
++        sm, am, cm, covm = mem.solve(positions)
++        ss, as_, cs, covs = st.solve(positions)
++        assert cs == pytest.approx(cm, abs=1e-6)        # chi^2 ~ 470: delta 1e-6
++        np.testing.assert_allclose(as_, am, rtol=1e-6, atol=1e-10)
++        np.testing.assert_allclose(ss, sm, rtol=0, atol=1e-6 * np.abs(sm).max())
++    ys, xs = detection_lattice(case["geom"])
++    for accepted in ([], POSITIONS[:1]):
++        am, sm = mem.scan(accepted, ys, xs)
++        as_, ss = st.scan(accepted, ys, xs)
++        np.testing.assert_allclose(as_, am, rtol=0, atol=1e-7 * np.abs(am).max())
++        np.testing.assert_allclose(ss, sm, rtol=0, atol=1e-7 * sm.max())
++    rm = augmented_structure_ratio(mem, POSITIONS[:1], fitting.imager_for(case["mem"][1]))
++    rs = augmented_structure_ratio(st, POSITIONS[:1], case["imager"])
++    assert rs == pytest.approx(rm, rel=1e-9)
++
++
++def test_visibility_space_is_refused_not_faked(case):
++    """The stub's eight visibilities are not the data; nothing may read them."""
++    st = case["system"]
++    with pytest.raises(NotImplementedError):
++        st.model_visibilities(np.zeros(st.n_mesh), [], [])
++    with pytest.raises(NotImplementedError):
++        st.columns_for(POSITIONS)
++    with pytest.raises(AttributeError):
++        st.d_re
++
++
++@pytest.mark.parametrize("positions", [None, [(0.7, 0.8)]])   # (dRA, dDec)
++def test_fit_point_sources_is_the_same_fit(case, positions):
++    """Detection, refinement, the unresolved test (widened columns), the
++    structure retune and the systematic error: the same answer either way."""
++    beam = 0.35
++    mem = fit_point_sources(
++        case["mem"][0], case["mem"][1], case["geom"], positions=positions,
++        beam_fwhm=beam, retune_criterion="structure",
++        dirty_imager=fitting.imager_for(case["mem"][1]))
++    inv, stub, terms, imager = case["streamed"]
++    st = fit_point_sources(
++        inv, stub, case["geom"], positions=positions, beam_fwhm=beam,
++        retune_criterion="structure", dirty_imager=imager,
++        system=case["StreamedAugmentedSystem"](inv, stub, terms, imager))
++    # The two systems' chi^2 surfaces agree to ~1e-7, and Nelder-Mead stops
++    # within its own tolerance (step/20 = 1.6 mas here) of the minimum, so
++    # positions agree to well inside that, not to rounding; likewise the
++    # retune, which bisects the structure ratio to a 1% bracket
++    assert len(st.points) == len(mem.points) >= 1
++    for a, b in zip(st.points, mem.points):
++        assert a.d_ra == pytest.approx(b.d_ra, abs=1e-4)
++        assert a.d_dec == pytest.approx(b.d_dec, abs=1e-4)
++        assert a.flux == pytest.approx(b.flux, rel=1e-4)
++        assert a.flux_error == pytest.approx(b.flux_error, rel=1e-3)
++    assert st.regularization_factor == pytest.approx(mem.regularization_factor, rel=1e-3)
++    assert st.chi_squared == pytest.approx(mem.chi_squared, rel=1e-5)
++
++
++def test_cross_on_grid_batches_without_changing_the_answer(case, monkeypatch):
++    """`(W~ M)^T` is built a batch of columns at a time (all at once was 5 GB
++    of FFT transients on Teresa's grid); the batching changes nothing."""
++    from pyuvimage import pointsource
++
++    inv, ds = case["mem"]
++    ys, xs = detection_lattice(case["geom"])
++    whole = SparseMesh(inv, ds).cross_on_grid(ys, xs)
++    monkeypatch.setattr(pointsource, "SCAN_CHUNK_BYTES", 1)   # one column per batch
++    batched = SparseMesh(inv, ds).cross_on_grid(ys, xs)
++    np.testing.assert_array_equal(batched, whole)
++    # and a strict subset of the grid is the matching columns
++    sub = SparseMesh(inv, ds).cross_on_grid(ys[::7], xs[::7])
++    np.testing.assert_array_equal(sub, whole[:, ::7])
++
++
++def test_streamed_run_with_points_matches_the_in_memory_run(tmp_path):
++    """`api.run` end to end: MFS points now stream rather than holding the
++    visibilities, and every product agrees with the in-memory sparse run."""
++    from pyuvimage import api
++
++    uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
++        n_vis=400, mesh_n=24, compact_flux=0.012, compact_centre=(0.8, -0.7))
++    kw = dict(fov=3.0, reg="matern", criterion="structure", inversion="sparse",
++              pb_correction=False, write=False, uncertainty_map=False,
++              point_sources=True)
++    ref = api.run(uvd, out=tmp_path / "mem", **kw)
++    st = api.run(uvd, out=tmp_path / "str", streaming=True, chunk_k=4096,
++                 kernel_cache=str(tmp_path), **kw)
++    r, s = ref.products[0], st.products[0]
++    assert len(s.points) == len(r.points) == 1
++    assert s.points[0].flux == pytest.approx(r.points[0].flux, rel=1e-6)
++    assert s.points[0].d_ra == pytest.approx(r.points[0].d_ra, abs=1e-6)
++    assert s.chi_squared == pytest.approx(r.chi_squared, rel=1e-6)
++    np.testing.assert_allclose(s.model_image, r.model_image, rtol=0,
++                               atol=1e-6 * np.abs(r.model_image).max())
++    # the residual map includes the point's own dirty image, off the grids
++    np.testing.assert_allclose(s.residual_sigma, r.residual_sigma, rtol=0, atol=1e-5)
++    np.testing.assert_allclose(s.reconvolved, r.reconvolved, rtol=0,
++                               atol=1e-6 * np.abs(r.reconvolved).max())
++    assert st.parameters["point_sources"]["n_points"] == 1
++    assert st.parameters["streaming"]["n_visibilities_streamed"] == 400
++
++
++def test_auto_streams_mfs_points_and_holds_cube_points(monkeypatch, caplog):
++    from pyuvimage import api
++
++    monkeypatch.setattr(stm, "scan_header", lambda *a, **k: type(
++        "H", (), {"n_samples": 10**6})())
++    stream, _ = api.resolve_streaming("auto", "some/file.npz", point_sources=True)
++    assert stream
++    stream, _ = api.resolve_streaming("auto", "some/file.npz", mode="cube",
++                                      point_sources=True)
++    assert not stream
++    monkeypatch.setattr(stm, "nufftax_available", lambda: False)
++    stream, _ = api.resolve_streaming("auto", "some/file.npz", point_sources=True)
++    assert not stream
+diff --git a/tests/test_streaming.py b/tests/test_streaming.py
+index 1d9162e..325356c 100644
+--- a/tests/test_streaming.py
++++ b/tests/test_streaming.py
+@@ -188,10 +188,15 @@ def test_the_dirty_image_is_the_operators(ragged, flat, terms):
+ def test_the_products_side_matches_dirty_imager(flat, terms):
+     _, d, _, ds = flat
+     im = DirtyImager(ds)
+-    np.testing.assert_allclose(terms.beam_raw / terms.sum_weights, im.dirty_beam, rtol=1e-12, atol=1e-14)
++    # Mixed tolerances: with nufftax present the terms are type-1 NUFFTs,
++    # whose error is bounded against the peak, not elementwise -- near-zero
++    # entries carry ~1e-11 relative (the kernel builder's docstring says the
++    # same of its own output). The DFT path agrees to 1e-14.
++    np.testing.assert_allclose(terms.beam_raw / terms.sum_weights, im.dirty_beam,
++                               rtol=1e-10, atol=1e-11)
+     np.testing.assert_allclose(terms.data_dirty_raw / terms.sum_weights,
+-                               im.dirty_image(np.asarray(ds.data)), rtol=1e-12,
+-                               atol=1e-12 * np.abs(im.dirty_image(np.asarray(ds.data))).max())
++                               im.dirty_image(np.asarray(ds.data)), rtol=1e-10,
++                               atol=1e-11 * np.abs(im.dirty_image(np.asarray(ds.data))).max())
+     assert terms.sum_weights == pytest.approx(np.sum(im.weights), rel=1e-12)
+     assert terms.rms == pytest.approx(im.rms, rel=1e-12)
+ 
+@@ -326,7 +331,7 @@ def test_n_data_reads_the_terms_not_the_stub(terms):
+ 
+ 
+ @pytest.mark.parametrize("kwargs, exc", [
+-    (dict(point_sources=True), NotImplementedError),
++    (dict(point_sources=True, mode="cube"), NotImplementedError),
+     (dict(inversion="dense"), ValueError),
+     (dict(mode="slices"), ValueError),
+     (dict(mode="cube", cube_prior="median"), ValueError),
+@@ -353,13 +358,17 @@ def test_auto_streams_a_file_on_the_mfs_sparse_path(npz_path, monkeypatch, caplo
+     assert stream is True
+     assert header is not None and header.n_samples > 0
+     assert "streaming auto -> streamed" in caplog.text
+-    # cube mode and recentring stream too, now that both are wired
+-    for kwargs in (dict(mode="cube"), dict(image_centre="auto"), dict(image_centre=(1.0, 0.5))):
++    # cube mode, recentring and MFS point components stream too, now that
++    # all three are wired
++    for kwargs in (dict(mode="cube"), dict(image_centre="auto"), dict(image_centre=(1.0, 0.5)),
++                   dict(point_sources=True)):
++        if kwargs.get("point_sources") and not stm.nufftax_available():
++            continue
+         assert api.resolve_streaming("auto", str(npz_path), **kwargs)[0] is True
+ 
+ 
+ @pytest.mark.parametrize("kwargs, why", [
+-    (dict(point_sources=True), "point components"),
++    (dict(point_sources=True, mode="cube"), "point components in cube mode"),
+     (dict(inversion="dense"), "dense"),
+ ])
+ def test_auto_holds_the_data_where_streaming_is_not_supported(
+@@ -550,11 +559,15 @@ def test_channel_terms_are_each_channels_own_and_sum_to_the_mfs_terms(ragged, te
+                                             ag.TransformerDFT, pool_noise=True)
+         got = per_channel[(spw_i, chan_i)]
+         assert got.n_vis == alone.n_vis > 0
+-        np.testing.assert_allclose(got.kernel, alone.kernel, rtol=1e-12)
++        np.testing.assert_allclose(got.kernel, alone.kernel, rtol=1e-10,
++                                   atol=1e-10 * np.abs(alone.kernel).max())
+         np.testing.assert_allclose(got.dirty_image, alone.dirty_image, rtol=1e-10,
+                                    atol=1e-12 * np.abs(alone.dirty_image).max())
+         assert got.data_term == pytest.approx(alone.data_term, rel=1e-12)
+-    np.testing.assert_allclose(mfs.kernel, terms.kernel, rtol=1e-12)
++    # summed per channel vs accumulated in one stream: the NUFFT batches
++    # differ, so this agrees to the transform's peak-scaled precision
++    np.testing.assert_allclose(mfs.kernel, terms.kernel, rtol=1e-10,
++                               atol=1e-10 * np.abs(terms.kernel).max())
+     np.testing.assert_allclose(mfs.dirty_image, terms.dirty_image, rtol=1e-10,
+                                atol=1e-12 * np.abs(terms.dirty_image).max())
+     assert mfs.n_vis == terms.n_vis
+@@ -785,3 +798,32 @@ def test_streamed_recentred_fit_matches_the_in_memory_one(ragged, tmp_path):
+                                atol=1e-10 * np.abs(r.model_image).max())
+     assert streamed.uvdata.meta["image_centre_offset_arcsec"] == \
+         pytest.approx(reference.uvdata.meta["image_centre_offset_arcsec"])
++
++
++@pytest.mark.skipif(not stm.nufftax_available(), reason="the fast path is nufftax")
++def test_the_nufft_accumulation_matches_the_per_chunk_dft(ragged):
++    """The fast path (type-1 NUFFTs over batches of `NUFFT_BATCH`) against the
++    per-chunk DFT it replaced -- 54x faster on Teresa's 112x112 grid, where
++    the DFT pass would have taken ~6 h. Errors scale with each image's peak."""
++    uvd, _, geom = ragged
++    mask = fitting.make_mask(geom, "square")
++    slow = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=False)
++    fast = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=True)
++    for ch in stm.iter_uvdata_chunks(uvd, CHUNK):
++        slow.add(ch)
++        fast.add(ch)
++    a, b = slow.finish(), fast.finish()
++    for name in ("kernel", "dirty_image", "beam_raw", "data_dirty_raw"):
++        x, y = getattr(a, name), getattr(b, name)
++        np.testing.assert_allclose(y, x, rtol=0, atol=1e-11 * np.abs(x).max(), err_msg=name)
++    assert (b.sum_weights, b.data_term, b.n_vis) == (a.sum_weights, a.data_term, a.n_vis)
++
++
++def test_point_grids_need_the_fast_path_and_an_even_oversample(ragged):
++    uvd, _, geom = ragged
++    mask = fitting.make_mask(geom, "square")
++    with pytest.raises(RuntimeError, match="nufftax"):
++        stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=False, point_oversample=8)
++    if stm.nufftax_available():
++        with pytest.raises(ValueError, match="even"):
++            stm.TermsAccumulator(geom, mask, ag.TransformerDFT, point_oversample=3)
+-- 
+2.43.0
+

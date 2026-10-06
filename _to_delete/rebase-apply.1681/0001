@@ -1,0 +1,421 @@
+From e3fba5fa14e0b31f2a8b8056fe548eaa0fdf8e28 Mon Sep 17 00:00:00 2001
+From: HRSAstro <hrstacey@icloud.com>
+Date: Sun, 4 Oct 2026 09:39:30 +0000
+Subject: [PATCH] Stream through autoarray's sparse_terms_from_chunks; require
+ 2026.10.2.1
+
+The streamed path's fast accumulation now hands each batch of exactly
+NUFFT_BATCH samples to autoarray's own streaming accumulation (released in
+2026.10.2.1), which matched pyuvimage's type-1 accumulation to 3e-13 of the
+peak on ALMaQUEST CO(1-0) and ran 25% faster on Hannah's Mac. The last
+batch is padded with zero-weight (infinite sigma) samples so JAX compiles
+one batch length. pyuvimage's own type-1 path remains for the point
+components' oversampled grids, for unpooled batches with unequal sigmas
+(which autoarray refuses), and as the fallback on an older autoarray,
+with a one-time warning giving the pip command.
+
+pyproject: autoarray and autogalaxy >= 2026.10.2.1, replacing the git
+head (the release has the solver rewrite the git pin was for). docs/install.md
+explains replacing a git-installed autoarray, which reports 9999.0.0.dev0.
+
+From autoarray 2026.10 a sparse inversion's `dataset` is a DatasetInterface
+without data arrays; LinearSystem.from_inversion reads data and noise from
+the fit's own dataset first. compare_from_stream.py keeps comparing
+pyuvimage's own accumulation against from_stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8
+---
+ README.md                      |   2 +-
+ docs/install.md                |  30 ++++++--
+ pyproject.toml                 |  12 +--
+ scripts/compare_from_stream.py |  20 +++--
+ src/pyuvimage/fitting.py       |  10 ++-
+ src/pyuvimage/streaming.py     | 135 +++++++++++++++++++++++++++++----
+ tests/test_streaming.py        |  36 +++++++++
+ 7 files changed, 209 insertions(+), 36 deletions(-)
+
+diff --git a/README.md b/README.md
+index 4a3d6f9..897e436 100644
+--- a/README.md
++++ b/README.md
+@@ -12,7 +12,7 @@ prior whose hyperparameters are optimised automatically.
+ ## Install
+ 
+ ```bash
+-pip install -e .            # core (numpy backend; numba and autoarray's git head, see docs/install.md)
++pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see docs/install.md)
+ pip install -e ".[ms]"      # + python-casacore, to read measurement sets
+ pip install -e ".[jax]"     # + JAX/nufftax (optional)
+ ```
+diff --git a/docs/install.md b/docs/install.md
+index 693eda5..d07177f 100644
+--- a/docs/install.md
++++ b/docs/install.md
+@@ -3,7 +3,7 @@
+ [← back to the README](../README.md)
+ 
+ ```bash
+-pip install -e .            # core (numpy backend; numba and autoarray's git head, see below)
++pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see below)
+ pip install -e ".[ms]"      # + python-casacore, to read measurement sets
+ pip install -e ".[jax]"     # + JAX/nufftax
+ ```
+@@ -11,7 +11,7 @@ pip install -e ".[jax]"     # + JAX/nufftax
+ Python ≥ 3.12 is required by current PyAutoGalaxy releases (3.11 works with
+ `version: python_version_check: False` in a local `config/general.yaml`).
+ 
+-## numba, and autoarray's development head
++## numba, and the autoarray release
+ 
+ Two things decide how long a positivity-on fit takes, and neither is
+ pyuvimage's code. Both concern autoarray's non-negative least-squares solver
+@@ -25,16 +25,30 @@ decorator is a no-op and the kernels run as pure Python — 9 s of a 44 s cold
+ solve when profiled. pyuvimage warns at the start of a run if numba is
+ missing; `pip install numba` is the whole fix.
+ 
+-**autoarray `main`** (September 2026) rewrote the same solver: the factor is
++**autoarray 2026.10.2.1** is the minimum. It is the first release with the
++solver rewrite below, and the first with autoarray's own streaming
++accumulation (`sparse_terms_from_chunks` / `Interferometer.from_stream`),
++which the streamed path now uses: on ALMaQUEST CO(1-0) it matched
++pyuvimage's own accumulation to 3e-13 and ran 25% faster. `pip install -e .`
++pulls it in. One trap: an autoarray installed earlier from git (which the
++previous version of these instructions asked for) reports version
++`9999.0.0.dev0`, which pip counts as newer than any release, so a plain
++upgrade leaves it in place. Replace it explicitly:
++
++```bash
++pip install --force-reinstall --no-deps "autoarray>=2026.10.2.1" "autogalaxy>=2026.10.2.1"
++python -c "from autoarray.inversion.inversion.interferometer import inversion_interferometer_util as u; print(hasattr(u, 'sparse_terms_from_chunks'))"   # True
++```
++
++With an older autoarray the streamed path still runs, on pyuvimage's own
++accumulation, and says so once at the start.
++
++The solver rewrite (September 2026, in that release): the factor is
+ updated in place instead of being copied with `np.insert`/`np.delete` on every
+ iteration (17 s of that same 44 s), the warm-start repair is correct, and a
+ process-wide memo seeds each framework solve from the passive set of the
+ previous one with the same mesh — so the delivered fit of a second adaptive
+-pass, or of each cube channel, starts from the last one's answer. None of it
+-is in a release yet and the version string was not bumped, so
+-`pip install -U autoarray` does nothing; the core dependency therefore
+-points at the git head (`autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray`)
+-until the next release, and `pip install -e .` installs it. Measured on
++pass, or of each cube channel, starts from the last one's answer. Measured on
+ J0116 (50×50 mesh): delivered fits 72 s and 109 s → 1 s and 2 s; the test
+ suite 920 s → 92 s. `AUTOARRAY_NNLS_WARM_START=0` switches the memo off if
+ it ever needs ruling out. pyuvimage's own seeding of its probe solves
+diff --git a/pyproject.toml b/pyproject.toml
+index b751473..2a11fd4 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -15,12 +15,12 @@ dependencies = [
+     "scipy",
+     "astropy",
+     "matplotlib",
+-    "autogalaxy",
+-    # autoarray's development head: the in-place non-negative solver and its
+-    # cross-fit warm-start memo (Sep 2026) took a J0116 fit's solves from
+-    # 72-109 s to 1-2 s. Not in a release yet and the version string was not
+-    # bumped, so it has to come from git (see docs/install.md).
+-    "autoarray @ git+https://github.com/PyAutoLabs/PyAutoArray",
++    # PyAutoLabs releases in lockstep; 2026.10.2.1 is the first with both the
++    # streaming accumulation the streamed path uses (`sparse_terms_from_chunks`)
++    # and the in-place non-negative solver with its warm-start memo (J0116
++    # solves 72-109 s -> 1-2 s). See docs/install.md.
++    "autogalaxy>=2026.10.2.1",
++    "autoarray>=2026.10.2.1",
+     # the same solver's Cholesky-update kernels are numba; without it they run
+     # as pure Python and every positive-only solve is several times slower
+     "numba",
+diff --git a/scripts/compare_from_stream.py b/scripts/compare_from_stream.py
+index c95789a..2b3fa75 100644
+--- a/scripts/compare_from_stream.py
++++ b/scripts/compare_from_stream.py
+@@ -15,7 +15,10 @@ sigma_re and sigma_im and pyuvimage's sparse path pools them anyway. Each side
+ then uses its own transform:
+ 
+   pyuvimage   one batched type-1 NUFFT per `NUFFT_BATCH` samples, for every
+-              image term and the kernel (`TermsAccumulator(fast=True)`)
++              image term and the kernel (`TermsAccumulator(fast=True)` with
++              autoarray's accumulation switched off: since this comparison,
++              the accumulator uses autoarray's whenever it is installed, and
++              its own type-1 path is the fallback for older autoarray)
+   autoarray   per chunk: the kernel builder (`method="nufft"`) and two
+               adjoints through a transformer built over that chunk
+               (`TransformerNUFFT` by default; `--aa-transformer dft` uses the
+@@ -152,12 +155,17 @@ def main(argv=None):
+     print(f"image grid {geometry.shape_native} at {geometry.pixel_scale:.4g}\"/pix")
+ 
+     # -- pyuvimage
+-    print("streaming the pyuvimage side...")
++    print("streaming the pyuvimage side (its own type-1 accumulation)...")
+     t0 = time.time()
+-    acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
+-    for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
+-        acc.add(stm.VisibilityChunk(uv=uv, data=d, noise=n))
+-    ours = acc.finish()
++    upstream, stm.autoarray_streaming = stm.autoarray_streaming, lambda: None
++    stm._WARNED_OLD_AUTOARRAY = True          # this is on purpose; no warning
++    try:
++        acc = stm.TermsAccumulator(geometry, mask, None, fast=True)
++        for uv, d, n in _pooled_chunks(a.dataset, a.chunk_k, a.limit):
++            acc.add(stm.VisibilityChunk(uv=uv, data=d, noise=n))
++        ours = acc.finish()
++    finally:
++        stm.autoarray_streaming = upstream
+     t_ours = time.time() - t0
+     print(f"pyuvimage TermsAccumulator: {t_ours:.1f} s "
+           f"({1e6 * t_ours / max(ours.n_vis, 1):.1f} us/sample)")
+diff --git a/src/pyuvimage/fitting.py b/src/pyuvimage/fitting.py
+index 48cbbea..b811752 100644
+--- a/src/pyuvimage/fitting.py
++++ b/src/pyuvimage/fitting.py
+@@ -2294,8 +2294,14 @@ class LinearSystem:
+             data_term = float(terms.data_term)
+             noise_normalization = float(terms.noise_normalization)
+         else:
+-            data = inversion.dataset.data.array
+-            noise = inversion.dataset.noise_map.array
++            # the fit's own dataset first: from autoarray 2026.10 a sparse
++            # inversion's `dataset` is a `DatasetInterface` that carries no
++            # data or noise arrays
++            source = next(
++                ds for ds in (dataset, inversion.dataset)
++                if ds is not None and getattr(ds, "data", None) is not None)
++            data = np.asarray(getattr(source.data, "array", source.data))
++            noise = np.asarray(getattr(source.noise_map, "array", source.noise_map))
+             # the same expression `fast_chi_squared` evaluates, on the same arrays
+             data_term = np.sum(data.real**2.0 / noise.real**2.0) + np.sum(
+                 data.imag**2.0 / noise.imag**2.0
+diff --git a/src/pyuvimage/streaming.py b/src/pyuvimage/streaming.py
+index e5131cb..fbf570c 100644
+--- a/src/pyuvimage/streaming.py
++++ b/src/pyuvimage/streaming.py
+@@ -89,6 +89,41 @@ def nufftax_available() -> bool:
+     return _nufftax() is not None
+ 
+ 
++#: the first autoarray release with `sparse_terms_from_chunks` /
++#: `Interferometer.from_stream` (PyAutoLabs discussion #13)
++AUTOARRAY_STREAMING_RELEASE = "2026.10.2.1"
++
++
++def autoarray_streaming():
++    """autoarray's `sparse_terms_from_chunks`, or None on an older release."""
++    try:
++        from autoarray.inversion.inversion.interferometer import (
++            inversion_interferometer_util as su,
++        )
++    except Exception:  # pragma: no cover
++        return None
++    return getattr(su, "sparse_terms_from_chunks", None)
++
++
++_WARNED_OLD_AUTOARRAY = False
++
++
++def _warn_old_autoarray() -> None:
++    global _WARNED_OLD_AUTOARRAY
++    if _WARNED_OLD_AUTOARRAY:
++        return
++    _WARNED_OLD_AUTOARRAY = True
++    logger.warning(
++        "this autoarray has no streaming accumulation (sparse_terms_from_chunks, "
++        "autoarray >= %s); using pyuvimage's own, which gives the same terms "
++        "about 25%% slower. To use autoarray's: pip install --force-reinstall "
++        "--no-deps \"autoarray>=%s\" (--force-reinstall because an autoarray "
++        "installed from git reports version 9999.0.0.dev0, which pip treats as "
++        "newer than any release).",
++        AUTOARRAY_STREAMING_RELEASE, AUTOARRAY_STREAMING_RELEASE,
++    )
++
++
+ def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
+                 pixel_scale_arcsec: float, centred: bool = False,
+                 eps: float = NUFFT_EPS) -> np.ndarray:
+@@ -693,7 +728,29 @@ class RowTracker:
+ class TermsAccumulator:
+     """Folds chunks into `SparseTerms`, one `add` at a time.
+ 
+-    Per chunk a transformer is built over that chunk's uv (the DFT here is
++    **The fast path** (nufftax installed; the default) buffers samples into
++    batches of exactly `NUFFT_BATCH` and hands each to autoarray's own
++    streaming accumulation, `sparse_terms_from_chunks` -- the kernel by its
++    type-1 NUFFT builder, the dirty image and beam through a
++    `TransformerNUFFT` over the batch. Compared on ALMaQUEST CO(1-0) (1.34M
++    samples) it matched pyuvimage's own type-1 accumulation to 3e-13 of the
++    peak and ran 25% faster (`scripts/compare_from_stream.py`,
++    `claude/autoarray-from-stream-comparison.md`), so it is used whenever
++    the installed autoarray has it (>= `AUTOARRAY_STREAMING_RELEASE`). The
++    last batch is padded to full length with samples of infinite sigma --
++    zero weight, so they add exactly nothing -- so JAX compiles one batch
++    shape per run rather than one per remainder (one per channel in cube
++    mode).
++
++    pyuvimage's own type-1 accumulation (`kernel_image`, `type1_image`) is
++    still used for the oversampled point-component grids, which autoarray
++    does not build, and for any batch whose sigma_re and sigma_im differ
++    (autoarray refuses those: its kernel is built from sigma_re alone; the
++    sparse path pools them, so this is only an unpooled caller's case). On
++    an autoarray older than `AUTOARRAY_STREAMING_RELEASE` it does the whole
++    job, with a one-time warning naming the pip command.
++
++    **The slow path** (`fast=False`): per chunk a transformer is built over that chunk's uv (the DFT here is
+     n_image x chunk_k, freed with the chunk) and three adjoints are taken:
+     the weighted data (for D), the DirtyImager-weighted data and the weights
+     (for the products). The kernel accumulation is autoarray's own
+@@ -789,7 +846,7 @@ class TermsAccumulator:
+             self._buf.append((uv, d, sr, si))
+             self._buf_n += n
+             if self._buf_n >= NUFFT_BATCH:
+-                self._flush()
++                self._flush(full_batches_only=True)
+             self._add_scalars(d, sr, si, n)
+             return
+         # -- the kernel, from autoarray's own accumulation on this chunk
+@@ -822,32 +879,84 @@ class TermsAccumulator:
+                                  + np.sum(np.log(2 * np.pi * si ** 2)))
+         self.n_vis += n
+ 
+-    def _flush(self) -> None:
+-        """The buffered samples' contribution to every image term."""
++    def _flush(self, full_batches_only: bool = False) -> None:
++        """The buffered samples' contribution to every image term, a batch of
++        exactly `NUFFT_BATCH` at a time; with ``full_batches_only`` the
++        remainder stays buffered for the next `add`."""
+         if not self._buf:
+             return
+         uv = np.concatenate([b[0] for b in self._buf])
+         d = np.concatenate([b[1] for b in self._buf])
+         sr = np.concatenate([b[2] for b in self._buf])
+         si = np.concatenate([b[3] for b in self._buf])
+-        self._buf, self._buf_n = [], 0
++        n = len(d)
++        stop = (n // NUFFT_BATCH) * NUFFT_BATCH if full_batches_only else n
++        for lo in range(0, stop, NUFFT_BATCH):
++            hi = min(lo + NUFFT_BATCH, stop)
++            self._flush_batch(uv[lo:hi], d[lo:hi], sr[lo:hi], si[lo:hi])
++        if stop < n:
++            self._buf = [(uv[stop:], d[stop:], sr[stop:], si[stop:])]
++            self._buf_n = n - stop
++        else:
++            self._buf, self._buf_n = [], 0
++
++    def _flush_batch(self, uv, d, sr, si) -> None:
+         pix = float(self.geometry.pixel_scale)
+         w = sr ** -2.0
+-        self.kernel += kernel_image(uv, w, self.shape, pix)
+         weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
+-        dirty = type1_image(uv, weighted, self.shape, pix)
+-        self.dirty += dirty
+-        self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
+-        # with equal sigma_re and sigma_im -- always, once pooled -- the
+-        # products' weighting is the fit's, and the two images are one
+-        self.data_dirty += (dirty if np.array_equal(sr, si)
+-                            else type1_image(uv, d * w, self.shape, pix))
++        upstream = autoarray_streaming()
++        if upstream is not None and np.array_equal(sr, si):
++            self._add_upstream(upstream, uv, d, sr)
++        else:
++            if upstream is None:
++                _warn_old_autoarray()
++            self.kernel += kernel_image(uv, w, self.shape, pix)
++            dirty = type1_image(uv, weighted, self.shape, pix)
++            self.dirty += dirty
++            self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
++            # with equal sigma_re and sigma_im the products' weighting is the
++            # fit's, and the two images are one
++            self.data_dirty += (dirty if np.array_equal(sr, si)
++                                else type1_image(uv, d * w, self.shape, pix))
+         if self.q:
+             self.kernel_fine += kernel_image(
+                 uv, w, self.kernel_fine_shape, pix / self.q, zero_nyquist=False)
+             self.dirty_fine += type1_image(
+                 uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
+ 
++    def _add_upstream(self, sparse_terms_from_chunks, uv, d, sigma) -> None:
++        """One batch through autoarray's `sparse_terms_from_chunks`.
++
++        Only its image terms are taken: the scalars are pyuvimage's own
++        (`_add_scalars`, identical sums), and padding would put infinities in
++        its noise normalisation. With sigma_re == sigma_im the data dirty
++        image of the products (weight 1/sigma_re^2) is the fit's dirty image.
++        """
++        n = len(d)
++        if n < NUFFT_BATCH:
++            # zero-weight padding: 1/inf^2 is exactly 0, so every term gains
++            # exactly nothing, and JAX sees the one batch length it compiled
++            pad = NUFFT_BATCH - n
++            uv = np.concatenate([uv, np.zeros((pad, 2))])
++            d = np.concatenate([d, np.zeros(pad, dtype=complex)])
++            sigma = np.concatenate([sigma, np.full(pad, np.inf)])
++        with np.errstate(divide="ignore", invalid="ignore"):
++            t = sparse_terms_from_chunks(
++                [(uv, d, sigma * (1 + 1j))], real_space_mask=self.mask,
++                eps=NUFFT_EPS,
++            )
++        kernel = np.asarray(t.nufft_precision_operator, dtype=np.float64)
++        if kernel.shape != self.kernel.shape:
++            raise RuntimeError(
++                f"autoarray's streamed kernel is {kernel.shape}, expected "
++                f"{self.kernel.shape}: the mask's unmasked extent is smaller "
++                "than the image grid")
++        dirty = np.asarray(t.dirty_image_native, dtype=np.float64)
++        self.kernel += kernel
++        self.dirty += dirty
++        self.beam += np.asarray(t.dirty_beam_native, dtype=np.float64)
++        self.data_dirty += dirty
++
+     def finish(self) -> SparseTerms:
+         self._flush()
+         lengths, keep = self.rows.lengths_and_keep()
+diff --git a/tests/test_streaming.py b/tests/test_streaming.py
+index 325356c..020dd62 100644
+--- a/tests/test_streaming.py
++++ b/tests/test_streaming.py
+@@ -827,3 +827,39 @@ def test_point_grids_need_the_fast_path_and_an_even_oversample(ragged):
+     if stm.nufftax_available():
+         with pytest.raises(ValueError, match="even"):
+             stm.TermsAccumulator(geom, mask, ag.TransformerDFT, point_oversample=3)
++
++
++@pytest.mark.skipif(not stm.nufftax_available() or stm.autoarray_streaming() is None,
++                    reason="needs nufftax and autoarray >= AUTOARRAY_STREAMING_RELEASE")
++def test_the_fast_path_is_autoarrays_streaming_and_matches_our_own(ragged, monkeypatch, caplog):
++    """With pooled noise every batch goes through autoarray's
++    `sparse_terms_from_chunks`; pyuvimage's own type-1 accumulation (what an
++    older autoarray falls back to) gives the same terms to rounding."""
++    import logging
++
++    uvd, _, geom = ragged
++    mask = fitting.make_mask(geom, "square")
++    upstream = stm.autoarray_streaming()
++    calls = []
++
++    def spy(chunks, **kw):
++        chunks = list(chunks)
++        calls.append(len(chunks[0][1]))
++        return upstream(chunks, **kw)
++
++    monkeypatch.setattr(stm, "autoarray_streaming", lambda: spy)
++    theirs = stm.accumulate_sparse_terms(
++        stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
++    # every batch, the padded last one included, has the one compiled length
++    assert calls and set(calls) == {stm.NUFFT_BATCH}
++
++    monkeypatch.setattr(stm, "autoarray_streaming", lambda: None)
++    monkeypatch.setattr(stm, "_WARNED_OLD_AUTOARRAY", False)
++    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
++        ours = stm.accumulate_sparse_terms(
++            stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
++    assert "pip install --force-reinstall" in caplog.text
++    for name in ("kernel", "dirty_image", "beam_raw", "data_dirty_raw"):
++        x, y = getattr(ours, name), getattr(theirs, name)
++        np.testing.assert_allclose(y, x, rtol=0, atol=1e-11 * np.abs(x).max(), err_msg=name)
++    assert theirs.data_term == ours.data_term and theirs.n_vis == ours.n_vis
+-- 
+2.43.0
+

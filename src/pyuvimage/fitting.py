@@ -2011,7 +2011,39 @@ def make_regularization(
     ``scale`` is a correlation length in **arcsec** -- the kernel schemes build
     their covariance from the mesh coordinates themselves, which are in the
     image plane's angular units.
+
+    ``envelope["primary_beam"]``, when present, is ``{"fwhm", "centre"}`` of
+    the primary beam [arcsec]: the prior is then placed on the true sky rather
+    than the apparent one (`envelope.PrimaryBeamPrior`, which is the PB folded
+    into F).
     """
+    env = dict(envelope or {})
+    pb = env.pop("primary_beam", None)
+    if pb is None:
+        return _base_regularization(kind, coefficient, scale, nu, envelope)
+    from .envelope import PrimaryBeamPrior
+
+    return PrimaryBeamPrior(
+        _base_regularization(kind, coefficient, scale, nu, env),
+        fwhm=pb["fwhm"], centre=pb.get("centre", (0.0, 0.0)),
+        floor=float(pb.get("floor", PB_PRIOR_FLOOR)),
+    )
+
+
+#: below this primary-beam response the true-sky prior stops growing (see
+#: `envelope.PrimaryBeamPrior`); CASA blanks pbcor images at 0.2, pyuvimage's
+#: products at `primary_beam.DEFAULT_PB_CUTOFF` = 0.1
+PB_PRIOR_FLOOR = 0.1
+
+
+def _base_regularization(
+    kind: str,
+    coefficient: float,
+    scale: float | None = None,
+    nu: float = DEFAULT_NU,
+    envelope: dict | None = None,
+):
+    """`make_regularization` without the primary beam."""
     kind = kind.lower()
     if kind == "constant":
         return ag.reg.Constant(coefficient=coefficient)
@@ -3477,6 +3509,10 @@ class SingleFit:
     #: `structure` fit is measured on residual maps (see `_admissible_scan`)
     #: and builds one from the dataset otherwise
     imager: object = field(default=None, repr=False, compare=False)
+    #: the criterion that chose the prior when this fit did not choose it
+    #: itself (`scan` is None): a cube channel, whose prior is frozen from the
+    #: MFS fit, measures its systematic window the way the MFS did
+    window_criterion: str = ""
 
     @property
     def coefficient(self) -> float:
@@ -3502,9 +3538,16 @@ class SingleFit:
         tolerance (`structure_ratio_scatter`). After a fallback to
         `discrepancy` the fit is in the weakly constrained regime where the
         ratio is not calibrated, and chi^2 is kept.
+
+        A fit with a frozen prior has no scan of its own and follows
+        `window_criterion`, the criterion of the fit its prior came from. Cube
+        channels used to fall back to chi^2 here, and on REBELS-25 every
+        channel's window then opened to +/-6 dex: 24 non-negative solves per
+        channel, most of the cube's run time, and a systematic as large as
+        the model.
         """
-        criterion = getattr(self.scan, "criterion", "") or ""
-        effective = getattr(self.scan, "effective_criterion", "")
+        criterion = self.criterion_used
+        effective = PriorScan(criterion=criterion).effective_criterion
         if not criterion.startswith("structure") or effective == "discrepancy":
             return "chi^2", None
         imager = self.imager
@@ -3516,6 +3559,14 @@ class SingleFit:
                 return "chi^2", None
             self.imager = imager
         return "structure ratio", imager
+
+    @property
+    def criterion_used(self) -> str:
+        """The criterion that chose this fit's prior: its own scan's, or the
+        one handed down with a frozen prior (`window_criterion`)."""
+        if self.scan is not None:
+            return getattr(self.scan, "criterion", "") or ""
+        return self.window_criterion or ""
 
     @property
     def system(self) -> LinearSystem:
@@ -4131,6 +4182,7 @@ def fit_dataset(
     chi2_target: float = 1.0,
     warn_on_chi2: bool = True,
     system: LinearSystem | None = None,
+    window_criterion: str | None = None,
 ) -> SingleFit:
     """Fit one Interferometer dataset (one channel, or the MFS stack).
 
@@ -4150,6 +4202,11 @@ def fit_dataset(
     ``system`` is the coefficient-invariant `LinearSystem` for this dataset
     and mesh. Built here when not given; the adaptive first pass hands its own
     to the second so F and D are built once per fit, not once per stage.
+
+    ``window_criterion`` is, for a fixed ``prior``, the criterion that chose
+    it (the MFS fit's `SingleFit.criterion_used` for a cube channel); the
+    systematic window is measured by it (`SingleFit._window_metric`). Without
+    it a fixed prior is taken as chosen by ``criterion`` once resolved.
     """
     mesh_shape = geometry.mesh_shape
     n_data = n_data_of(dataset)
@@ -4578,7 +4635,11 @@ def fit_dataset(
                 chi2_final / n_data, chi2_target,
             )
 
+    if scan is None and window_criterion is None:
+        window_criterion = resolve_criterion(
+            criterion, n_data, int(np.prod(mesh_shape)))
     return SingleFit(
         fit=fit, geometry=geometry, prior=prior, scan=scan,
         positive_only=bool(positive_only),
+        window_criterion=window_criterion or "",
     )

@@ -268,6 +268,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--no-pb", action="store_true", help="skip primary-beam products")
     p_fit.add_argument(
+        "--pb-in-model", action="store_true",
+        help="put the primary beam in the forward model, so the source prior "
+             "acts on the true sky rather than the apparent (PB-dimmed) sky; "
+             "for emission that reaches the outer primary beam",
+    )
+    p_fit.add_argument(
         "--transformer", default="auto",
         choices=["auto", "dft", "nufft", "pynufft"],
         help=(
@@ -620,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
             image_centre=_parse_centre(args.image_centre),
             pb_correction=not args.no_pb,
             dish_diameter=args.dish_diameter,
+            pb_in_model=args.pb_in_model,
             uncertainty_map=not args.no_uncertainty,
             point_sources=point_sources,
             point_significance=args.point_significance,

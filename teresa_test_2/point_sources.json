@@ -1,0 +1,14 @@
+{
+  "points": [
+    {
+      "d_ra_arcsec": 0.11589732375592701,
+      "d_dec_arcsec": -0.3271252906806541,
+      "flux_jy": 0.008772154666853323,
+      "flux_error_jy": 0.0014643727049216562,
+      "flux_error_stat_jy": 2.914641253776267e-05,
+      "flux_error_sys_jy": 0.0014640826156866104,
+      "significance": 300.9685893757232,
+      "position": "auto-detected"
+    }
+  ]
+}

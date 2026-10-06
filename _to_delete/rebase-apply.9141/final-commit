@@ -1,0 +1,9 @@
+compare_from_stream: report progress, versions and hard crashes
+
+A run on the Mac printed only autonerves' workspace warning and nothing
+else. The script now prints as it goes (line-buffered), names the autoarray,
+pyuvimage and nufftax it imported, enables faulthandler so a crash inside
+JAX or nufftax leaves a traceback, and skips the workspace version check.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8

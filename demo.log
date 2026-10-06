@@ -1,0 +1,193 @@
+2026-10-04 12:33:17,239 - pyuvimage - INFO - streaming auto -> in memory: the dataset is already in memory, so streaming it would save nothing
+2026-10-04 12:33:17,240 - pyuvimage - INFO - dataset: 4800 visibilities x 1 channel(s), central frequency 230 GHz
+2026-10-04 12:33:17,240 - pyuvimage - INFO - mesh 26x26 at 0.1154"/pix (Nyquist 0.09522"), image grid 52x52
+2026-10-04 12:33:17,240 - pyuvimage - INFO - inversion auto -> dense: only 4800 visibilities, below the 5000 at which the w-tilde path starts to pay for its kernel build. Pass --inversion sparse to use it anyway
+2026-10-04 12:33:17,240 - pyuvimage - INFO - this fit needs roughly 1.2 GB (0.6 GB already resident + 0.6 GB to allocate); about 3.8 GB is available
+2026-10-04 12:33:17,240 - pyuvimage - INFO - criterion auto -> structure: 14 data points per model pixel (9600 / 676), comfortably enough for the residual map to be white at chi^2 = N, and chi^2 is a weak discriminant at this size. Pass --criterion discrepancy to override.
+2026-10-04 12:33:17,241 - pyuvimage - INFO - fitting MFS image (4800 visibility samples)...
+2026-10-04 12:33:17,690 - pyuvimage - INFO - source prior correlation length set to the beam size: 0.2459 arcsec
+2026-10-04 12:33:18,670 - pyuvimage - INFO - adaptive prior: first pass (plain Matern)...
+2026-10-04 12:33:19,001 - pyuvimage - INFO - probing the weakest prior with the non-negative solver (the slow solve of the search; a second pass seeds it from the first)...
+2026-10-04 12:33:19,624 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=-7300.92  chi2/N=14.04  structure=3.38
+2026-10-04 12:33:19,625 - pyuvimage - WARNING - structure ratio = 3.38 with essentially no regularisation, above the target of 1: the model cannot reproduce this data however little it is smoothed. Common causes: the source has real structure finer than the model pixel scale, the noise map underestimates the noise, or the field of view is too small. Falling back to maximum-evidence selection so the prior is not switched off.
+2026-10-04 12:33:19,638 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=50973.8  chi2/N=1.904
+2026-10-04 12:33:19,652 - pyuvimage - INFO -   coefficient=0.0001  log_evidence=52530.3  chi2/N=1.904
+2026-10-04 12:33:19,663 - pyuvimage - INFO -   coefficient=0.01  log_evidence=54084  chi2/N=1.904
+2026-10-04 12:33:19,682 - pyuvimage - INFO -   coefficient=1  log_evidence=55622.6  chi2/N=1.907
+2026-10-04 12:33:19,702 - pyuvimage - INFO -   coefficient=100  log_evidence=57154.1  chi2/N=1.91
+2026-10-04 12:33:19,713 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=58677.4  chi2/N=1.912
+2026-10-04 12:33:19,729 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,744 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,758 - pyuvimage - INFO -   coefficient=3.162e+05  log_evidence=59778.8  chi2/N=1.915
+2026-10-04 12:33:19,769 - pyuvimage - INFO -   coefficient=5.623e+05  log_evidence=59952.5  chi2/N=1.916
+2026-10-04 12:33:19,780 - pyuvimage - INFO -   coefficient=7.499e+05  log_evidence=60036.9  chi2/N=1.916
+2026-10-04 12:33:19,791 - pyuvimage - INFO -   coefficient=8.66e+05  log_evidence=60078.3  chi2/N=1.917
+2026-10-04 12:33:19,804 - pyuvimage - INFO -   coefficient=9.306e+05  log_evidence=60098.7  chi2/N=1.917
+2026-10-04 12:33:19,820 - pyuvimage - INFO -   coefficient=9.647e+05  log_evidence=60108.9  chi2/N=1.917
+2026-10-04 12:33:19,832 - pyuvimage - INFO -   coefficient=9.822e+05  log_evidence=60113.9  chi2/N=1.917
+2026-10-04 12:33:19,843 - pyuvimage - INFO -   coefficient=9.91e+05  log_evidence=60116.5  chi2/N=1.917
+2026-10-04 12:33:19,854 - pyuvimage - INFO -   coefficient=9.955e+05  log_evidence=60117.7  chi2/N=1.917
+2026-10-04 12:33:19,869 - pyuvimage - INFO -   coefficient=9.978e+05  log_evidence=60118.4  chi2/N=1.917
+2026-10-04 12:33:19,881 - pyuvimage - INFO -   coefficient=9.989e+05  log_evidence=60118.7  chi2/N=1.917
+2026-10-04 12:33:19,895 - pyuvimage - INFO -   coefficient=9.994e+05  log_evidence=60118.8  chi2/N=1.917
+2026-10-04 12:33:19,910 - pyuvimage - INFO -   coefficient=9.997e+05  log_evidence=60118.9  chi2/N=1.917
+2026-10-04 12:33:19,922 - pyuvimage - INFO -   coefficient=9.999e+05  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,936 - pyuvimage - INFO -   coefficient=9.999e+05  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,948 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,963 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,977 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:19,989 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:20,000 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917
+2026-10-04 12:33:20,001 - pyuvimage - INFO - source prior optimised (evidence, 28 evaluations): coefficient=1e+06, scale=0.2459, nu=1.5
+2026-10-04 12:33:20,001 - pyuvimage - INFO - checking the non-negative solver at coefficient 1e+06 (on the delivered fit's own solve)...
+2026-10-04 12:33:20,011 - pyuvimage - INFO - solving the delivered fit at coefficient 1e+06 (non-negative; this solve is not seeded)...
+2026-10-04 12:33:20,193 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:33:20,195 - pyuvimage - INFO -   solver check done in 0 s -- unreliable
+2026-10-04 12:33:20,195 - pyuvimage - WARNING - the non-negative solver is unreliable on this data: it fits far worse than the unconstrained solve (chi^2 1.348e+05 vs 1.84e+04). Disabling positivity for this fit; the model may contain small negative values. Pass enforce_positive=True (--enforce-positive) to keep it regardless.
+2026-10-04 12:33:21,416 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=50973.8  chi2/N=1.904  structure=0.941
+2026-10-04 12:33:21,778 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=60119  chi2/N=1.917  structure=0.945
+2026-10-04 12:33:22,126 - pyuvimage - INFO -   coefficient=1e+09  log_evidence=44823.2  chi2/N=2.821  structure=1.15
+2026-10-04 12:33:22,472 - pyuvimage - INFO -   coefficient=31.62  log_evidence=56771.5  chi2/N=1.91  structure=0.944
+2026-10-04 12:33:22,901 - pyuvimage - INFO -   coefficient=1.778e+05  log_evidence=59600.7  chi2/N=1.914  structure=0.945
+2026-10-04 12:33:23,252 - pyuvimage - INFO -   coefficient=1.334e+07  log_evidence=60550  chi2/N=1.928  structure=0.946
+2026-10-04 12:33:23,632 - pyuvimage - INFO -   coefficient=1.155e+08  log_evidence=58709.6  chi2/N=1.994  structure=0.952
+2026-10-04 12:33:23,986 - pyuvimage - INFO -   coefficient=3.398e+08  log_evidence=54560.9  chi2/N=2.182  structure=0.993
+2026-10-04 12:33:24,330 - pyuvimage - INFO -   coefficient=5.829e+08  log_evidence=50633.4  chi2/N=2.411  structure=1.05
+2026-10-04 12:33:24,677 - pyuvimage - INFO -   coefficient=4.451e+08  log_evidence=52798.8  chi2/N=2.279  structure=1.02
+2026-10-04 12:33:25,024 - pyuvimage - INFO -   coefficient=3.889e+08  log_evidence=53726.3  chi2/N=2.227  structure=1
+2026-10-04 12:33:25,371 - pyuvimage - INFO -   coefficient=3.635e+08  log_evidence=54154.7  chi2/N=2.203  structure=0.998
+2026-10-04 12:33:25,769 - pyuvimage - INFO -   coefficient=3.76e+08  log_evidence=53943.3  chi2/N=2.215  structure=1
+2026-10-04 12:33:25,770 - pyuvimage - INFO - source prior optimised (structure, 13 evaluations): coefficient=3.697e+08, scale=0.2459, nu=1.5
+2026-10-04 12:33:25,770 - pyuvimage - INFO - solving the delivered fit at coefficient 3.697e+08...
+2026-10-04 12:33:25,873 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:33:26,038 - pyuvimage - INFO - adaptive prior: second pass (tracks the first-pass model)
+2026-10-04 12:33:26,373 - pyuvimage - INFO - probing the weakest prior with the non-negative solver (the slow solve of the search; a second pass seeds it from the first)...
+2026-10-04 12:33:26,816 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=-4253.41  chi2/N=14.04  structure=3.38
+2026-10-04 12:33:26,816 - pyuvimage - WARNING - structure ratio = 3.38 with essentially no regularisation, above the target of 1: the model cannot reproduce this data however little it is smoothed. Common causes: the source has real structure finer than the model pixel scale, the noise map underestimates the noise, or the field of view is too small. Falling back to maximum-evidence selection so the prior is not switched off.
+2026-10-04 12:33:26,830 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=54019.9  chi2/N=1.904
+2026-10-04 12:33:26,851 - pyuvimage - INFO -   coefficient=0.0001  log_evidence=55559.4  chi2/N=1.907
+2026-10-04 12:33:26,869 - pyuvimage - INFO -   coefficient=0.01  log_evidence=57090.4  chi2/N=1.91
+2026-10-04 12:33:26,886 - pyuvimage - INFO -   coefficient=1  log_evidence=58614.8  chi2/N=1.912
+2026-10-04 12:33:26,902 - pyuvimage - INFO -   coefficient=100  log_evidence=60083.2  chi2/N=1.917
+2026-10-04 12:33:26,912 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=60928.8  chi2/N=1.947
+2026-10-04 12:33:26,929 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=49450.8  chi2/N=3.311
+2026-10-04 12:33:26,942 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=60928.8  chi2/N=1.947
+2026-10-04 12:33:26,955 - pyuvimage - INFO -   coefficient=3.162e+04  log_evidence=60398  chi2/N=1.998
+2026-10-04 12:33:26,971 - pyuvimage - INFO -   coefficient=3162  log_evidence=60939.9  chi2/N=1.93
+2026-10-04 12:33:26,984 - pyuvimage - INFO -   coefficient=1000  log_evidence=60727  chi2/N=1.923
+2026-10-04 12:33:26,996 - pyuvimage - INFO -   coefficient=1000  log_evidence=60727  chi2/N=1.923
+2026-10-04 12:33:27,009 - pyuvimage - INFO -   coefficient=5623  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,020 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=60928.8  chi2/N=1.947
+2026-10-04 12:33:27,036 - pyuvimage - INFO -   coefficient=4217  log_evidence=60966.3  chi2/N=1.933
+2026-10-04 12:33:27,052 - pyuvimage - INFO -   coefficient=7499  log_evidence=60965.2  chi2/N=1.941
+2026-10-04 12:33:27,063 - pyuvimage - INFO -   coefficient=4870  log_evidence=60973.5  chi2/N=1.935
+2026-10-04 12:33:27,078 - pyuvimage - INFO -   coefficient=6494  log_evidence=60973.5  chi2/N=1.939
+2026-10-04 12:33:27,092 - pyuvimage - INFO -   coefficient=6043  log_evidence=60975.5  chi2/N=1.938
+2026-10-04 12:33:27,104 - pyuvimage - INFO -   coefficient=5233  log_evidence=60975.4  chi2/N=1.936
+2026-10-04 12:33:27,119 - pyuvimage - INFO -   coefficient=5829  log_evidence=60976  chi2/N=1.937
+2026-10-04 12:33:27,132 - pyuvimage - INFO -   coefficient=5425  log_evidence=60975.9  chi2/N=1.936
+2026-10-04 12:33:27,145 - pyuvimage - INFO -   coefficient=5725  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,157 - pyuvimage - INFO -   coefficient=5523  log_evidence=60976  chi2/N=1.936
+2026-10-04 12:33:27,171 - pyuvimage - INFO -   coefficient=5674  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,186 - pyuvimage - INFO -   coefficient=5573  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,202 - pyuvimage - INFO -   coefficient=5649  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,219 - pyuvimage - INFO -   coefficient=5674  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,233 - pyuvimage - INFO -   coefficient=5636  log_evidence=60976.1  chi2/N=1.937
+2026-10-04 12:33:27,233 - pyuvimage - INFO - source prior optimised (evidence, 29 evaluations): coefficient=5636, scale=0.2459, nu=1.5
+2026-10-04 12:33:27,234 - pyuvimage - INFO - checking the non-negative solver at coefficient 5636 (on the delivered fit's own solve)...
+2026-10-04 12:33:27,245 - pyuvimage - INFO - solving the delivered fit at coefficient 5636 (non-negative; this solve is not seeded)...
+2026-10-04 12:33:27,397 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:33:27,399 - pyuvimage - INFO -   solver check done in 0 s -- unreliable
+2026-10-04 12:33:27,399 - pyuvimage - WARNING - the non-negative solver is unreliable on this data: it fits far worse than the unconstrained solve (chi^2 1.349e+05 vs 1.859e+04). Disabling positivity for this fit; the model may contain small negative values. Pass enforce_positive=True (--enforce-positive) to keep it regardless.
+2026-10-04 12:33:28,153 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=54019.9  chi2/N=1.904  structure=0.942
+2026-10-04 12:33:28,506 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=49450.8  chi2/N=3.311  structure=1.39
+2026-10-04 12:33:28,847 - pyuvimage - INFO -   coefficient=1  log_evidence=58614.8  chi2/N=1.912  structure=0.944
+2026-10-04 12:33:29,195 - pyuvimage - INFO -   coefficient=1000  log_evidence=60727  chi2/N=1.923  structure=0.946
+2026-10-04 12:33:29,544 - pyuvimage - INFO -   coefficient=3.162e+04  log_evidence=60398  chi2/N=1.998  structure=0.956
+2026-10-04 12:33:29,886 - pyuvimage - INFO -   coefficient=1.778e+05  log_evidence=57402.2  chi2/N=2.294  structure=1.05
+2026-10-04 12:33:30,244 - pyuvimage - INFO -   coefficient=7.499e+04  log_evidence=59350.9  chi2/N=2.095  structure=0.982
+2026-10-04 12:33:30,587 - pyuvimage - INFO -   coefficient=1.155e+05  log_evidence=58511.7  chi2/N=2.178  structure=1.01
+2026-10-04 12:33:30,934 - pyuvimage - INFO -   coefficient=9.306e+04  log_evidence=58962.2  chi2/N=2.133  structure=0.993
+2026-10-04 12:33:31,279 - pyuvimage - INFO -   coefficient=1.037e+05  log_evidence=58745  chi2/N=2.154  structure=1
+2026-10-04 12:33:31,627 - pyuvimage - INFO -   coefficient=9.822e+04  log_evidence=58855.6  chi2/N=2.143  structure=0.997
+2026-10-04 12:33:31,976 - pyuvimage - INFO -   coefficient=1.009e+05  log_evidence=58800.8  chi2/N=2.149  structure=0.999
+2026-10-04 12:33:31,976 - pyuvimage - INFO - source prior optimised (structure, 12 evaluations): coefficient=1.023e+05, scale=0.2459, nu=1.5
+2026-10-04 12:33:31,976 - pyuvimage - INFO - solving the delivered fit at coefficient 1.023e+05...
+2026-10-04 12:33:32,081 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:33:32,122 - pyuvimage - WARNING - the pixelized model sits at chi^2/N = 2.152 against a target of 1. Fitting point components anyway, since an unmodelled compact source is a common cause of exactly this -- but the result will be discarded unless it explains the excess and has a credible flux.
+2026-10-04 12:33:32,122 - pyuvimage - INFO - fitting analytic point sources (auto-detect above 5.0 sigma)...
+2026-10-04 12:33:33,119 - pyuvimage - INFO -   point source accepted at dRA 0.850", dDec -0.651": 0.003917 Jy (127.3 sigma, unresolved: widening gains only delta chi2 = 0.0)
+2026-10-04 12:33:33,650 - pyuvimage - INFO -   point source accepted at dRA 0.016", dDec 0.004": 0.0001144 Jy (5.3 sigma, unresolved: widening gains only delta chi2 = 0.0)
+2026-10-04 12:33:34,128 - pyuvimage - INFO -   candidate at dRA 0.377", dDec -0.044" rejected: 2.8 sigma < 5.0
+2026-10-04 12:33:56,867 - pyuvimage - INFO -   regularisation rescaled by 889 with point components present (structure ratio 0.136 -> 1.000)
+2026-10-04 12:33:56,871 - pyuvimage - INFO -   point at dRA 0.059", dDec -0.070" dropped after the regularisation retune: amplitude went negative (-0.000168 Jy)
+2026-10-04 12:34:01,739 - pyuvimage - INFO -   refitting with the adaptive prior tracking the extended model only (the first-pass map included the point sources)
+2026-10-04 12:34:02,976 - pyuvimage - INFO - probing the weakest prior with the non-negative solver (the slow solve of the search; a second pass seeds it from the first)...
+2026-10-04 12:34:03,447 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=-4360.75  chi2/N=14.04  structure=3.38
+2026-10-04 12:34:03,447 - pyuvimage - WARNING - structure ratio = 3.38 with essentially no regularisation, above the target of 1: the model cannot reproduce this data however little it is smoothed. Common causes: the source has real structure finer than the model pixel scale, the noise map underestimates the noise, or the field of view is too small. Falling back to maximum-evidence selection so the prior is not switched off.
+2026-10-04 12:34:03,456 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=53913.4  chi2/N=1.904
+2026-10-04 12:34:03,468 - pyuvimage - INFO -   coefficient=0.0001  log_evidence=55456.2  chi2/N=1.906
+2026-10-04 12:34:03,477 - pyuvimage - INFO -   coefficient=0.01  log_evidence=56986  chi2/N=1.91
+2026-10-04 12:34:03,491 - pyuvimage - INFO -   coefficient=1  log_evidence=58511.2  chi2/N=1.912
+2026-10-04 12:34:03,502 - pyuvimage - INFO -   coefficient=100  log_evidence=59974.8  chi2/N=1.917
+2026-10-04 12:34:03,511 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=60359.3  chi2/N=1.952
+2026-10-04 12:34:03,521 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=29069.4  chi2/N=4.936
+2026-10-04 12:34:03,536 - pyuvimage - INFO -   coefficient=1e+04  log_evidence=60359.3  chi2/N=1.952
+2026-10-04 12:34:03,546 - pyuvimage - INFO -   coefficient=3.162e+04  log_evidence=58919.9  chi2/N=2.023
+2026-10-04 12:34:03,556 - pyuvimage - INFO -   coefficient=3162  log_evidence=60683.6  chi2/N=1.931
+2026-10-04 12:34:03,568 - pyuvimage - INFO -   coefficient=1000  log_evidence=60574.9  chi2/N=1.923
+2026-10-04 12:34:03,577 - pyuvimage - INFO -   coefficient=1000  log_evidence=60574.9  chi2/N=1.923
+2026-10-04 12:34:03,585 - pyuvimage - INFO -   coefficient=1778  log_evidence=60660.2  chi2/N=1.926
+2026-10-04 12:34:03,593 - pyuvimage - INFO -   coefficient=5623  log_evidence=60604.9  chi2/N=1.939
+2026-10-04 12:34:03,604 - pyuvimage - INFO -   coefficient=2371  log_evidence=60681.7  chi2/N=1.929
+2026-10-04 12:34:03,617 - pyuvimage - INFO -   coefficient=4217  log_evidence=60660.4  chi2/N=1.935
+2026-10-04 12:34:03,627 - pyuvimage - INFO -   coefficient=2738  log_evidence=60685.4  chi2/N=1.93
+2026-10-04 12:34:03,638 - pyuvimage - INFO -   coefficient=2371  log_evidence=60681.7  chi2/N=1.929
+2026-10-04 12:34:03,648 - pyuvimage - INFO -   coefficient=2943  log_evidence=60685.3  chi2/N=1.931
+2026-10-04 12:34:03,660 - pyuvimage - INFO -   coefficient=2548  log_evidence=60684.2  chi2/N=1.929
+2026-10-04 12:34:03,668 - pyuvimage - INFO -   coefficient=2839  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,679 - pyuvimage - INFO -   coefficient=2943  log_evidence=60685.3  chi2/N=1.931
+2026-10-04 12:34:03,694 - pyuvimage - INFO -   coefficient=2788  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,705 - pyuvimage - INFO -   coefficient=2890  log_evidence=60685.4  chi2/N=1.93
+2026-10-04 12:34:03,718 - pyuvimage - INFO -   coefficient=2813  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,727 - pyuvimage - INFO -   coefficient=2788  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,735 - pyuvimage - INFO -   coefficient=2826  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,746 - pyuvimage - INFO -   coefficient=2801  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,759 - pyuvimage - INFO -   coefficient=2820  log_evidence=60685.5  chi2/N=1.93
+2026-10-04 12:34:03,759 - pyuvimage - INFO - source prior optimised (evidence, 29 evaluations): coefficient=2813, scale=0.2459, nu=1.5
+2026-10-04 12:34:03,759 - pyuvimage - INFO - checking the non-negative solver at coefficient 2813 (on the delivered fit's own solve)...
+2026-10-04 12:34:03,768 - pyuvimage - INFO - solving the delivered fit at coefficient 2813 (non-negative; this solve is not seeded)...
+2026-10-04 12:34:03,902 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:34:03,903 - pyuvimage - INFO -   solver check done in 0 s -- unreliable
+2026-10-04 12:34:03,903 - pyuvimage - WARNING - the non-negative solver is unreliable on this data: it fits far worse than the unconstrained solve (chi^2 1.348e+05 vs 1.853e+04). Disabling positivity for this fit; the model may contain small negative values. Pass enforce_positive=True (--enforce-positive) to keep it regardless.
+2026-10-04 12:34:04,578 - pyuvimage - INFO -   coefficient=1e-06  log_evidence=53913.4  chi2/N=1.904  structure=0.941
+2026-10-04 12:34:04,958 - pyuvimage - INFO -   coefficient=1e+06  log_evidence=29069.4  chi2/N=4.936  structure=1.61
+2026-10-04 12:34:05,319 - pyuvimage - INFO -   coefficient=1  log_evidence=58511.2  chi2/N=1.912  structure=0.944
+2026-10-04 12:34:05,672 - pyuvimage - INFO -   coefficient=1000  log_evidence=60574.9  chi2/N=1.923  structure=0.946
+2026-10-04 12:34:06,012 - pyuvimage - INFO -   coefficient=3.162e+04  log_evidence=58919.9  chi2/N=2.023  structure=0.962
+2026-10-04 12:34:06,374 - pyuvimage - INFO -   coefficient=1.778e+05  log_evidence=51263.8  chi2/N=2.564  structure=1.12
+2026-10-04 12:34:06,758 - pyuvimage - INFO -   coefficient=7.499e+04  log_evidence=56284.8  chi2/N=2.183  structure=1
+2026-10-04 12:34:07,153 - pyuvimage - INFO -   coefficient=4.87e+04  log_evidence=57831.7  chi2/N=2.085  structure=0.977
+2026-10-04 12:34:07,527 - pyuvimage - INFO -   coefficient=6.043e+04  log_evidence=57123.4  chi2/N=2.129  structure=0.989
+2026-10-04 12:34:07,929 - pyuvimage - INFO -   coefficient=6.732e+04  log_evidence=56721.5  chi2/N=2.154  structure=0.996
+2026-10-04 12:34:08,826 - pyuvimage - INFO -   coefficient=7.105e+04  log_evidence=56507.6  chi2/N=2.168  structure=1
+2026-10-04 12:34:09,213 - pyuvimage - INFO -   coefficient=6.916e+04  log_evidence=56615.6  chi2/N=2.161  structure=0.998
+2026-10-04 12:34:09,213 - pyuvimage - INFO - source prior optimised (structure, 12 evaluations): coefficient=7.01e+04, scale=0.2459, nu=1.5
+2026-10-04 12:34:09,213 - pyuvimage - INFO - solving the delivered fit at coefficient 7.01e+04...
+2026-10-04 12:34:09,324 - pyuvimage - INFO -   delivered fit solved in 0 s
+2026-10-04 12:34:10,600 - pyuvimage - INFO -   point source accepted at dRA 0.850", dDec -0.650": 0.003983 Jy (142.5 sigma, unresolved: widening gains only delta chi2 = 0.0)
+2026-10-04 12:34:11,031 - pyuvimage - INFO -   candidate at dRA -0.014", dDec -0.004" rejected: 4.9 sigma < 5.0
+2026-10-04 12:34:23,583 - pyuvimage - INFO -   regularisation rescaled by 2.85e+03 with point components present (structure ratio 0.140 -> 1.000)
+2026-10-04 12:34:23,694 - pyuvimage - INFO -   the point components explain 90% of the excess chi^2 (2.165 -> 1.113) and carry 0.003971 Jy against the extended model's 0.01299 Jy: keeping them
+2026-10-04 12:34:23,694 - pyuvimage - WARNING - positivity does not extend to the mesh once point components are fitted: the bordered system is solved by Cholesky elimination, which is unconstrained, so the delivered mesh may contain small negative values. The point amplitudes themselves are unaffected.
+2026-10-04 12:34:23,694 - pyuvimage - INFO -   1 point source(s), total 0.003971 Jy; chi2/N now 1.113
+2026-10-04 12:34:24,721 - pyuvimage - INFO - measuring the prior-systematic window (unconstrained solves in half-decade steps, up to +/-6 dex)...
+2026-10-04 12:34:24,754 - pyuvimage - INFO -   window -0.5 to +0.5 dex, 4 solves, 0 s
+2026-10-04 12:34:24,756 - pyuvimage - INFO - model uncertainty: median 3.54e-06 Jy/pixel (statistical 1.35e-06, prior systematic 1.61e-06); mesh/image checkerboard of 96% removed
+2026-10-04 12:34:24,801 - pyuvimage - INFO - peak brightness 0.00624 Jy/beam = 2160 sigma; largest residual 6.1 sigma = 0.28% of the peak (dynamic range 351:1)
+2026-10-04 12:34:24,801 - pyuvimage - INFO - residual map rms 1.06 sigma against 1.05 expected for white noise at chi2/N = 1.113: structure ratio 1.00
+2026-10-04 12:34:24,911 - jax._src.xla_bridge - INFO - Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: dlopen(libtpu.so, 0x0001): tried: 'libtpu.so' (no such file), '/System/Volumes/Preboot/Cryptexes/OSlibtpu.so' (no such file), '/Users/hstacey/packages/miniforge3/envs/native_env/bin/../lib/libtpu.so' (no such file), '/usr/lib/libtpu.so' (no such file, not in dyld cache), 'libtpu.so' (no such file)
+2026-10-04 12:34:25,695 - pyuvimage - INFO - products written to /Users/hstacey/Work/pyuvimage/pyuvimage_demo
+demo products written to pyuvimage_demo
+  true point source: 0.0040 Jy at dRA +0.85", dDec -0.65"
+  recovered:         0.0040 +- 0.0000 Jy at dRA +0.85", dDec -0.65" (770 sigma)

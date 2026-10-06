@@ -1,0 +1,24 @@
+REBELS-25 (3e6 data points): chi^2 moved by < 400 across twelve decades of
+prior strength against a tolerance of sqrt(2N) = 2442, so the prior-
+systematic window opened to +/-6 dex. The strongest prior in it smoothed the
+source away, the systematic equalled the model everywhere, and snr.fits
+never exceeded 1.3 on a 15-sigma source. The structure ratio went 0.80 ->
+1.48 over the same range.
+
+When `structure` chose the strength, the window is now the set of strengths
+whose structure ratio is within its own noise scatter of the fitted one,
+sigma(ratio) = sqrt(sum(beam^2) / 2 n_pixels) (`structure_ratio_scatter`,
+checked against 300 noise realisations on three mocks to ~10%). On
+REBELS-25 that is 0.027, the window is +/-0.5 dex, the median systematic
+falls 2.6e-7 -> 3.3e-8 Jy/pixel and the peak pixel reads 3.3 sigma. Fits
+that fell back to `discrepancy` keep the chi^2 window.
+
+Every run now also reports the flux in the source region (model convolved
+with the restoring beam > 3 rms, connected to the peak) with its
+statistical error from the full posterior covariance and its prior
+systematic across the same window: 1.20 +- 0.08 mJy, 14.5 sigma, on
+REBELS-25. In the log and as `source_flux` in fit_parameters.json. snr.fits
+and uncertainty.fits headers say per-pixel and which metric set the window.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01V4AtTWc5c27eTcL5eRWWt8

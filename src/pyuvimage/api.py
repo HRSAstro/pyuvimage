@@ -246,6 +246,7 @@ def run(
     pb_correction: bool = True,
     dish_diameter: float | None = None,
     pb_factor: float = primary_beam.DEFAULT_PB_FACTOR,
+    pb_in_model: bool = False,
     uncertainty_map: bool = True,
     point_sources: bool | str | tuple | list | None = None,
     point_significance: float = 5.0,
@@ -312,6 +313,12 @@ def run(
             point. Set this to keep positivity and take the warning instead.
         dish_diameter: antenna diameter [m] for the primary beam; defaults to
             the value stored at import.
+        pb_in_model: put the primary beam in the forward model, so the source
+            prior acts on the true sky rather than the apparent sky (PB x I).
+            Matters where emission reaches the outer PB: an apparent-sky prior
+            reads the PB's dimming as faint emission and smooths it away. The
+            products are unchanged in kind (`model` apparent, `model_pbcor`
+            true). See `envelope.PrimaryBeamPrior`.
         streaming: read the visibilities once, in chunks, and hold nothing
             per visibility: the w-tilde kernel, the dirty images and the
             chi^2 constants are accumulated in one pass (and cached), and the
@@ -383,7 +390,8 @@ def run(
             positive_only=positive_only, enforce_positive=enforce_positive,
             kernel_cache=kernel_cache, mask_shape=mask_shape, oversample=oversample,
             pb_correction=pb_correction, dish_diameter=dish_diameter,
-            pb_factor=pb_factor, uncertainty_map=uncertainty_map, write=write,
+            pb_factor=pb_factor, pb_in_model=pb_in_model,
+            uncertainty_map=uncertainty_map, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
             point_sources=point_sources, point_significance=point_significance,
             max_points=max_points, point_retune=point_retune,
@@ -701,6 +709,11 @@ def run(
     fixed_prior = _fixed_prior(
         reg, coefficient, reg_scale, nu, beam_scale, optimise_envelope=optimise_env,
     )
+    if pb_in_model:
+        envelope = _pb_prior_envelope(
+            envelope, geometry, uvd.central_frequency, dish, pb_factor,
+            uvd.meta.get("image_centre_offset_arcsec"),
+        )
     mfs_fit = fitting.fit_dataset(
         mfs_dataset, geometry, reg_kind=reg, prior=fixed_prior,
         positive_only=positive_only, enforce_positive=enforce_positive,
@@ -771,6 +784,7 @@ def run(
         _report_dynamic_range(products[0], n_data_all, criterion)
     else:
         frozen = dict(mfs_fit.prior)
+        window_criterion = getattr(mfs_fit, "criterion_used", None)
         # Points carried into the cube: the MFS pass decides *where* they
         # are, each channel fits its own amplitude at those fixed positions.
         # Until 1 Sep 2026 the channels were fitted with no point components
@@ -844,6 +858,8 @@ def run(
                 ds_c, geometry, reg_kind=reg, prior=frozen,
                 positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion, nu=nu,
+                # the window is measured the way the MFS chose the prior
+                window_criterion=window_criterion,
                 envelope=envelope,
                 chi2_target=chi2_target,
                 # one summary line per channel below; the per-fit warning
@@ -935,6 +951,7 @@ def run_streamed(
     pb_correction: bool = True,
     dish_diameter: float | None = None,
     pb_factor: float = primary_beam.DEFAULT_PB_FACTOR,
+    pb_in_model: bool = False,
     uncertainty_map: bool = True,
     write: bool = True,
     mode: str = "mfs",
@@ -1175,6 +1192,12 @@ def run_streamed(
     optimise_env = bool(reg in fitting.ENVELOPE_REGULARIZATIONS and envelope_fwhm == "optimise")
     fixed_prior = _fixed_prior(reg, coefficient, reg_scale, nu, beam_scale,
                                optimise_envelope=optimise_env)
+    if pb_in_model:
+        envelope = _pb_prior_envelope(
+            envelope, geometry, header.central_frequency,
+            dish_diameter or header.meta.get("dish_diameter_m"), pb_factor,
+            header.meta.get("image_centre_offset_arcsec"),
+        )
 
     logger.info("fitting MFS image (%d visibility samples, none held)...", terms.n_vis)
     mfs_fit = fitting.fit_dataset(
@@ -1236,6 +1259,7 @@ def run_streamed(
     else:
         # -- the channels: `run`'s cube loop, each on its own stub ----------
         frozen = dict(mfs_fit.prior)
+        window_criterion = getattr(mfs_fit, "criterion_used", None)
         logger.info(
             "cube mode: source prior frozen from the MFS fit (%s)",
             ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
@@ -1265,6 +1289,7 @@ def run_streamed(
                 stub_c, geometry, reg_kind=reg, prior=frozen,
                 positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion, nu=nu, envelope=envelope,
+                window_criterion=window_criterion,
                 chi2_target=chi2_target, warn_on_chi2=False,
             )
             n_data_c = 2 * int(terms_c.n_vis)
@@ -1606,6 +1631,8 @@ def _parameter_record(
             "applied": bool(pb_correction),
             "dish_diameter_m": float(dish) if dish else None,
             "pb_factor": float(pb_factor),
+            # the source prior on the true sky (`--pb-in-model`)
+            "in_model": bool(envelope and envelope.get("primary_beam") is not None),
         },
         "point_sources": (
             point_solution.as_dict() if point_solution is not None
@@ -1721,6 +1748,35 @@ def _announce_centre(centre) -> None:
         "(dRA %+.3f\", dDec %+.3f\") from the phase centre; the output WCS "
         "follows.", -d_ra, d_dec, d_ra, d_dec,
     )
+
+
+def _pb_prior_envelope(envelope, geometry, frequency, dish, pb_factor, offset):
+    """``envelope`` plus the primary beam (``"primary_beam"``), which puts the
+    source prior on the true sky (`fitting.make_regularization`).
+
+    One PB, at the central frequency, for every fit of the run: a cube's
+    channels share the MFS prior, and across a 2 GHz band at 230 GHz the PB
+    width moves by < 1%.
+    """
+    if not dish:
+        raise ValueError(
+            "pb_in_model needs the dish diameter: none was stored at import; "
+            "pass dish_diameter=..."
+        )
+    fwhm = primary_beam.pb_fwhm_arcsec(float(frequency), float(dish), pb_factor)
+    # the phase centre in image coordinates: (-y0, -x0) after a recentre
+    y0, x0 = (float(v) for v in (offset or (0.0, 0.0)))
+    centre = (-y0, -x0)
+    half = 0.5 * geometry.fov_arcsec
+    corners = np.array([[sy * half, sx * half] for sy in (-1, 1) for sx in (-1, 1)])
+    r2 = np.sum((corners - np.array(centre)) ** 2, axis=1)
+    edge = float(np.exp(-0.5 * r2.max() / (fwhm / envelope_mod.SIGMA_TO_FWHM) ** 2))
+    logger.info(
+        "primary beam in the model: the source prior acts on the true sky "
+        "(PB FWHM %.3g arcsec; %.2g at the field's farthest corner; floor %.2g)",
+        fwhm, edge, fitting.PB_PRIOR_FLOOR,
+    )
+    return {**(envelope or {}), "primary_beam": {"fwhm": fwhm, "centre": centre}}
 
 
 def _recentre(uvd, image_centre, fov: float, dish_diameter, transformer="auto"):

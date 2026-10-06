@@ -255,6 +255,40 @@ def test_the_window_is_measured_in_what_chose_the_strength(criterion, metric):
     assert sf._window_metric()[0] == metric
 
 
+@pytest.mark.parametrize("criterion, metric", [
+    ("structure", "structure ratio"),
+    ("structure->discrepancy (ratio unreachable)", "chi^2"),
+    ("discrepancy", "chi^2"),
+    ("", "chi^2"),
+])
+def test_a_frozen_prior_window_follows_the_criterion_that_chose_it(criterion, metric):
+    """Cube channels have no scan (the prior is frozen from the MFS fit). They
+    fell back to chi^2, and on REBELS-25 each channel's window opened to
+    +/-6 dex: 24 non-negative solves per channel, most of the run time."""
+    from pyuvimage.fitting import SingleFit
+
+    sf = SingleFit(fit=None, geometry=None, prior={}, scan=None,
+                   window_criterion=criterion,
+                   imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
+    assert sf.criterion_used == criterion
+    assert sf._window_metric()[0] == metric
+
+
+def test_fit_dataset_records_the_criterion_of_a_fixed_prior():
+    from pyuvimage import fitting, mock
+
+    uvd, _, geometry, _ = mock.make_demo_dataset(n_vis=60, mesh_n=8, seed=5)
+    uv, d, n = uvd.flattened()
+    ds = fitting.make_dataset(uv, d, n, geometry, transformer="dft")
+    prior = {"coefficient": 1.0, "scale": 0.3}
+    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
+                             positive_only=False)
+    assert sf.scan is None and sf.criterion_used == "structure"
+    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
+                             positive_only=False, window_criterion="discrepancy")
+    assert sf.criterion_used == "discrepancy"
+
+
 # --- snr.fits: S/N at the restoring beam's resolution ---------------------------
 
 def test_the_smoothed_error_uses_the_full_covariance():

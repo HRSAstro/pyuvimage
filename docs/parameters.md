@@ -73,6 +73,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 | `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
 | `--noise` (on `pyuvimage import` and `convert`) | **difference** | How the per-visibility noise is set. MS weights are relative, not absolute, so the scale is always recomputed from the data. `difference`: from the visibilities alone. `hybrid`: adds the weight column's time profile. `scaled`: whole shape from the weights. `sigma`: trust `SIGMA` as absolute, and warn. On `convert`, `keep` (the default there) leaves the stored map alone. Full discussion in [noise.md](noise.md). |
 | `--dish-diameter`, `--no-pb` | from MS | Gaussian primary beam, FWHM = `1.13 lambda/D`, centred on the phase centre (the pointing) even when `--image-centre` has moved the grid. |
+| `--pb-in-model` | off | Put the primary beam in the forward model, so the source prior acts on the true sky instead of the apparent (PB-dimmed) sky. Mathematically `(F + P^-1 H P^-1) a = D`; F, D and the products are unchanged. Effect at the PB edge: less noise is amplified by the PB correction, but faint edge emission is pulled lower. On a mock with clumps at PB 0.3–0.5 the evidence preferred it by 50–75 in log Z under `matern` and by ~4 under `adaptive` (`scripts/mock_pb_in_model.py`). |
 
 
 ## When positivity is turned off for you
