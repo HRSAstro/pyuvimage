@@ -1,0 +1,780 @@
+{
+  "evidence": [
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "beam": 0.4517725020067852,
+      "peak_snr": 109.62588463099323,
+      "nu": {
+        "0.5": {
+          "lnZ": 154321.861375727,
+          "log_coeff": 9.499999999999998,
+          "scale_beams": 0.75
+        },
+        "1.0": {
+          "lnZ": 154316.00100751783,
+          "log_coeff": 9.499999999999998,
+          "scale_beams": 0.75
+        },
+        "1.5": {
+          "lnZ": 154315.16657640645,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "2.5": {
+          "lnZ": 154313.7959200076,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "3.5": {
+          "lnZ": 154312.76126476022,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        }
+      }
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "beam": 0.44898622957690376,
+      "peak_snr": 109.59013553693634,
+      "nu": {
+        "0.5": {
+          "lnZ": 154875.23652678134,
+          "log_coeff": 9.499999999999998,
+          "scale_beams": 0.75
+        },
+        "1.0": {
+          "lnZ": 154869.62360849697,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "1.5": {
+          "lnZ": 154868.0516724061,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "2.5": {
+          "lnZ": 154865.38443160692,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "3.5": {
+          "lnZ": 154863.41450067097,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        }
+      }
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "beam": 0.45869026232916527,
+      "peak_snr": 109.1266566720957,
+      "nu": {
+        "0.5": {
+          "lnZ": 154856.2005785157,
+          "log_coeff": 9.499999999999998,
+          "scale_beams": 0.75
+        },
+        "1.0": {
+          "lnZ": 154850.04884455123,
+          "log_coeff": 9.499999999999998,
+          "scale_beams": 0.75
+        },
+        "1.5": {
+          "lnZ": 154848.82727526498,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "2.5": {
+          "lnZ": 154847.0255440316,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        },
+        "3.5": {
+          "lnZ": 154845.77265524853,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 0.5
+        }
+      }
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "beam": 0.45176632019771734,
+      "peak_snr": 22.98086722391737,
+      "nu": {
+        "0.5": {
+          "lnZ": 90427.88553788805,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 1.0
+        },
+        "1.0": {
+          "lnZ": 90425.85795022165,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "1.5": {
+          "lnZ": 90424.7144832758,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "2.5": {
+          "lnZ": 90423.05633124095,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "3.5": {
+          "lnZ": 90422.00141168591,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        }
+      }
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "beam": 0.44898801875604805,
+      "peak_snr": 22.30155765250447,
+      "nu": {
+        "0.5": {
+          "lnZ": 91007.87675887377,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 1.0
+        },
+        "1.0": {
+          "lnZ": 91005.66137029039,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "1.5": {
+          "lnZ": 91004.2847841343,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "2.5": {
+          "lnZ": 91002.36750414118,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "3.5": {
+          "lnZ": 91001.21407252087,
+          "log_coeff": 9.799999999999997,
+          "scale_beams": 1.0
+        }
+      }
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "beam": 0.4586894493978591,
+      "peak_snr": 22.43669628250278,
+      "nu": {
+        "0.5": {
+          "lnZ": 90969.29756529293,
+          "log_coeff": 9.599999999999998,
+          "scale_beams": 1.5
+        },
+        "1.0": {
+          "lnZ": 90967.44663354439,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "1.5": {
+          "lnZ": 90966.20175634939,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "2.5": {
+          "lnZ": 90964.38404471487,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        },
+        "3.5": {
+          "lnZ": 90963.20081084323,
+          "log_coeff": 9.699999999999998,
+          "scale_beams": 1.0
+        }
+      }
+    }
+  ],
+  "pipeline": [
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 1.0149375975900086,
+      "coefficient": 8601423130.994411,
+      "rms_err_beam": 0.01050024827852687,
+      "peak_residual_sigma": 5.78605560208071,
+      "flux": {
+        "smooth blob": 0.9946240196010221,
+        "exponential disc": 0.983830379316032,
+        "knot arc": 1.025643158373446
+      },
+      "seconds": 20.79882574081421
+    },
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 1.0157413655306677,
+      "coefficient": 4322571517.865362,
+      "rms_err_beam": 0.010287259999771016,
+      "peak_residual_sigma": 5.275418207060691,
+      "flux": {
+        "smooth blob": 0.9938607463962228,
+        "exponential disc": 0.9810679966257828,
+        "knot arc": 1.0375251457736723
+      },
+      "seconds": 16.07189679145813
+    },
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 1.0156624853183556,
+      "coefficient": 2086103912.0183392,
+      "rms_err_beam": 0.01017948890551533,
+      "peak_residual_sigma": 4.988932101553749,
+      "flux": {
+        "smooth blob": 0.9933094659648333,
+        "exponential disc": 0.9789095165408107,
+        "knot arc": 1.0426314790771893
+      },
+      "seconds": 16.450549125671387
+    },
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 1.0104395121080012,
+      "coefficient": 86693848.24782321,
+      "rms_err_beam": 0.00888384818717606,
+      "peak_residual_sigma": 3.357423290894429,
+      "flux": {
+        "smooth blob": 0.9825712262640052,
+        "exponential disc": 0.9640145005431617,
+        "knot arc": 1.021234088537012
+      },
+      "seconds": 28.27414035797119
+    },
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 1.0115157708256546,
+      "coefficient": 73239621.9274035,
+      "rms_err_beam": 0.008829887420181176,
+      "peak_residual_sigma": 3.3374524296210604,
+      "flux": {
+        "smooth blob": 0.9869155555694508,
+        "exponential disc": 0.9629964955437865,
+        "knot arc": 1.027548002253449
+      },
+      "seconds": 30.12713861465454
+    },
+    {
+      "label": "high S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 1.0119074335019225,
+      "coefficient": 55918896.66325339,
+      "rms_err_beam": 0.008748513182266889,
+      "peak_residual_sigma": 3.485458115887832,
+      "flux": {
+        "smooth blob": 0.9899185406542335,
+        "exponential disc": 0.9630165440508028,
+        "knot arc": 1.028963063493987
+      },
+      "seconds": 31.32626700401306
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 0.9862712563952851,
+      "coefficient": 8601423130.994411,
+      "rms_err_beam": 0.009964189111363849,
+      "peak_residual_sigma": 6.480065989324101,
+      "flux": {
+        "smooth blob": 0.9581664059081374,
+        "exponential disc": 0.9957985661709113,
+        "knot arc": 1.0308245142770347
+      },
+      "seconds": 16.92442297935486
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 0.986903565301496,
+      "coefficient": 4151108285.5035295,
+      "rms_err_beam": 0.009904681202660515,
+      "peak_residual_sigma": 6.316329842699107,
+      "flux": {
+        "smooth blob": 0.9582307406138897,
+        "exponential disc": 0.9936042646066396,
+        "knot arc": 1.044491729231188
+      },
+      "seconds": 15.82250452041626
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 0.9868988521025587,
+      "coefficient": 2003354530.4710402,
+      "rms_err_beam": 0.009927754152543279,
+      "peak_residual_sigma": 6.152158862052195,
+      "flux": {
+        "smooth blob": 0.9581477375503147,
+        "exponential disc": 0.9918532444650858,
+        "knot arc": 1.0503311999060452
+      },
+      "seconds": 15.0318763256073
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 0.9806350440748516,
+      "coefficient": 109781040.76804765,
+      "rms_err_beam": 0.009053791197107539,
+      "peak_residual_sigma": 3.8276212120949586,
+      "flux": {
+        "smooth blob": 0.9440934469064656,
+        "exponential disc": 0.977747133890941,
+        "knot arc": 1.0334651020899877
+      },
+      "seconds": 27.036527395248413
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 0.9816472297509045,
+      "coefficient": 92743857.64563824,
+      "rms_err_beam": 0.008929325798580988,
+      "peak_residual_sigma": 3.838633827438055,
+      "flux": {
+        "smooth blob": 0.9496804281456552,
+        "exponential disc": 0.9774868701059817,
+        "knot arc": 1.0400563044994882
+      },
+      "seconds": 29.316834449768066
+    },
+    {
+      "label": "high S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 0.9820950640149048,
+      "coefficient": 75752074.60284732,
+      "rms_err_beam": 0.008879783582017521,
+      "peak_residual_sigma": 3.7746008911937468,
+      "flux": {
+        "smooth blob": 0.9527078746434129,
+        "exponential disc": 0.9775557119812237,
+        "knot arc": 1.042127710042977
+      },
+      "seconds": 32.50105381011963
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 0.9877006270543809,
+      "coefficient": 7932572727.607414,
+      "rms_err_beam": 0.009973248357760608,
+      "peak_residual_sigma": 6.165312620703963,
+      "flux": {
+        "smooth blob": 0.9849111379103026,
+        "exponential disc": 1.0115590697050194,
+        "knot arc": 1.0230782583020561
+      },
+      "seconds": 16.363784551620483
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 0.9881520061668135,
+      "coefficient": 3676458665.0474296,
+      "rms_err_beam": 0.009694330553660686,
+      "peak_residual_sigma": 5.600794412134964,
+      "flux": {
+        "smooth blob": 0.9843234126072823,
+        "exponential disc": 1.009803192686617,
+        "knot arc": 1.034016136239829
+      },
+      "seconds": 15.957384586334229
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 0.988266737306424,
+      "coefficient": 1774285230.8703084,
+      "rms_err_beam": 0.00960406542042347,
+      "peak_residual_sigma": 5.22821394088662,
+      "flux": {
+        "smooth blob": 0.9838242951667804,
+        "exponential disc": 1.0084960390373496,
+        "knot arc": 1.0388004690832364
+      },
+      "seconds": 17.207802057266235
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 0.9833469286951003,
+      "coefficient": 73239621.9274035,
+      "rms_err_beam": 0.007252547514318553,
+      "peak_residual_sigma": 3.616669832819816,
+      "flux": {
+        "smooth blob": 0.9747684113277778,
+        "exponential disc": 0.9944459953948502,
+        "knot arc": 1.0163032257292102
+      },
+      "seconds": 28.152603149414062
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 0.9842250201434174,
+      "coefficient": 61873389.27135109,
+      "rms_err_beam": 0.007301993582597961,
+      "peak_residual_sigma": 3.6565327039843982,
+      "flux": {
+        "smooth blob": 0.9788244440483139,
+        "exponential disc": 0.9947221711911771,
+        "knot arc": 1.0219366652563697
+      },
+      "seconds": 34.27654266357422
+    },
+    {
+      "label": "high S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 0.9846938283188063,
+      "coefficient": 48861280.4409688,
+      "rms_err_beam": 0.007351922074907832,
+      "peak_residual_sigma": 3.707882455258305,
+      "flux": {
+        "smooth blob": 0.9811150085974728,
+        "exponential disc": 0.9951943435891433,
+        "knot arc": 1.023898004669825
+      },
+      "seconds": 34.05058145523071
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 1.012348124727682,
+      "coefficient": 8260230901.587306,
+      "rms_err_beam": 0.03788598051475052,
+      "peak_residual_sigma": 6.051933360599304,
+      "flux": {
+        "smooth blob": 1.0194861464316451,
+        "exponential disc": 0.9097669589104656,
+        "knot arc": 0.9245445020024529
+      },
+      "seconds": 17.15504217147827
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 1.012656300813107,
+      "coefficient": 8956708445.545834,
+      "rms_err_beam": 0.03724277230915165,
+      "peak_residual_sigma": 5.837836929039002,
+      "flux": {
+        "smooth blob": 1.021017774770575,
+        "exponential disc": 0.9199499480443193,
+        "knot arc": 0.9342291507577702
+      },
+      "seconds": 16.865432739257812
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 1.012808612817987,
+      "coefficient": 8601423130.994411,
+      "rms_err_beam": 0.03706507037928623,
+      "peak_residual_sigma": 5.740418066904846,
+      "flux": {
+        "smooth blob": 1.0222449025682112,
+        "exponential disc": 0.924991876181907,
+        "knot arc": 0.9379919276356419
+      },
+      "seconds": 18.26895499229431
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 1.0117507925996234,
+      "coefficient": 139016517.9617384,
+      "rms_err_beam": 0.033870145035195254,
+      "peak_residual_sigma": 3.6224165936028583,
+      "flux": {
+        "smooth blob": 0.9530041647530051,
+        "exponential disc": 0.9369525843308216,
+        "knot arc": 0.916417740992363
+      },
+      "seconds": 26.96688485145569
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 1.0120687849834487,
+      "coefficient": 125638022.96809284,
+      "rms_err_beam": 0.03408103359740576,
+      "peak_residual_sigma": 3.6288482260965744,
+      "flux": {
+        "smooth blob": 0.9617463943558794,
+        "exponential disc": 0.9342499569967578,
+        "knot arc": 0.9336621158162245
+      },
+      "seconds": 28.37193489074707
+    },
+    {
+      "label": "low S/N",
+      "seed": 1,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 1.0122001434157613,
+      "coefficient": 109781040.76804765,
+      "rms_err_beam": 0.0341454304290925,
+      "peak_residual_sigma": 3.6125262947159382,
+      "flux": {
+        "smooth blob": 0.9686186337364807,
+        "exponential disc": 0.933408263382224,
+        "knot arc": 0.942490055164771
+      },
+      "seconds": 30.461837768554688
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 0.9827886687065215,
+      "coefficient": 7315732422.467873,
+      "rms_err_beam": 0.035019062768163405,
+      "peak_residual_sigma": 5.483125749326499,
+      "flux": {
+        "smooth blob": 0.858349612823338,
+        "exponential disc": 0.9689166222543986,
+        "knot arc": 0.9699769901917306
+      },
+      "seconds": 18.1519136428833
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 0.9831249739075596,
+      "coefficient": 7617911754.341997,
+      "rms_err_beam": 0.034229344150554425,
+      "peak_residual_sigma": 5.35666203790008,
+      "flux": {
+        "smooth blob": 0.8584515918436518,
+        "exponential disc": 0.9824830734227015,
+        "knot arc": 0.984674549714462
+      },
+      "seconds": 16.775891065597534
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 0.9832769707196065,
+      "coefficient": 7025539623.328239,
+      "rms_err_beam": 0.03388371506440606,
+      "peak_residual_sigma": 5.280518890217702,
+      "flux": {
+        "smooth blob": 0.8601515106490111,
+        "exponential disc": 0.9894253773643039,
+        "knot arc": 0.9915962315346382
+      },
+      "seconds": 17.087979078292847
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 0.9821481204567725,
+      "coefficient": 148717912.66411462,
+      "rms_err_beam": 0.0340303357487514,
+      "peak_residual_sigma": 4.441156967696799,
+      "flux": {
+        "smooth blob": 0.7698338113021551,
+        "exponential disc": 0.99930145639719,
+        "knot arc": 0.9781128372040487
+      },
+      "seconds": 30.981348752975464
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 0.9825063181912744,
+      "coefficient": 121471013.83205803,
+      "rms_err_beam": 0.033999902328414704,
+      "peak_residual_sigma": 4.446096630794835,
+      "flux": {
+        "smooth blob": 0.7813997914620785,
+        "exponential disc": 1.0001023718086806,
+        "knot arc": 1.0002248277992583
+      },
+      "seconds": 31.460875272750854
+    },
+    {
+      "label": "low S/N",
+      "seed": 2,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 0.9826661767549929,
+      "coefficient": 102619635.74124433,
+      "rms_err_beam": 0.03387287104886623,
+      "peak_residual_sigma": 4.439460175692637,
+      "flux": {
+        "smooth blob": 0.7899871250936611,
+        "exponential disc": 1.0003017394335263,
+        "knot arc": 1.0111244494856755
+      },
+      "seconds": 32.45656085014343
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 0.5,
+      "chi2_per_n": 0.9848887323148998,
+      "coefficient": 5510752895.334103,
+      "rms_err_beam": 0.034608920558728,
+      "peak_residual_sigma": 4.554980492488873,
+      "flux": {
+        "smooth blob": 0.9630561085639384,
+        "exponential disc": 1.0373656528971393,
+        "knot arc": 0.9365843762733608
+      },
+      "seconds": 16.792494297027588
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 1.5,
+      "chi2_per_n": 0.9852183087283937,
+      "coefficient": 5292158130.556692,
+      "rms_err_beam": 0.03394519628230755,
+      "peak_residual_sigma": 4.37809813763955,
+      "flux": {
+        "smooth blob": 0.9646150705426729,
+        "exponential disc": 1.048882227562454,
+        "knot arc": 0.9504278858803594
+      },
+      "seconds": 15.510540008544922
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "matern",
+      "nu": 2.5,
+      "chi2_per_n": 0.9853405644531824,
+      "coefficient": 4501117109.450305,
+      "rms_err_beam": 0.03367072129874065,
+      "peak_residual_sigma": 4.261668571554912,
+      "flux": {
+        "smooth blob": 0.9661164124582123,
+        "exponential disc": 1.0548007157758834,
+        "knot arc": 0.958283746059423
+      },
+      "seconds": 17.722742795944214
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 0.5,
+      "chi2_per_n": 0.9841911465787357,
+      "coefficient": 59821247.95075233,
+      "rms_err_beam": 0.03017137168233672,
+      "peak_residual_sigma": 3.463179874466981,
+      "flux": {
+        "smooth blob": 0.9258424676457664,
+        "exponential disc": 1.064985542912108,
+        "knot arc": 0.9641737601666472
+      },
+      "seconds": 29.45728826522827
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 1.5,
+      "chi2_per_n": 0.984512311228971,
+      "coefficient": 47240708.91981723,
+      "rms_err_beam": 0.030041323782423336,
+      "peak_residual_sigma": 3.465664774213249,
+      "flux": {
+        "smooth blob": 0.93695242918643,
+        "exponential disc": 1.0640292061512706,
+        "knot arc": 0.9836301778918426
+      },
+      "seconds": 30.50645422935486
+    },
+    {
+      "label": "low S/N",
+      "seed": 3,
+      "reg": "adaptive",
+      "nu": 2.5,
+      "chi2_per_n": 0.9846708826609527,
+      "coefficient": 37305884.70979621,
+      "rms_err_beam": 0.030010466500568836,
+      "peak_residual_sigma": 3.472608801721456,
+      "flux": {
+        "smooth blob": 0.9442849776346877,
+        "exponential disc": 1.06254452283558,
+        "knot arc": 0.9937711899999186
+      },
+      "seconds": 31.603109121322632
+    }
+  ]
+}

@@ -1,0 +1,542 @@
+[
+  {
+    "label": "high S/N",
+    "seed": 1,
+    "reg": "matern",
+    "chi2_per_n": 1.015741365530668,
+    "coefficient": 4322571517.865362,
+    "rms_err_beam": 0.010287259999771025,
+    "peak_residual_sigma": 5.275418207060636,
+    "structure_ratio": 1.0013078488175051,
+    "flux": {
+      "smooth blob": 0.993860746396223,
+      "exponential disc": 0.9810679966257826,
+      "knot arc": 1.0375251457736718
+    },
+    "flux_aperture": 1.0098327088230326,
+    "flux_field": 1.0223268235949694,
+    "seconds": 20.56101369857788
+  },
+  {
+    "label": "high S/N",
+    "seed": 1,
+    "reg": "exponential",
+    "chi2_per_n": 1.0149375972691244,
+    "coefficient": 8601423130.994411,
+    "rms_err_beam": 0.010500248228263225,
+    "peak_residual_sigma": 5.786055530689514,
+    "structure_ratio": 0.996743581912009,
+    "flux": {
+      "smooth blob": 0.9946240197023978,
+      "exponential disc": 0.9838303793918884,
+      "knot arc": 1.0256431575483769
+    },
+    "flux_aperture": 1.0082377215766696,
+    "flux_field": 1.0216093132058,
+    "seconds": 21.53673768043518
+  },
+  {
+    "label": "high S/N",
+    "seed": 1,
+    "reg": "gaussian",
+    "chi2_per_n": 1.014073783243174,
+    "coefficient": 312340935.15472835,
+    "rms_err_beam": 0.010406464529787132,
+    "peak_residual_sigma": 8.089743533137101,
+    "structure_ratio": 1.0015716999854327,
+    "flux": {
+      "smooth blob": 0.990430624855619,
+      "exponential disc": 0.9833850402070872,
+      "knot arc": 1.0211908915428212
+    },
+    "flux_aperture": 1.00790456809295,
+    "flux_field": 1.0173385621950495,
+    "seconds": 16.04041051864624
+  },
+  {
+    "label": "high S/N",
+    "seed": 1,
+    "reg": "gibbs",
+    "chi2_per_n": 1.012923102853586,
+    "coefficient": 19002406.038634595,
+    "rms_err_beam": 0.009984545511996304,
+    "peak_residual_sigma": 4.50514800904844,
+    "structure_ratio": 0.9996608285692878,
+    "flux": {
+      "smooth blob": 0.9912349667828964,
+      "exponential disc": 0.9787699007161738,
+      "knot arc": 1.0374111521876972
+    },
+    "flux_aperture": 1.0178933851462988,
+    "flux_field": 1.0295193553331345,
+    "seconds": 48.941731452941895
+  },
+  {
+    "label": "high S/N",
+    "seed": 1,
+    "reg": "adaptive",
+    "chi2_per_n": 1.0115157708256546,
+    "coefficient": 73239621.9274035,
+    "rms_err_beam": 0.008829887420181176,
+    "peak_residual_sigma": 3.3374524296210604,
+    "structure_ratio": 1.0021874798657293,
+    "flux": {
+      "smooth blob": 0.9869155555694508,
+      "exponential disc": 0.9629964955437865,
+      "knot arc": 1.027548002253449
+    },
+    "flux_aperture": 1.0018340122993017,
+    "flux_field": 1.0066412165808345,
+    "seconds": 31.49264168739319
+  },
+  {
+    "label": "high S/N",
+    "seed": 2,
+    "reg": "matern",
+    "chi2_per_n": 0.9869035653014957,
+    "coefficient": 4151108285.5035295,
+    "rms_err_beam": 0.009904681202660496,
+    "peak_residual_sigma": 6.316329842699117,
+    "structure_ratio": 1.0003803116189467,
+    "flux": {
+      "smooth blob": 0.9582307406138896,
+      "exponential disc": 0.9936042646066394,
+      "knot arc": 1.0444917292311882
+    },
+    "flux_aperture": 1.002632868220224,
+    "flux_field": 1.0154697585377404,
+    "seconds": 17.156224966049194
+  },
+  {
+    "label": "high S/N",
+    "seed": 2,
+    "reg": "exponential",
+    "chi2_per_n": 0.9862712560620465,
+    "coefficient": 8601423130.994411,
+    "rms_err_beam": 0.009964189060878648,
+    "peak_residual_sigma": 6.480065940811854,
+    "structure_ratio": 1.0009263981058443,
+    "flux": {
+      "smooth blob": 0.9581664059161794,
+      "exponential disc": 0.9957985661863898,
+      "knot arc": 1.030824513422052
+    },
+    "flux_aperture": 1.0005627251687463,
+    "flux_field": 1.0140511644526793,
+    "seconds": 20.492244482040405
+  },
+  {
+    "label": "high S/N",
+    "seed": 2,
+    "reg": "gaussian",
+    "chi2_per_n": 0.9848169114536346,
+    "coefficient": 222917688.58803174,
+    "rms_err_beam": 0.009479851614489963,
+    "peak_residual_sigma": 8.97963500634518,
+    "structure_ratio": 1.0000034041456498,
+    "flux": {
+      "smooth blob": 0.9542308982845343,
+      "exponential disc": 0.9940912424928633,
+      "knot arc": 1.0242507801664733
+    },
+    "flux_aperture": 1.0010094307909707,
+    "flux_field": 1.00913631552595,
+    "seconds": 15.398910522460938
+  },
+  {
+    "label": "high S/N",
+    "seed": 2,
+    "reg": "gibbs",
+    "chi2_per_n": 0.9833680123087987,
+    "coefficient": 27538571.35867706,
+    "rms_err_beam": 0.009832817386580974,
+    "peak_residual_sigma": 4.924376524618754,
+    "structure_ratio": 0.9993920922572339,
+    "flux": {
+      "smooth blob": 0.9594297809652139,
+      "exponential disc": 0.9914859769238364,
+      "knot arc": 1.0489347364389061
+    },
+    "flux_aperture": 1.0108256836428988,
+    "flux_field": 1.0228684839560984,
+    "seconds": 47.76290535926819
+  },
+  {
+    "label": "high S/N",
+    "seed": 2,
+    "reg": "adaptive",
+    "chi2_per_n": 0.9816472297509045,
+    "coefficient": 92743857.64563824,
+    "rms_err_beam": 0.008929325798580988,
+    "peak_residual_sigma": 3.838633827438055,
+    "structure_ratio": 0.9996862250789782,
+    "flux": {
+      "smooth blob": 0.9496804281456552,
+      "exponential disc": 0.9774868701059817,
+      "knot arc": 1.0400563044994882
+    },
+    "flux_aperture": 0.9933637364351704,
+    "flux_field": 0.9963471807485411,
+    "seconds": 31.135172128677368
+  },
+  {
+    "label": "high S/N",
+    "seed": 3,
+    "reg": "matern",
+    "chi2_per_n": 0.988152006166814,
+    "coefficient": 3676458665.0474296,
+    "rms_err_beam": 0.009694330553660696,
+    "peak_residual_sigma": 5.600794412134969,
+    "structure_ratio": 0.9978165832406244,
+    "flux": {
+      "smooth blob": 0.9843234126072823,
+      "exponential disc": 1.009803192686617,
+      "knot arc": 1.034016136239829
+    },
+    "flux_aperture": 1.0071250550634268,
+    "flux_field": 1.0236815724412147,
+    "seconds": 16.4390389919281
+  },
+  {
+    "label": "high S/N",
+    "seed": 3,
+    "reg": "exponential",
+    "chi2_per_n": 0.9877006267615194,
+    "coefficient": 7932572727.607414,
+    "rms_err_beam": 0.009973248308156086,
+    "peak_residual_sigma": 6.165312543233588,
+    "structure_ratio": 1.0016728691981216,
+    "flux": {
+      "smooth blob": 0.9849111380385294,
+      "exponential disc": 1.0115590697400927,
+      "knot arc": 1.0230782574677446
+    },
+    "flux_aperture": 1.0051604433596737,
+    "flux_field": 1.022481894630639,
+    "seconds": 19.637392044067383
+  },
+  {
+    "label": "high S/N",
+    "seed": 3,
+    "reg": "gaussian",
+    "chi2_per_n": 0.9863654176323902,
+    "coefficient": 208375980.43470237,
+    "rms_err_beam": 0.009181956097978436,
+    "peak_residual_sigma": 8.257152340419061,
+    "structure_ratio": 1.001416087100576,
+    "flux": {
+      "smooth blob": 0.9795882687785886,
+      "exponential disc": 1.0117610941550823,
+      "knot arc": 1.0175627253589383
+    },
+    "flux_aperture": 1.0042137314020971,
+    "flux_field": 1.0176140638272664,
+    "seconds": 15.086869239807129
+  },
+  {
+    "label": "high S/N",
+    "seed": 3,
+    "reg": "gibbs",
+    "chi2_per_n": 0.9855007579268731,
+    "coefficient": 15520938.166840883,
+    "rms_err_beam": 0.009489660840073065,
+    "peak_residual_sigma": 4.386559728027368,
+    "structure_ratio": 1.0001579698589815,
+    "flux": {
+      "smooth blob": 0.983605486955778,
+      "exponential disc": 1.0091093383792689,
+      "knot arc": 1.0321453540425622
+    },
+    "flux_aperture": 1.0144154551410118,
+    "flux_field": 1.0294262741144995,
+    "seconds": 44.99429130554199
+  },
+  {
+    "label": "high S/N",
+    "seed": 3,
+    "reg": "adaptive",
+    "chi2_per_n": 0.9842250201434174,
+    "coefficient": 61873389.27135109,
+    "rms_err_beam": 0.007301993582597961,
+    "peak_residual_sigma": 3.6565327039843982,
+    "structure_ratio": 0.9994569725209758,
+    "flux": {
+      "smooth blob": 0.9788244440483139,
+      "exponential disc": 0.9947221711911771,
+      "knot arc": 1.0219366652563697
+    },
+    "flux_aperture": 0.999677147983681,
+    "flux_field": 1.005102826231765,
+    "seconds": 31.425463438034058
+  },
+  {
+    "label": "low S/N",
+    "seed": 1,
+    "reg": "matern",
+    "chi2_per_n": 1.012656300813107,
+    "coefficient": 8956708445.545834,
+    "rms_err_beam": 0.03724277230915159,
+    "peak_residual_sigma": 5.837836929039014,
+    "structure_ratio": 0.9990065345138052,
+    "flux": {
+      "smooth blob": 1.0210177747705733,
+      "exponential disc": 0.9199499480443197,
+      "knot arc": 0.9342291507577694
+    },
+    "flux_aperture": 1.022335896640644,
+    "flux_field": 1.0558589823799307,
+    "seconds": 17.371283769607544
+  },
+  {
+    "label": "low S/N",
+    "seed": 1,
+    "reg": "exponential",
+    "chi2_per_n": 1.0123481246982655,
+    "coefficient": 8260230901.587306,
+    "rms_err_beam": 0.037885980491316154,
+    "peak_residual_sigma": 6.051933354321737,
+    "structure_ratio": 0.9982800563510636,
+    "flux": {
+      "smooth blob": 1.0194861463637637,
+      "exponential disc": 0.9097669588129041,
+      "knot arc": 0.9245445021482386
+    },
+    "flux_aperture": 1.0225840361688063,
+    "flux_field": 1.0586875681579897,
+    "seconds": 20.80054998397827
+  },
+  {
+    "label": "low S/N",
+    "seed": 1,
+    "reg": "gaussian",
+    "chi2_per_n": 1.0116726813606995,
+    "coefficient": 500849254.00936633,
+    "rms_err_beam": 0.03278399275388945,
+    "peak_residual_sigma": 3.9764958731160265,
+    "structure_ratio": 0.9999887377760044,
+    "flux": {
+      "smooth blob": 0.9462683434033439,
+      "exponential disc": 0.9341079941734732,
+      "knot arc": 0.9586241904502285
+    },
+    "flux_aperture": 0.9987138965059359,
+    "flux_field": 1.0228091569325384,
+    "seconds": 16.51190686225891
+  },
+  {
+    "label": "low S/N",
+    "seed": 1,
+    "reg": "gibbs",
+    "chi2_per_n": 1.0128945721244382,
+    "coefficient": 4322571517.865362,
+    "rms_err_beam": 0.037238586213504676,
+    "peak_residual_sigma": 5.422916169113017,
+    "structure_ratio": 1.0000102463728286,
+    "flux": {
+      "smooth blob": 1.033258511594759,
+      "exponential disc": 0.9135637053638926,
+      "knot arc": 0.949107194444115
+    },
+    "flux_aperture": 1.027866031465629,
+    "flux_field": 1.0611311005676436,
+    "seconds": 64.04601645469666
+  },
+  {
+    "label": "low S/N",
+    "seed": 1,
+    "reg": "adaptive",
+    "chi2_per_n": 1.0120687849834487,
+    "coefficient": 125638022.96809284,
+    "rms_err_beam": 0.03408103359740583,
+    "peak_residual_sigma": 3.6288482260966197,
+    "structure_ratio": 1.0008810569267415,
+    "flux": {
+      "smooth blob": 0.9617463943558809,
+      "exponential disc": 0.9342499569967596,
+      "knot arc": 0.9336621158162284
+    },
+    "flux_aperture": 0.9399958410653094,
+    "flux_field": 0.9468483315521772,
+    "seconds": 29.382664680480957
+  },
+  {
+    "label": "low S/N",
+    "seed": 2,
+    "reg": "matern",
+    "chi2_per_n": 0.9831249739075596,
+    "coefficient": 7617911754.341997,
+    "rms_err_beam": 0.03422934415055444,
+    "peak_residual_sigma": 5.35666203790003,
+    "structure_ratio": 0.9989427583223965,
+    "flux": {
+      "smooth blob": 0.8584515918436509,
+      "exponential disc": 0.9824830734227035,
+      "knot arc": 0.9846745497144631
+    },
+    "flux_aperture": 0.9883636349050959,
+    "flux_field": 1.021503656052298,
+    "seconds": 17.50505566596985
+  },
+  {
+    "label": "low S/N",
+    "seed": 2,
+    "reg": "exponential",
+    "chi2_per_n": 0.9827886686716327,
+    "coefficient": 7315732422.467873,
+    "rms_err_beam": 0.03501906273865306,
+    "peak_residual_sigma": 5.483125739985029,
+    "structure_ratio": 0.9990175166825197,
+    "flux": {
+      "smooth blob": 0.8583496127668673,
+      "exponential disc": 0.9689166221603308,
+      "knot arc": 0.9699769902719748
+    },
+    "flux_aperture": 0.9888582710924997,
+    "flux_field": 1.0245434136844485,
+    "seconds": 21.511146545410156
+  },
+  {
+    "label": "low S/N",
+    "seed": 2,
+    "reg": "gaussian",
+    "chi2_per_n": 0.9820755029369403,
+    "coefficient": 312340935.15472835,
+    "rms_err_beam": 0.03439905237379033,
+    "peak_residual_sigma": 5.345467342985721,
+    "structure_ratio": 1.0011713958117503,
+    "flux": {
+      "smooth blob": 0.8001873244608858,
+      "exponential disc": 0.992641529684902,
+      "knot arc": 1.0055273798177378
+    },
+    "flux_aperture": 0.9681001805735838,
+    "flux_field": 0.9870299146120667,
+    "seconds": 16.19369602203369
+  },
+  {
+    "label": "low S/N",
+    "seed": 2,
+    "reg": "gibbs",
+    "chi2_per_n": 0.983390965280843,
+    "coefficient": 3256081842.7705255,
+    "rms_err_beam": 0.03368345112892883,
+    "peak_residual_sigma": 4.910268465565102,
+    "structure_ratio": 0.9997829332952021,
+    "flux": {
+      "smooth blob": 0.8662000282320719,
+      "exponential disc": 0.9851802806361653,
+      "knot arc": 1.0029150056530258
+    },
+    "flux_aperture": 0.9945409623636404,
+    "flux_field": 1.0261333967031165,
+    "seconds": 66.78555011749268
+  },
+  {
+    "label": "low S/N",
+    "seed": 2,
+    "reg": "adaptive",
+    "chi2_per_n": 0.9825063181912744,
+    "coefficient": 121471013.83205803,
+    "rms_err_beam": 0.03399990232841503,
+    "peak_residual_sigma": 4.446096630794815,
+    "structure_ratio": 1.0006075523926348,
+    "flux": {
+      "smooth blob": 0.7813997914620799,
+      "exponential disc": 1.000102371808681,
+      "knot arc": 1.0002248277992523
+    },
+    "flux_aperture": 0.9041081055965201,
+    "flux_field": 0.9083603822950153,
+    "seconds": 32.56878304481506
+  },
+  {
+    "label": "low S/N",
+    "seed": 3,
+    "reg": "matern",
+    "chi2_per_n": 0.9852183087283937,
+    "coefficient": 5292158130.556692,
+    "rms_err_beam": 0.033945196282307535,
+    "peak_residual_sigma": 4.3780981376395065,
+    "structure_ratio": 1.0000068662807011,
+    "flux": {
+      "smooth blob": 0.9646150705426723,
+      "exponential disc": 1.0488822275624536,
+      "knot arc": 0.9504278858803588
+    },
+    "flux_aperture": 1.0213078670120384,
+    "flux_field": 1.0696897855828897,
+    "seconds": 16.747894763946533
+  },
+  {
+    "label": "low S/N",
+    "seed": 3,
+    "reg": "exponential",
+    "chi2_per_n": 0.984888732281811,
+    "coefficient": 5510752895.334103,
+    "rms_err_beam": 0.03460892054388553,
+    "peak_residual_sigma": 4.554980483507077,
+    "structure_ratio": 0.998870838872881,
+    "flux": {
+      "smooth blob": 0.9630561085956894,
+      "exponential disc": 1.0373656528287156,
+      "knot arc": 0.9365843763108812
+    },
+    "flux_aperture": 1.0203708438187582,
+    "flux_field": 1.0713006697124903,
+    "seconds": 20.044844150543213
+  },
+  {
+    "label": "low S/N",
+    "seed": 3,
+    "reg": "gaussian",
+    "chi2_per_n": 0.9840640750307701,
+    "coefficient": 170199010.65192962,
+    "rms_err_beam": 0.028325434978072318,
+    "peak_residual_sigma": 3.7219392741215533,
+    "structure_ratio": 1.0003956403316396,
+    "flux": {
+      "smooth blob": 0.91480004718324,
+      "exponential disc": 1.0549990761979493,
+      "knot arc": 0.9688820102278953
+    },
+    "flux_aperture": 1.0094149295910335,
+    "flux_field": 1.0431758624306606,
+    "seconds": 16.501993894577026
+  },
+  {
+    "label": "low S/N",
+    "seed": 3,
+    "reg": "gibbs",
+    "chi2_per_n": 0.9854211255934213,
+    "coefficient": 1636316039.689035,
+    "rms_err_beam": 0.03341046537947557,
+    "peak_residual_sigma": 3.832565401054903,
+    "structure_ratio": 1.0006994121962187,
+    "flux": {
+      "smooth blob": 0.9715878407512939,
+      "exponential disc": 1.0510005741785995,
+      "knot arc": 0.9696487507939713
+    },
+    "flux_aperture": 1.0283216360959178,
+    "flux_field": 1.075870217881092,
+    "seconds": 64.67903351783752
+  },
+  {
+    "label": "low S/N",
+    "seed": 3,
+    "reg": "adaptive",
+    "chi2_per_n": 0.984512311228971,
+    "coefficient": 47240708.91981723,
+    "rms_err_beam": 0.03004132378242332,
+    "peak_residual_sigma": 3.465664774213254,
+    "structure_ratio": 0.9993609315124715,
+    "flux": {
+      "smooth blob": 0.9369524291864307,
+      "exponential disc": 1.0640292061512702,
+      "knot arc": 0.9836301778918413
+    },
+    "flux_aperture": 0.9780255434339695,
+    "flux_field": 0.9872738985025217,
+    "seconds": 30.712564945220947
+  }
+]

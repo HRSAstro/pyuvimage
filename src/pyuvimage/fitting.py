@@ -3394,20 +3394,52 @@ def optimise_prior(
             return best, scan
     else:
         # ---- coarse grid then local refinement, maximising the evidence
-        coarse_coeff = np.linspace(
+        coarse_coeff = list(np.linspace(
             LOG_COEFFICIENT_BOUNDS[0], LOG_COEFFICIENT_BOUNDS[1], 7
+        ))
+        coarse_scale = (
+            np.linspace(log_scale_bounds[0], log_scale_bounds[1], 3) if two_d else None
         )
-        if two_d:
-            coarse_scale = np.linspace(log_scale_bounds[0], log_scale_bounds[1], 3)
-            grid = [np.array([c, sc]) for sc in coarse_scale for c in coarse_coeff]
-        else:
-            grid = [np.array([c]) for c in coarse_coeff]
+
+        def column(c):
+            if two_d:
+                return [np.array([c, sc]) for sc in coarse_scale]
+            return [np.array([c])]
+
+        grid = [p for c in coarse_coeff for p in column(c)]
         scores = [score(p) for p in grid]
         if not np.any(np.isfinite(scores)):
             raise RuntimeError(
                 "the inversion failed for every source prior tried; check the "
                 "noise map, the uv coordinates and the field of view"
             )
+        # The coefficient's meaningful magnitude follows the data's units, so
+        # the evidence peak can lie outside the shipped bracket: on a 20k-
+        # visibility mock it sat at 1e9.5, and a search held to 1e6 reported
+        # an evidence 3000 below the true maximum (and Teresa's run "chose"
+        # the bound itself). Extend the grid in 3-dex steps for as long as
+        # the best coefficient sits on an edge, as the discrepancy search
+        # already does.
+        while True:
+            best_c = float(grid[int(np.nanargmax(scores))][0])
+            if best_c >= max(coarse_coeff) and max(coarse_coeff) < MAX_LOG_COEFFICIENT:
+                c = min(max(coarse_coeff) + 3.0, MAX_LOG_COEFFICIENT)
+            elif best_c <= min(coarse_coeff) and min(coarse_coeff) > -MAX_LOG_COEFFICIENT:
+                c = max(min(coarse_coeff) - 3.0, -MAX_LOG_COEFFICIENT)
+            else:
+                break
+            logger.info(
+                "  evidence still rising at the edge of the coefficient range "
+                "(1e%.0f): extending to 1e%.0f", best_c, c,
+            )
+            coarse_coeff.append(c)
+            # `score` rejects anything outside `bounds`; widen them with the
+            # grid so the new column, and the refinement after it, can be
+            # evaluated
+            bounds[0] = (min(coarse_coeff), max(coarse_coeff))
+            new = column(c)
+            grid += new
+            scores += [score(p) for p in new]
         x0 = grid[int(np.nanargmax(scores))]
 
         from scipy.optimize import minimize
