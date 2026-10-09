@@ -16,8 +16,13 @@ to stop trusting the tool.
     python scripts/figure_snr_series.py --plot     # re-plot from the cache
     python scripts/figure_snr_series.py --criterion discrepancy
 
-Writes figures/snr_series.{pdf,png} (criterion `structure`, the default since
-Oct 2026), or figures/snr_series_<criterion>.{pdf,png} for any other.
+Writes figures/snr_series.{pdf,png} (criterion `structure`, uncertainty
+`statistical`), or figures/snr_series_<criterion>_<uncertainty>.{pdf,png} for
+any other pair. The uncertainty row is statistical because the mock carries a
+point component and `--uncertainty bayesian` is not available with point
+components (it falls back to statistical wherever a point is found, which
+would mix the two across the series); the Bayesian comparison is
+`marginal_lambda_mock.py`.
 """
 
 from __future__ import annotations
@@ -38,12 +43,12 @@ logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
 #: how the prior strength is chosen; set from the command line
 CRITERION = "structure"
-#: `fitting.STRUCTURE_WINDOW_N_SIGMA` for structure fits; set from the command line
-WINDOW_SIGMA = 1.0
+#: the uncertainty mode (`fitting.UNCERTAINTY_MODES`); set from the command line
+UNCERTAINTY = "statistical"
 
 
 def _tag() -> str:
-    return CRITERION + (f"_window{WINDOW_SIGMA:g}" if WINDOW_SIGMA != 1.0 else "")
+    return f"{CRITERION}_{UNCERTAINTY}"
 
 
 def cache() -> Path:
@@ -104,7 +109,7 @@ def fit_all() -> None:
             pyuvimage.run(
                 uvd, fov=FOV, out=out, mesh_shape=(MESH_N, MESH_N),
                 reg=REG, criterion=CRITERION, point_sources=True,
-                uncertainty_map=True, pb_correction=False,
+                uncertainty=UNCERTAINTY, pb_correction=False,
                 mask_shape="square",
             )
             failed = ""
@@ -252,7 +257,7 @@ def plot() -> None:
     ax_a.set_xscale("log")
     ax_a.set_xlabel("peak signal-to-noise [$\\sigma$]", fontsize=6.5)
     ax_a.set_ylabel("recovered / true flux", fontsize=6.5)
-    ax_a.legend(fontsize=5.6, frameon=False, loc="lower right")
+    ax_a.legend(fontsize=5.6, frameon=False, loc="upper left")
 
     ax_b = fig.add_subplot(gs_tr[0, 1])
     ax_b.axhline(DETECTION_CUT, color=fs.MUTED, lw=0.6, ls="--", zorder=1)
@@ -274,18 +279,19 @@ def plot() -> None:
     # ---- and the question the uncertainty row raises ---------------------
     # The statistical term alone *falls* as the data get worse, because a
     # weaker dataset gets a stronger prior and a strong prior shrinks the
-    # posterior variance, while the actual error does the opposite -- so with
-    # a fixed systematic window the two crossed near 11 sigma and the map
-    # under-stated the error by 9.6x by 5 sigma. The systematic window is now
-    # measured per fit (`SingleFit.chi2_admissible_dex`), sampled at every
-    # step rather than only its edges, and opens as chi^2 goes flat -- so the
-    # quoted 1 sigma now rises with the actual error instead of falling away
-    # from it, and covers it across the whole 60x range (coverage 0.26 at 300
-    # sigma to 0.94 at 5). Where the two curves meet is the honest end of the
-    # calibration, and it is not a detail a caption can be trusted to carry.
+    # posterior variance, while the actual error does the opposite -- so the
+    # statistical map under-states the error badly at low S/N. The Bayesian
+    # mode marginalises over the prior strength and tracks it
+    # (scripts/marginal_lambda_mock.py). Where the two curves part is the
+    # honest end of the statistical calibration, and it is not a detail a
+    # caption can be trusted to carry.
+    from scipy.ndimage import map_coordinates
     k = ref["model"].shape[0] // truth_sb.shape[0]
-    truth_img = to_fits_orientation(
-        np.kron(np.load(cache() / "truth.npy"), np.ones((k, k))) / k**2)
+    t_mesh = np.load(cache() / "truth.npy")
+    c = (np.arange(t_mesh.shape[0] * k) + 0.5) / k - 0.5     # bilinear, not a
+    yy, xx = np.meshgrid(c, c, indexing="ij")                # k x k block copy
+    t_up = map_coordinates(t_mesh, [yy, xx], order=1, mode="nearest")
+    truth_img = to_fits_orientation(t_up * t_mesh.sum() / t_up.sum())
     src = truth_img > 0.02 * truth_img.max()
     quoted, actual = [], []
     for _, r in runs:
@@ -311,7 +317,7 @@ def plot() -> None:
     ax_c.set_xscale("log"); ax_c.set_yscale("log")
     ax_c.set_xlabel("peak signal-to-noise [$\\sigma$]", fontsize=6.5)
     ax_c.set_ylabel("extended model [Jy/pixel]", fontsize=6.5)
-    ax_c.legend(fontsize=5.6, frameon=False, loc="lower left")
+    ax_c.legend(fontsize=5.6, frameon=False, loc="upper left")
 
     for ax in (ax_a, ax_b, ax_c):
         ax.tick_params(labelsize=5.8, length=2.0, width=0.4, color=fs.MUTED)
@@ -321,7 +327,7 @@ def plot() -> None:
         ax.set_xlim(snr.max() * 1.7, snr.min() * 0.55)   # bright on the left,
                                                          # matching the panels
 
-    stem = "snr_series" if _tag() == "structure" else f"snr_series_{_tag()}"
+    stem = "snr_series" if _tag() == "structure_statistical" else f"snr_series_{_tag()}"
     for p in fs.save(fig, stem):
         print("wrote", p)
 
@@ -341,13 +347,10 @@ if __name__ == "__main__":
                     help="skip fitting and re-plot from the cache")
     ap.add_argument("--criterion", default="structure",
                     choices=["structure", "discrepancy", "evidence"])
-    ap.add_argument("--structure-window-sigma", type=float, default=1.0,
-                    help="structure-fit systematic window, in units of the ratio's scatter")
+    ap.add_argument("--uncertainty", default="statistical", choices=["statistical", "bayesian"])
     args = ap.parse_args()
     CRITERION = args.criterion
-    WINDOW_SIGMA = args.structure_window_sigma
-    from pyuvimage import fitting as _fitting
-    _fitting.STRUCTURE_WINDOW_N_SIGMA = WINDOW_SIGMA
+    UNCERTAINTY = args.uncertainty
     if not args.plot:
         fit_all()
     plot()

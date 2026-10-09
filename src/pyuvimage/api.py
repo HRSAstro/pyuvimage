@@ -78,7 +78,7 @@ def resolve_uncertainty_mode(uncertainty: str | None, uncertainty_map: bool | No
     """The uncertainty mode from the new keyword or the deprecated boolean.
 
     ``uncertainty`` wins; otherwise ``uncertainty_map`` True means
-    "systematic" (what it always produced) and False "none"; with neither,
+    "statistical" and False "none"; with neither,
     "none" (the default since Oct 2026: the uncertainty products cost as much
     as the fit on large data, and which kind to trust is the user's call --
     docs/uncertainty.md).
@@ -86,8 +86,12 @@ def resolve_uncertainty_mode(uncertainty: str | None, uncertainty_map: bool | No
     if uncertainty is None:
         if uncertainty_map is None:
             return "none"
-        return "systematic" if uncertainty_map else "none"
+        return "statistical" if uncertainty_map else "none"
     mode = str(uncertainty).lower()
+    if mode == "systematic":
+        raise ValueError(
+            'uncertainty="systematic" (statistical + prior systematic) was removed '
+            'in Oct 2026; use "statistical" or "bayesian" (docs/uncertainty.md)')
     if mode not in fitting.UNCERTAINTY_MODES:
         raise ValueError(
             f"uncertainty must be one of {', '.join(fitting.UNCERTAINTY_MODES)}, "
@@ -370,12 +374,10 @@ def run(
             records this function's own keyword arguments instead.
         uncertainty: what the uncertainty products contain -- "none"
             (default: no uncertainty.fits or snr.fits), "statistical" (the
-            posterior width at the fitted prior strength), "systematic"
-            (statistical + the prior-strength systematic, with
-            uncertainty_systematic.fits) or "bayesian" (the posterior
+            posterior width at the fitted prior strength) or "bayesian" (the posterior
             marginalised over the prior strength, with model_bayesian.fits);
             see `fitting.UNCERTAINTY_MODES` and docs/uncertainty.md.
-        uncertainty_map: deprecated: True means uncertainty="systematic",
+        uncertainty_map: deprecated: True means uncertainty="statistical",
             False "none". Ignored when ``uncertainty`` is given.
         pynufft_shift: apply the half-pixel phase ramp that aligns the pynufft
             transformer with the DFT (default). False reproduces the
@@ -816,7 +818,6 @@ def run(
         _report_dynamic_range(products[0], n_data_all, criterion)
     else:
         frozen = dict(mfs_fit.prior)
-        window_criterion = getattr(mfs_fit, "criterion_used", None)
         # Points carried into the cube: the MFS pass decides *where* they
         # are, each channel fits its own amplitude at those fixed positions.
         # Until 1 Sep 2026 the channels were fitted with no point components
@@ -890,8 +891,6 @@ def run(
                 ds_c, geometry, reg_kind=reg, prior=frozen,
                 positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion, nu=nu,
-                # the window is measured the way the MFS chose the prior
-                window_criterion=window_criterion,
                 envelope=envelope,
                 chi2_target=chi2_target,
                 # one summary line per channel below; the per-fit warning
@@ -1294,7 +1293,6 @@ def run_streamed(
     else:
         # -- the channels: `run`'s cube loop, each on its own stub ----------
         frozen = dict(mfs_fit.prior)
-        window_criterion = getattr(mfs_fit, "criterion_used", None)
         logger.info(
             "cube mode: source prior frozen from the MFS fit (%s)",
             ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
@@ -1324,7 +1322,6 @@ def run_streamed(
                 stub_c, geometry, reg_kind=reg, prior=frozen,
                 positive_only=positive_only, enforce_positive=enforce_positive,
                 criterion=criterion, nu=nu, envelope=envelope,
-                window_criterion=window_criterion,
                 chi2_target=chi2_target, warn_on_chi2=False,
             )
             n_data_c = 2 * int(terms_c.n_vis)
@@ -1928,18 +1925,16 @@ STRUCTURE_RATIO_SUGGEST = 1.25
 SOURCE_REGION_SIGMA = 3.0
 
 
-def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "systematic") -> dict | None:
+def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistical") -> dict | None:
     """The model's flux in the source region, with its significance.
 
     Per-pixel S/N (`snr.fits`) reads low on any model sampled finer than the
     beam: neighbouring pixels are strongly anticorrelated, so each one is
     poorly determined while their sum is not. On REBELS-25 the peak pixel was
     at 4 sigma statistical while the source within 0.5" was at 14.5 sigma.
-    This reports the sum, with its proper error: the statistical part from
-    the full posterior covariance (`SingleFit.aperture_uncertainty`) and the
-    prior systematic as the largest change of the sum across the measured
-    window (`aperture_systematic`, available once the uncertainty map has
-    been made).
+    This reports the sum, with its proper error from the full posterior
+    covariance (`SingleFit.aperture_uncertainty`); in the Bayesian mode, also
+    the marginal posterior mean's own sum and error (`aperture_bayesian`).
 
     The region is where the model convolved with the restoring beam exceeds
     `SOURCE_REGION_SIGMA` x rms, keeping only the connected piece around the
@@ -1963,8 +1958,6 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "systemati
         region = labels == labels[peak]
         flux = float(np.sum(model_image[region]))
         stat = float(sf.aperture_uncertainty(region))
-        sys_ = sf.aperture_systematic(region) if mode == "systematic" else None
-        total = float(np.hypot(stat, sys_)) if sys_ is not None else None
         bayes = sf.aperture_bayesian(region) if mode == "bayesian" else None
     except Exception as e:                         # never let this kill a fit
         logger.debug("source flux failed: %s", e)
@@ -1976,10 +1969,8 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "systemati
         "area_arcsec2": float(region.sum() * pixel_scale ** 2),
         "flux_jy": flux,
         "flux_error_stat_jy": stat,
-        "flux_error_sys_jy": sys_,
-        "flux_error_jy": total,
         "snr_stat": flux / stat if stat > 0 else None,
-        "snr": flux / total if total else None,
+        "snr": flux / stat if stat > 0 else None,
         "uncertainty": mode,
     }
     if bayes is not None:
@@ -1989,13 +1980,12 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "systemati
         record["flux_error_bayesian_jy"] = bayes[1]
         record["snr"] = bayes[0] / bayes[1] if bayes[1] > 0 else None
     logger.info(
-        "source flux %.4g Jy in %.3g arcsec^2 (%s): +- %.2g statistical%s = "
+        "source flux %.4g Jy in %.3g arcsec^2 (%s): +- %.2g statistical = "
         "%.1f sigma. Per-pixel S/N (snr.fits) is far lower on a model "
         "sampled finer than the beam -- neighbouring pixels are "
         "anticorrelated -- so quote fluxes from regions, not pixels.",
         flux, record["area_arcsec2"], record["region"], stat,
-        "" if sys_ is None else f" +- {sys_:.2g} prior systematic",
-        record["snr"] if record["snr"] else record["snr_stat"],
+        record["snr_stat"] or float("nan"),
     )
     return record
 
@@ -2114,7 +2104,7 @@ def _products_for(
     dish: float | None,
     pb_factor: float,
     oversample: int,
-    uncertainty_mode: str = "systematic",
+    uncertainty_mode: str = "statistical",
     imager: "beam_mod.DirtyImager | None" = None,
 ) -> ProductSet:
     if imager is None or imager.dataset is not dataset:
@@ -2143,36 +2133,17 @@ def _products_for(
         resid_dirty = imager.dirty_image(resid_vis)
     uncertainty = None
     uncertainty_terms = None
-    uncertainty_systematic = None
-    # the systematic window of a `structure` fit is measured on residual maps;
-    # hand the fit the imager already built rather than have it build another
-    base_fit = getattr(sf, "_sf", sf)
-    if getattr(base_fit, "imager", "absent") is None:
-        base_fit.imager = imager
     model_bayesian = None
     if uncertainty_mode == "bayesian" and getattr(sf, "solution", None) is not None \
             and len(getattr(sf.solution, "grid_positions", []) or []):
         logger.warning(
             "--uncertainty bayesian is not available with point components "
             "(their amplitudes are not in the marginalised system); using "
-            "--uncertainty systematic for this fit")
-        uncertainty_mode = "systematic"
+            "--uncertainty statistical for this fit")
+        uncertainty_mode = "statistical"
     started = time.time()
     try:
-        if uncertainty_mode == "systematic":
-            uncertainty, uncertainty_terms = sf.model_uncertainty_total()
-            # from the same cached walk, so no extra solves
-            uncertainty_systematic = sf.model_uncertainty_systematic()
-            logger.info(
-                "model uncertainty: median %.3g Jy/pixel "
-                "(statistical %.3g, prior systematic %.3g); "
-                "mesh/image checkerboard of %.0f%% removed",
-                uncertainty_terms["total_median"],
-                uncertainty_terms["statistical_median"],
-                uncertainty_terms["systematic_median"],
-                100 * uncertainty_terms["checkerboard_amplitude"],
-            )
-        elif uncertainty_mode == "statistical":
+        if uncertainty_mode == "statistical":
             uncertainty, uncertainty_terms = sf.model_uncertainty_statistical()
             logger.info("model uncertainty (statistical only): median %.3g Jy/pixel",
                         uncertainty_terms["total_median"])
@@ -2234,7 +2205,6 @@ def _products_for(
         model_image=model_image,
         uncertainty=uncertainty,
         uncertainty_terms=uncertainty_terms,
-        uncertainty_systematic=uncertainty_systematic,
         model_bayesian=model_bayesian,
         dirty_image=dirty_image,
         dirty_model=dirty_model,

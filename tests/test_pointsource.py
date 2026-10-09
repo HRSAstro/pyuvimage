@@ -572,3 +572,27 @@ def test_the_snr_map_uses_the_joint_mesh_point_covariance():
     np.testing.assert_allclose(joint, inv, rtol=0, atol=1e-9 * np.abs(inv).max())
     snr, sigma = pa.beam_snr(BeamFit(0.3, 0.3, 0.0))
     assert np.isfinite(snr).all() and np.nanmax(snr) > 50
+
+
+def test_the_uncertainty_map_of_a_point_fit_uses_its_own_covariance():
+    """`uncertainty.fits` for a point-augmented fit was the mesh-only fit's
+    (F+H)^-1, before the retune and without the amplitudes marginalised:
+    30x too large at 300 sigma on the demo series, while snr.fits was right."""
+    from pyuvimage import fitting, mock
+    from pyuvimage.pointsource import PointAugmentedFit, fit_point_sources
+
+    uvd, _, geom, _ = mock.make_demo_dataset(n_vis=600, point_flux_jy=0.004, seed=3)
+    uv, d, n = uvd.flattened()
+    ds = fitting.make_dataset(uv, d, n, geom)
+    sf = fitting.fit_dataset(ds, geom, reg_kind="matern", positive_only=False,
+                             prior={"coefficient": 1e7, "scale": 0.25, "nu": 1.5})
+    sol = fit_point_sources(sf.fit.inversion, ds, geom, beam_fwhm=0.3)
+    assert sol.points
+    pa = PointAugmentedFit(sf, sol)
+    want = sf._propagate(pa.posterior_covariance)
+    np.testing.assert_allclose(pa.model_uncertainty, want, rtol=1e-12)
+    raw, terms = pa.model_uncertainty_statistical(deblock=False)
+    np.testing.assert_allclose(raw, want, rtol=1e-12)
+    assert terms["type"] == "statistical"
+    # and it is not the mesh-only fit's map
+    assert not np.allclose(pa.model_uncertainty, sf.model_uncertainty, rtol=1e-3)

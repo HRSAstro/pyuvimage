@@ -63,6 +63,20 @@ def score(mean, std, truth, src):
                 flux=float(mean[src].sum() / truth[src].sum()))
 
 
+def upsample_truth(truth, k):
+    """Bilinear interpolation of the mesh truth onto the k-times finer image grid.
+
+    Flux per image pixel, total flux conserved. A block (kron) copy leaves k x k
+    steps in the truth that the smooth model cannot follow, and those show up as
+    a checkerboard in (model - truth) / sigma."""
+    from scipy.ndimage import map_coordinates
+    n = truth.shape[0] * k
+    c = (np.arange(n) + 0.5) / k - 0.5          # image-pixel centres in mesh-pixel units
+    yy, xx = np.meshgrid(c, c, indexing="ij")
+    out = map_coordinates(truth, [yy, xx], order=1, mode="nearest")
+    return out * truth.sum() / out.sum()
+
+
 def fit_all():
     rows, maps = [], []
     for sigma in SIGMAS:
@@ -82,14 +96,20 @@ def fit_all():
         fit.imager = imager
         sysm, H0, F = fit.system, np.asarray(fit.regularization_matrix), np.asarray(fit.system.F)
         k = fit.model_image.shape[0] // truth.shape[0]
-        t_img = np.kron(np.asarray(truth), np.ones((k, k))) / k**2
+        t_img = upsample_truth(np.asarray(truth), k)
+        dirty = np.asarray(imager.dirty_image(np.asarray(ds.data)))
         src = t_img > 0.02 * t_img.max()
         peak = float(np.max(imager.dirty_image(np.asarray(ds.data))) / imager.rms)
 
         ovs = geom.oversample
-        # shipped: structure fit, positivity, its measured window
-        total, _ = fit.model_uncertainty_total()
-        shipped = score(np.asarray(fit.model_image), np.asarray(total), t_img, src)
+        # statistical + the window-walk prior systematic: a mode removed in
+        # Oct 2026 on the strength of this comparison. Scored only when the
+        # code still has it (the cached figure was made with it).
+        total = None
+        shipped = None
+        if hasattr(fit, "model_uncertainty_total"):
+            total, _ = fit.model_uncertainty_total()
+            shipped = score(np.asarray(fit.model_image), np.asarray(total), t_img, src)
         # the statistical term alone, at the structure fit's strength
         stat = _deblock(np.asarray(fit.model_uncertainty), ovs)
         stat_only = score(np.asarray(fit.model_image), stat, t_img, src)
@@ -120,13 +140,16 @@ def fit_all():
         frac_between = float(np.median(between[src] / var[src]))
         row = dict(peak=peak, post_mean_dex=mu, post_sd_dex=sd, frac_var_from_lambda=frac_between,
                    stat_only=stat_only, shipped=shipped, evidence=evid, marginal=marg)
-        maps.append(dict(peak=peak, truth=t_img, src=src, pix=geom.pixel_scale, beam=b,
-                         model=np.asarray(fit.model_image), stat=stat, total=np.asarray(total),
+        maps.append(dict(peak=peak, truth=t_img, dirty=dirty, rms=float(imager.rms), src=src, pix=geom.pixel_scale, beam=b,
+                         model=np.asarray(fit.model_image), stat=stat,
+                         total=None if total is None else np.asarray(total),
                          bayes=m, bayes_sd=sd_marg))
         rows.append(row)
         print(f"peak {peak:4.0f}  log10 lam posterior {mu:+.2f} +- {sd:.2f} dex (rel. structure)  "
               f"lambda share of variance {frac_between:.2f}", flush=True)
         for name, r in (("stat only", stat_only), ("shipped", shipped), ("evidence", evid), ("marginal", marg)):
+            if r is None:
+                continue
             print(f"    {name:<9} rms {r['rms']:.2e}  coverage {r['cover']:.2f}  "
                   f"within-1sigma {r['within']:.2f}  flux {r['flux']:.2f}", flush=True)
     Path("figures").mkdir(exist_ok=True)
@@ -144,10 +167,23 @@ def plot(rows, maps):
 
     fs.use_paper_style()
     n = len(maps)
-    fig = plt.figure(figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 1.18))
-    gs = fig.add_gridspec(6, n, left=0.085, right=0.90, top=0.965, bottom=0.315,
+    from matplotlib.colors import Normalize, AsinhNorm
+    from matplotlib.ticker import FixedLocator, LogFormatterMathtext, NullLocator
+
+    def decade_ticks(cb, norm):
+        """Label an asinh bar at whole decades only, clear of the linear core.
+
+        The default asinh locator mixes 0 and linear ticks into the decades, and
+        they collide where the stretch compresses."""
+        lo = np.ceil(np.log10(3.0 * norm.linear_width))
+        ticks = 10.0 ** np.arange(lo, np.floor(np.log10(norm.vmax)) + 1)
+        cb.ax.yaxis.set_major_locator(FixedLocator(ticks))
+        cb.ax.yaxis.set_major_formatter(LogFormatterMathtext())
+        cb.ax.yaxis.set_minor_locator(NullLocator())
+    fig = plt.figure(figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 1.31))
+    gs = fig.add_gridspec(7, n, left=0.085, right=0.90, top=0.969, bottom=0.284,
                           wspace=0.04, hspace=0.05)
-    gs_tr = fig.add_gridspec(1, 3, left=0.075, right=0.99, top=0.245, bottom=0.055, wspace=0.36)
+    gs_tr = fig.add_gridspec(1, 3, left=0.075, right=0.99, top=0.221, bottom=0.050, wspace=0.36)
     pix = maps[0]["pix"]
     ext = fs.sky_extent(maps[0]["truth"].shape[0], pix)
     vmax = max(float(mp["truth"].max()) for mp in maps) / pix**2
@@ -157,11 +193,14 @@ def plot(rows, maps):
     smin = min(float(np.nanpercentile(mp["stat"], 50)) for mp in maps) / pix**2
     norm_s = fs.asinh_norm(smax, linear_width=0.5 * smin)
     norm_z = fs.symmetric_norm(4.0)
-    rows_lab = ["model\n(structure)", "statistical 1σ", "(model − truth)\n/ statistical 1σ",
+    dmax = max(float(mp["dirty"].max()) for mp in maps)
+    norm_d = Normalize(vmin=-0.15 * dmax, vmax=dmax)
+    rows_lab = ["dirty image", "model\n(structure)", "statistical 1σ", "(model − truth)\n/ statistical 1σ",
                 "mean\n(Bayesian)", "Bayesian 1σ", "(mean − truth)\n/ Bayesian 1σ"]
     for j, mp in enumerate(maps):
         src = mp["src"]
-        panels = [(mp["model"] / pix**2, dict(norm=norm_i)),
+        panels = [(mp["dirty"], dict(norm=norm_d)),
+                  (mp["model"] / pix**2, dict(norm=norm_i)),
                   (mp["stat"] / pix**2, dict(cmap=fs.UNCERTAINTY_CMAP, norm=norm_s)),
                   (np.where(src, (mp["model"] - mp["truth"]) / mp["stat"], np.nan),
                    dict(cmap=fs.RESIDUAL_CMAP, norm=norm_z)),
@@ -173,7 +212,7 @@ def plot(rows, maps):
             ax = fig.add_subplot(gs[i, j])
             ax.set_facecolor("#f0f0f0")
             im = fs.show_image(ax, fo(img), ext, **kw)
-            if i in (2, 5):
+            if i in (3, 6):
                 frac = float(np.nanmean(np.abs(img[src]) <= 1.0))
                 fs.panel_label(ax, f"{frac:.2f}", loc="lower right", color=fs.INK, size=5.4)
             if i == 0:
@@ -183,12 +222,13 @@ def plot(rows, maps):
             if j == 0:
                 ax.set_ylabel(rows_lab[i], fontsize=6.0, color=fs.INK, labelpad=2)
             if j == n - 1:
-                fs.colorbar(fig, im, ax, ["Jy arcsec$^{-2}$", "Jy arcsec$^{-2}$", "σ"][i % 3],
-                            pad=0.06, width=0.010)
+                cb = fs.colorbar(fig, im, ax, (["Jy beam$^{-1}$"] + ["Jy arcsec$^{-2}$", "Jy arcsec$^{-2}$", "σ"] * 2)[i],
+                                 pad=0.06, width=0.010)
+                if isinstance(kw.get("norm"), AsinhNorm):
+                    decade_ticks(cb, kw["norm"])
     snr = np.array([r["peak"] for r in rows])
-    series = [("stat_only", "statistical only (structure)", "#2a78d6", "o"),
-              ("shipped", "statistical + prior systematic", "#8a8a8a", "s"),
-              ("marginal", "Bayesian (evidence, λ-marginalised)", "#eb6834", "^")]
+    series = [("stat_only", "statistical", "#2a78d6", "o"),
+              ("marginal", "Bayesian", "#eb6834", "^")]
     panels = [("within", "fraction within 1σ", 0.6827),
               ("cover", "median 1σ / rms error", 1.0),
               ("flux", "recovered / true flux", 1.0)]
@@ -196,6 +236,8 @@ def plot(rows, maps):
         ax = fig.add_subplot(gs_tr[0, k])
         ax.axhline(ref, color=fs.MUTED, lw=0.6, ls="--")
         for name, lab, c, mk in series:
+            if rows[0].get(name) is None:
+                continue
             ax.plot(snr, [r[name][key] for r in rows], marker=mk, color=c, ms=3, lw=1, label=lab)
         ax.set_xscale("log")
         ax.set_xlim(snr.max() * 1.6, snr.min() * 0.6)
@@ -204,7 +246,7 @@ def plot(rows, maps):
         ax.tick_params(labelsize=5.8)
         for sp in ("top", "right"):
             ax.spines[sp].set_visible(False)
-    fig.axes[-3].legend(fontsize=5.2, frameon=False, loc="lower left")
+    fig.axes[-1].legend(fontsize=5.2, frameon=False, loc="lower left")
     fig.canvas.draw()
     for t in fig.findobj(mtext.Text):
         if t.get_text():

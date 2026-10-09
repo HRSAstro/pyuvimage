@@ -377,11 +377,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument(
         "--uncertainty", default="none",
-        choices=["none", "statistical", "systematic", "bayesian"],
+        choices=["none", "statistical", "bayesian"],
         help="what the uncertainty products contain (default none: no "
              "uncertainty.fits or snr.fits). statistical: the posterior width "
-             "at the fitted prior strength. systematic: statistical + the "
-             "prior-strength systematic (also uncertainty_systematic.fits). "
+             "at the fitted prior strength. "
              "bayesian: the posterior marginalised over the prior strength, "
              "weighted by the evidence (also model_bayesian.fits, the "
              "posterior mean those errors belong to). See docs/uncertainty.md "

@@ -74,29 +74,6 @@ DEFAULT_NU = 1.5
 # LogUniform(1e-6, 1e6) on both coefficient and scale; the scale is bounded
 # below by the pixel scale and above by the field of view at fit time, since
 # values outside that range are meaningless for the image.
-#: Widest window `SingleFit.chi2_admissible_dex` will report, in dex either
-#: side of the fitted strength. Six decades is already far past where the
-#: model resembles the data; the cap exists to bound the number of solves.
-CHI2_WINDOW_MAX_DEX = 6.0
-
-#: Narrowest window it will report. The walk steps in half decades, so a
-#: measured reach of zero means only "narrower than half a decade", not zero
-#: -- and quoting zero would drop the prior systematic entirely on the fits
-#: where the statistical term is most optimistic. Half a decade is also what
-#: the point-source flux systematic uses (a factor of 3), so the measured
-#: window can only ever widen the old fixed one, never narrow it.
-CHI2_WINDOW_MIN_DEX = 0.5
-
-#: How far the structure ratio may move, in units of its own noise scatter
-#: (`structure_ratio_scatter`), before a strength leaves the systematic window
-#: of a `structure` fit. 1 (the default) is the ratio's 1-sigma noise. Under
-#: test (Oct 2026): at low S/N the ratio barely responds to the strength, the
-#: 1-sigma window stays at its half-decade floor, and the quoted error falls
-#: ~10x short of the actual error on the demo mock at 5 sigma; 5 brings the
-#: mock's coverage to ~1 at peak S/N <= 60. See
-#: claude/snr-series-structure-window.md in the project notes.
-STRUCTURE_WINDOW_N_SIGMA = 1.0
-
 #: Where the coefficient search starts, in log10. The lower end is the
 #: weakest prior, probed first in every search (the floor check needs it). Both
 #: ends were PyAutoLabs' LogUniform(1e-6, 1e6) prior, set for optical/IR
@@ -113,13 +90,15 @@ MAX_LOG_COEFFICIENT = 18.0
 
 #: What the uncertainty products contain (`api.run(uncertainty=...)`,
 #: `--uncertainty`):
-#:   none        -- no uncertainty map, S/N map or systematic (fastest);
+#:   none        -- no uncertainty map or S/N map (fastest);
 #:   statistical -- the posterior width at the fitted prior strength only;
-#:   systematic  -- statistical + the prior-strength systematic (the window
-#:                  walk; docs/uncertainty.md);
 #:   bayesian    -- the posterior marginalised over the prior strength, with
 #:                  the evidence as its weight (`SingleFit.bayesian_posterior`).
-UNCERTAINTY_MODES = ("none", "statistical", "systematic", "bayesian")
+#: A third mode, statistical + a "prior systematic" (the largest change of the
+#: model across a window of admissible strengths), was removed in Oct 2026:
+#: the Bayesian mode covered the truth better at every S/N tested, and the
+#: window's edges had no calibration (docs/uncertainty.md).
+UNCERTAINTY_MODES = ("none", "statistical", "bayesian")
 
 #: The evidence grid of `SingleFit.bayesian_posterior`, in dex about the
 #: fitted strength: a coarse pass finds the peak, a fine pass resolves it.
@@ -2477,7 +2456,7 @@ class LinearSystem:
 
         `warm_start` is off by default because the seed changes the last bits
         of the answer, and a `Trial` is meant to be the framework fit to the
-        bit. The searches, probes and the systematic-window walk opt in: they
+        bit. The searches and probes opt in: they
         ask where chi^2 or the model sits, and 1e-11 is not a place.
         """
         from autoarray.inversion.inversion import inversion_util
@@ -2536,8 +2515,7 @@ class LinearSystem:
     #: took 7. On J0116 a 3-dex cap let two far seeds in and the three-solve
     #: solver check took 18 minutes -- a seed from the wrong regime leads the
     #: active set through more changes than the unconstrained signs do. One
-    #: decade covers everything that gains: the half-decade window walk, the
-    #: re-bisection's midpoints, and the same strength under another prior.
+    #: decade covers everything that gains: the re-bisection's midpoints, and the same strength under another prior.
     WARM_START_MAX_DEX = 1.0
 
     def _warm_seed(self, key: float) -> np.ndarray | None:
@@ -2553,8 +2531,7 @@ class LinearSystem:
         """Offer a non-negative solution solved elsewhere as a warm-start seed.
 
         The delivered fit is the framework's own solve, made outside this
-        class; the systematic-window walk starts from it, and the walk's first
-        step is a half-decade away from it.
+        class; a later solve near the same strength can start from it.
         """
         self._pool_solution(self._strength_key(H), reconstruction)
 
@@ -3570,13 +3547,12 @@ class SingleFit:
     """Everything downstream products need from one fit.
 
     The heavy pieces are computed once and kept. `products.py` asks for the
-    posterior covariance, the model uncertainty, the prior systematic, the
+    posterior covariance, the model uncertainty, the
     evidence and chi^2 in turn, and each of those used to go back to autoarray
     for F and (F + H)^-1 afresh: F six times over, the inverse two or three
     times. `functools.cached_property` works on a plain (non-frozen, non-slots)
     dataclass because it stores into the instance `__dict__`, which is what is
-    used here; `prior_systematic` takes an argument and keeps its own small
-    cache keyed on it.
+    used here.
     """
 
     fit: ag.FitInterferometer
@@ -3588,68 +3564,10 @@ class SingleFit:
     #: it is caught ignoring the prior, and `fit_parameters.json` was
     #: reporting the request rather than what actually ran.
     positive_only: bool = True
-    #: the dirty imager, when the caller has one; the systematic window of a
-    #: `structure` fit is measured on residual maps (see `_admissible_scan`)
-    #: and builds one from the dataset otherwise
-    imager: object = field(default=None, repr=False, compare=False)
-    #: the criterion that chose the prior when this fit did not choose it
-    #: itself (`scan` is None): a cube channel, whose prior is frozen from the
-    #: MFS fit, measures its systematic window the way the MFS did
-    window_criterion: str = ""
 
     @property
     def coefficient(self) -> float:
         return float(self.prior["coefficient"])
-
-    def _window_metric(self):
-        """What the systematic window is measured in: ``("chi^2", None)`` or
-        ``("structure ratio", imager)``.
-
-        chi^2 by default: a strength is admissible while chi^2 stays within
-        sqrt(2N) of the fitted value. That is the right test exactly where
-        chi^2 chose the strength, and the wrong one where `structure` did:
-        `--criterion auto` takes `structure` because chi^2 has gone flat, and
-        a flat chi^2 then declares every strength admissible. On REBELS-25
-        (3e6 data points) chi^2 moved by < 400 across 12 decades against a
-        tolerance of 2442, the window opened to +/-6 dex, the strongest prior
-        in it had smoothed the source to nothing, and the systematic equalled
-        the model everywhere: snr.fits never exceeded 1.3 on a 15-sigma source.
-        The structure ratio went 0.80 -> 1.48 over the same range.
-
-        So a fit whose strength `structure` chose has its window measured in
-        the structure ratio, with the ratio's own noise scatter as the
-        tolerance (`structure_ratio_scatter`). After a fallback to
-        `discrepancy` the fit is in the weakly constrained regime where the
-        ratio is not calibrated, and chi^2 is kept.
-
-        A fit with a frozen prior has no scan of its own and follows
-        `window_criterion`, the criterion of the fit its prior came from. Cube
-        channels used to fall back to chi^2 here, and on REBELS-25 every
-        channel's window then opened to +/-6 dex: 24 non-negative solves per
-        channel, most of the cube's run time, and a systematic as large as
-        the model.
-        """
-        criterion = self.criterion_used
-        effective = PriorScan(criterion=criterion).effective_criterion
-        if not criterion.startswith("structure") or effective == "discrepancy":
-            return "chi^2", None
-        imager = self.imager
-        if imager is None:
-            try:
-                imager = imager_for(self.fit.dataset)
-            except Exception as e:                # pragma: no cover
-                logger.debug("no imager for the structure window: %s", e)
-                return "chi^2", None
-            self.imager = imager
-        return "structure ratio", imager
-
-    @property
-    def criterion_used(self) -> str:
-        """The criterion that chose this fit's prior: its own scan's, or the
-        one handed down with a frozen prior (`window_criterion`)."""
-        if self.scan is not None:
-            return getattr(self.scan, "criterion", "") or ""
-        return self.window_criterion or ""
 
     @property
     def system(self) -> LinearSystem:
@@ -3711,8 +3629,8 @@ class SingleFit:
 
         NOTE this is conditional on the prior *and its fitted
         hyperparameters*, and on the noise map being correct.  It does not
-        include the systematic error from the prior itself being wrong, which
-        on a poorly-sampled field is usually the larger effect.
+        include the error from the prior's strength itself being uncertain
+        (see `bayesian_posterior`), nor from the prior family being wrong.
         """
         return np.linalg.inv(np.add(self.system.F, self.regularization_matrix))
 
@@ -3792,20 +3710,17 @@ class SingleFit:
             var += np.sum(img ** 2, axis=0)
         return np.sqrt(var)
 
-    def beam_snr(self, beam, mode: str = "systematic") -> tuple[np.ndarray, np.ndarray]:
+    def beam_snr(self, beam, mode: str = "statistical") -> tuple[np.ndarray, np.ndarray]:
         """(S/N, 1-sigma) of the model at the resolution of the restoring
         `beam` (a `beam.BeamFit`).
 
         ``mode`` is the uncertainty mode (`UNCERTAINTY_MODES`): "statistical"
-        leaves the prior systematic out; "bayesian" is the marginal posterior
-        mean over its own marginal error (`bayesian_posterior`).
+        is the model over its error at the fitted strength; "bayesian" is the
+        marginal posterior mean over its own marginal error
+        (`bayesian_posterior`).
 
         The model convolved with the (peak-normalised) restoring beam, over
-        its own error: the statistical part from the full covariance
-        (`smoothed_std`) and the prior systematic as the largest change of
-        the smoothed model across the measured window -- the window
-        `prior_systematic` walked, so this needs the uncertainty map first
-        and is statistical only otherwise. `snr.fits`. The smoothing is the
+        its own error from the full covariance (`smoothed_std`). `snr.fits`. The smoothing is the
         restored image's own (`beam.restore`), so the numerator is the
         restored image without its residuals, in Jy/beam.
         """
@@ -3821,23 +3736,10 @@ class SingleFit:
             sigma = self.smoothed_std(kernel, cov=post["cov"])
         else:
             smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
-            stat = self.smoothed_std(kernel)
-            sigma = (stat if mode == "statistical"
-                     else np.hypot(stat, self._smoothed_systematic(kernel)))
+            sigma = self.smoothed_std(kernel)
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = np.where(sigma > 0, smooth / sigma, 0.0)
         return snr, sigma
-
-    def _smoothed_systematic(self, kernel: np.ndarray) -> np.ndarray:
-        from scipy.signal import fftconvolve
-
-        base = np.nan_to_num(self.model_image)
-        worst = np.zeros_like(base)
-        for img in self.__dict__.get("_window_images") or []:
-            if img is not None:
-                worst = np.maximum(worst, np.abs(fftconvolve(
-                    np.nan_to_num(img) - base, kernel, mode="same")))
-        return worst
 
     @functools.cached_property
     def model_uncertainty_sampling(self) -> np.ndarray:
@@ -3867,36 +3769,10 @@ class SingleFit:
         """
         return self._propagate(self.posterior_covariance)
 
-    def model_image_at_scale(self, factor: float) -> np.ndarray:
-        """The model image with the regularisation strength scaled by `factor`.
-
-        H = coefficient x C^-1 scales linearly with the coefficient, so this
-        needs no refit: re-solve (F + factor*H) s = D and re-map.  Returns
-        None if the rescaled system is not positive definite (weakening the
-        prior far enough makes F alone singular wherever the mesh has pixels
-        the uv coverage does not constrain).
-
-        The re-solve uses the solver the delivered fit used. It used to be
-        unconstrained regardless, so on a positive-only fit the "systematic"
-        this feeds compared a non-negative model against two signed ones and
-        counted the positivity constraint itself -- a difference that has
-        nothing to do with the prior's strength -- as prior systematic.
-        """
-        try:
-            values = self.system.solve(
-                float(factor) * self.regularization_matrix,
-                positive=bool(self.positive_only), warm_start=True,
-            )
-        except Exception:  # LinAlgError, InversionException
-            return None
-        return self._image_from_values(values)
-
     def _image_from_values(self, values: np.ndarray) -> np.ndarray:
         """Map a stacked parameter vector onto the image grid.
 
-        Split out of `model_image_at_scale` so a caller that already holds the
-        solution -- `_admissible_scan` solves at every step of its walk --
-        does not pay for the same solve twice.
+        For a caller that already holds a solution vector.
         """
         inv = self.fit.inversion
         slim = None
@@ -3911,236 +3787,11 @@ class SingleFit:
             ).native
         )
 
-    def _admissible_scan(
-        self, max_dex: float = CHI2_WINDOW_MAX_DEX, per_dex: int = 2,
-        min_dex: float = CHI2_WINDOW_MIN_DEX,
-    ) -> tuple[float, float, list[tuple[float, np.ndarray]]]:
-        """`chi2_admissible_dex`, plus the solution at every accepted step.
-
-        The steps matter to `prior_systematic`, which must sample *inside* the
-        window and not only at its edges -- see there for why. Their solutions
-        are carried out with them because the walk has already paid for them:
-        re-deriving each one through `model_image_at_scale` doubled the solve
-        count (27 -> 49 on the faintest demo mock) for no new information.
-        """
-        H = self.regularization_matrix
-        system, positive = self.system, bool(self.positive_only)
-        floor = abs(min_dex)
-        started = time.perf_counter()
-        n_solves = 0
-
-        def solved(dex):
-            nonlocal n_solves
-            n_solves += 1
-            try:
-                # each step is seeded from the nearest solved strength -- the
-                # previous step, half a decade away -- which is what makes a
-                # constrained walk affordable (see `LinearSystem.solve`)
-                return system.solve(
-                    10.0**dex * H, positive=positive, warm_start=True
-                )
-            except Exception:                   # LinAlgError, InversionException
-                return None
-
-        # The walk starts from the delivered solution, which is already in
-        # hand: solving it again cost one more constrained solve for the same
-        # numbers. Offered to the system as the seed for the first steps.
-        base = self.reconstruction
-        if positive:
-            system.remember_constrained(H, base)
-        try:
-            chi2_0 = system.chi_squared(base)
-        except Exception:                       # pragma: no cover - singular
-            return -floor, floor, []
-        if not np.isfinite(chi2_0):             # pragma: no cover - singular
-            return -floor, floor, []
-        metric_name, imager = self._window_metric()
-        if imager is not None:
-            n_data = system.n_data
-
-            def metric(values) -> float:
-                chi2 = system.chi_squared(values)
-                return _structure_ratio_from_map(
-                    system.residual_dirty_image(values, imager), chi2,
-                    imager, n_data)
-
-            tolerance = STRUCTURE_WINDOW_N_SIGMA * structure_ratio_scatter(imager)
-            if not (np.isfinite(tolerance) and tolerance > 0):
-                metric_name, imager = "chi^2", None
-        if imager is None:
-            metric = system.chi_squared
-            tolerance = np.sqrt(2.0 * system.n_data)
-        try:
-            metric_0 = metric(base)
-        except Exception:                       # pragma: no cover - singular
-            return -floor, floor, []
-        if not np.isfinite(metric_0):           # pragma: no cover
-            return -floor, floor, []
-        self.__dict__["_systematic_window_metric"] = (metric_name, float(tolerance))
-        logger.info(
-            "measuring the prior-systematic window (%s solves in half-decade "
-            "steps, up to +/-%g dex, until the %s moves by %.3g)...",
-            "non-negative" if positive else "unconstrained", max_dex,
-            metric_name, tolerance,
-        )
-
-        lo = hi = 0.0
-        steps: list[tuple[float, np.ndarray]] = []
-        for sign in (+1.0, -1.0):
-            reach = 0.0
-            for step in range(1, int(max_dex * per_dex) + 1):
-                dex = sign * step / per_dex
-                values = solved(dex)
-                if values is None:
-                    break                       # the rescaled system is singular
-                moved = abs(metric(values) - metric_0)
-                if not np.isfinite(moved) or moved > tolerance:
-                    break
-                reach = dex
-                steps.append((dex, values))
-            if sign > 0:
-                hi = reach
-            else:
-                lo = reach
-        lo, hi = min(lo, -floor), max(hi, floor)
-        # The floor is part of the window whether or not the walk got there --
-        # it is what makes `measured >= fixed` hold pixel by pixel -- so if the
-        # walk stopped short, those two points are solved for explicitly.
-        reached = {dex for dex, _ in steps}
-        for dex in (-floor, floor):
-            if dex not in reached:
-                values = solved(dex)
-                if values is not None:
-                    steps.append((dex, values))
-        logger.info(
-            "  window %+.1f to %+.1f dex, %d solves, %.0f s",
-            lo, hi, n_solves, time.perf_counter() - started,
-        )
-        return lo, hi, sorted(steps, key=lambda s: s[0])
-
-    def chi2_admissible_dex(
-        self, max_dex: float = CHI2_WINDOW_MAX_DEX, per_dex: int = 2,
-        min_dex: float = CHI2_WINDOW_MIN_DEX,
-    ) -> tuple[float, float]:
-        """How far the regularisation strength can move before chi^2 notices.
-
-        Returns ``(lo_dex, hi_dex)``, the range of log10 scale factors over
-        which chi^2 stays within one standard deviation of its value at the
-        fitted strength -- ``sigma(chi^2) = sqrt(2 N)``, the only scale on
-        which a chi^2 difference means anything.
-
-        This is the range of priors *the data cannot distinguish between*, and
-        it is the honest window for `prior_systematic`. It is not a fixed
-        number of dex, and the difference matters: chi^2 responds steeply to
-        the strength on a well-constrained fit and goes flat on a weak one, so
-        the window is narrow where the data are good and wide where they are
-        not. Measured on the demo mock across a 60x range in noise, it stays
-        at the +/-0.5 dex floor down to a peak signal-to-noise of ~60 and then
-        opens to the +/-6 dex cap by 5 -- where a fixed +/-0.5 dex window
-        under-states the actual rms error by 9.6x and this one by 1.2x.
-
-        The result is floored at `min_dex`, so it is never narrower than the
-        fixed window it replaces: the walk cannot resolve a reach below one
-        step, and reporting zero there would quietly delete the systematic
-        term on exactly the fits whose statistical term is most optimistic.
-        Across twelve mock fits (two source shapes, three priors, six noise
-        levels) the measured window's coverage was never worse than the fixed
-        window's -- identical wherever the fit was well constrained.
-
-        A wider window is not automatically a larger systematic, which is why
-        `prior_systematic` samples the steps and not just the edges -- see
-        `_admissible_scan`.
-
-        Costs at most `2 * max_dex * per_dex` solves of an n_mesh system --
-        no transforms and no refit; the walk starts from the delivered
-        solution -- and only reaches that on a fit chi^2 barely responds to,
-        which is the case where the answer matters. On a non-negative fit each
-        step is seeded from the last (`LinearSystem.solve`), without which a
-        24-step constrained walk on a 50x50 mesh took a quarter of an hour.
-        """
-        lo, hi, _ = self._admissible_scan(max_dex, per_dex, min_dex)
-        return lo, hi
-
-    def prior_systematic(self, spread_dex: float | None = None) -> np.ndarray:
-        """Per-pixel systematic from the choice of regularisation strength.
-
-        The statistical error `model_uncertainty` is conditional on one prior
-        *and* one strength for it.  How far the model moves when that strength
-        is varied over the range these data allow is a measurable systematic,
-        and on compact features it is the larger term.  Same construction as
-        the point-source flux systematic, which turned pulls of up to 24 sigma
-        into pulls under 3.
-
-        `spread_dex=None` (the default) takes "the range these data allow"
-        literally and measures it, via `chi2_admissible_dex`, which is floored
-        at the old fixed half-decade and so can only widen it. Passing a
-        number restores a fixed window, which is what the point-source flux
-        systematic still uses.
-
-        **The window is sampled, not just its edges.** A pixel's deviation is
-        not monotonic in the scale factor: it can move further at 10^0.5 than
-        at 10^6, because a model with the prior turned up to nonsense is not
-        "further from" the fitted one everywhere. Taking only the two edges
-        therefore let a *wider* window report a *smaller* systematic -- across
-        32 mock configurations, 7 of them did, by up to 20% of the peak, which
-        would have made the measured window worse than the fixed one it is
-        supposed to subsume. So every half-decade step the walk accepted is
-        evaluated, and the pixel-wise maximum taken over all of them. The
-        floor's endpoints are always in that set, which is what makes
-        "measured >= fixed, pixel by pixel" true rather than merely likely.
-        The solves are the walk's own, so the extra cost is one mapping per
-        step, not one fit.
-
-        **Why the fixed window was not enough.** It assumes the admissible
-        range of strengths is the same whatever the data, and it is not. On a
-        weakly constrained fit the prior takes over, chi^2 stops responding to
-        it, and the model can be orders of magnitude away from the truth with
-        no chi^2 penalty -- while the *statistical* term shrinks, because a
-        strong prior shrinks the posterior variance. The quoted error then
-        falls as the data get worse, which is exactly backwards. Measured on
-        the demo mock at a peak signal-to-noise of 5, the total 1 sigma
-        understated the actual rms error by 9.6x with the fixed window and by
-        1.2x with the measured one.
-
-        This captures neither the prior *family* being wrong nor the smoothing
-        bias *at* the fitted strength, which is what is left over on compact
-        features -- see docs/uncertainty.md. Nothing cheap does.
-        """
-        cache = self.__dict__.setdefault("_prior_systematic_cache", {})
-        key = "measured" if spread_dex is None else float(spread_dex)
-        if key not in cache:
-            base = self.model_image
-            worst = np.zeros_like(base)
-            if spread_dex is None:
-                lo, hi, samples = self._admissible_scan()
-                window = (lo, hi)
-                # the walk already solved at each of these; kept for
-                # `aperture_systematic`, which needs the images, not a maximum
-                images = [self._image_from_values(v) for _, v in samples]
-                self.__dict__["_window_images"] = images
-            else:
-                window = (-float(spread_dex), float(spread_dex))
-                images = (self.model_image_at_scale(10.0**d) for d in window)
-            for alt in images:
-                if alt is None:
-                    continue
-                worst = np.maximum(worst, np.abs(alt - base))
-            cache[key] = (worst, window)
-        worst, window = cache[key]
-        # the window belongs to this call, not to whichever call filled the
-        # cache first, so `model_uncertainty_total` reports the right one
-        # however the two modes are interleaved
-        self.__dict__["_systematic_window_dex"] = window
-        return worst
-
-    def model_uncertainty_total(
-        self, spread_dex: float | None = None, deblock: bool = True
-    ) -> tuple[np.ndarray, dict]:
-        """Single total 1-sigma map on the model image [Jy/pixel].
-
-        sqrt(statistical^2 + systematic^2), with the mesh/image checkerboard
-        removed.  Returns (map, terms) where `terms` holds the two components
-        and the median of each, for the header and the parameter record.
+    def model_uncertainty_statistical(self, deblock: bool = True) -> tuple[np.ndarray, dict]:
+        """The statistical 1-sigma alone, `uncertainty="statistical"`:
+        sqrt(diag(M C M^T)) at the fitted strength. Conditional on the prior
+        and its strength -- on the demo series it covers the truth on 0-58% of
+        source pixels (docs/uncertainty.md).
 
         **The checkerboard.** Products live on a grid `oversample` times finer
         than the model mesh, and the mapper interpolates: a pixel sitting on a
@@ -4150,61 +3801,15 @@ class SingleFit:
         artefact of the two grids, not of the sky, and it lands straight in
         any significance map the user makes.  `deblock` replaces it with its
         upper envelope (see `_deblock`), which is the conservative choice:
-        an over-stated error never manufactures a detection.
-        """
-        stat = self.model_uncertainty
-        sys_ = self.prior_systematic(spread_dex)
-        total = np.hypot(stat, sys_)
-        raw_total = total
-        if deblock:
-            total = _deblock(total, self.geometry.oversample)
-        terms = {
-            "type": "systematic",
-            "statistical_median": float(np.nanmedian(stat)),
-            "systematic_median": float(np.nanmedian(sys_)),
-            "total_median": float(np.nanmedian(total)),
-            "checkerboard_amplitude": float(_block_contrast(
-                raw_total, self.geometry.oversample)),
-            "systematic_spread_dex": (
-                float(spread_dex) if spread_dex is not None else None),
-            "systematic_window_dex": list(
-                self.__dict__.get("_systematic_window_dex", (np.nan, np.nan))),
-            "systematic_window_metric": self.__dict__.get(
-                "_systematic_window_metric", ("chi^2", float("nan")))[0],
-            "systematic_window_tolerance": self.__dict__.get(
-                "_systematic_window_metric", ("chi^2", float("nan")))[1],
-            "deblocked": bool(deblock),
-        }
-        return total, terms
-
-    def model_uncertainty_systematic(
-        self, spread_dex: float | None = None, deblock: bool = True
-    ) -> np.ndarray:
-        """The prior-systematic term of `model_uncertainty_total` alone [Jy/pixel].
-
-        Written as its own product (`uncertainty_systematic.fits`) so that a
-        user can see how much of the total comes from the choice of prior
-        strength, and drop or rescale it: it is the least certain part of the
-        error budget (see docs/uncertainty.md, "Caveats on the prior
-        systematic"). Served from the same cache as the total, so asking for
-        both costs one walk. Deblocked like the total, so the two share a grid
-        convention.
-        """
-        sys_ = self.prior_systematic(spread_dex)
-        return _deblock(sys_, self.geometry.oversample) if deblock else sys_
-
-    def model_uncertainty_statistical(self, deblock: bool = True) -> tuple[np.ndarray, dict]:
-        """The statistical 1-sigma alone, `uncertainty="statistical"`:
-        sqrt(diag(M C M^T)) at the fitted strength, deblocked like the total.
-        Conditional on the prior and its strength -- on the demo series it
-        covers the truth on 0-27% of source pixels (docs/uncertainty.md)."""
+        an over-stated error never manufactures a detection."""
         stat = np.asarray(self.model_uncertainty)
         out = _deblock(stat, self.geometry.oversample) if deblock else stat
         terms = {
             "type": "statistical",
             "statistical_median": float(np.nanmedian(stat)),
-            "systematic_median": 0.0,
             "total_median": float(np.nanmedian(out)),
+            "checkerboard_amplitude": float(_block_contrast(
+                stat, self.geometry.oversample)),
             "deblocked": bool(deblock),
         }
         return out, terms
@@ -4232,9 +3837,9 @@ class SingleFit:
 
         Unconstrained throughout: the evidence and the Gaussian posterior are
         exact only without positivity, so the mean can dip slightly below
-        zero. On the demo series this posterior covers the truth on 56-74% of
-        source pixels against 0-41% for the conditional error with or without
-        the prior systematic (`scripts/marginal_lambda_mock.py`).
+        zero. On the demo series this posterior covers the truth on 65-85% of
+        source pixels against 0-58% for the statistical error at the
+        structure-chosen strength (`scripts/marginal_lambda_mock.py`).
         """
         system, H0 = self.system, np.asarray(self.regularization_matrix)
         cache: dict[float, tuple[np.ndarray | None, float]] = {}
@@ -4317,7 +3922,6 @@ class SingleFit:
         terms = {
             "type": "bayesian",
             "statistical_median": float(np.nanmedian(sd)),
-            "systematic_median": 0.0,
             "total_median": float(np.nanmedian(out)),
             "deblocked": bool(deblock),
             "lambda_posterior": dict(post["info"]),
@@ -4339,20 +3943,6 @@ class SingleFit:
                 return slice(start, start + n)
             start += n
         raise KeyError("linear object not found in the inversion")
-
-    def aperture_systematic(self, region: np.ndarray) -> float | None:
-        """The prior systematic on the summed flux inside a region [Jy]:
-        the largest change of that sum across the measured window (the same
-        sampled strengths as `prior_systematic`). None until the window has
-        been measured -- it is not walked again just for this."""
-        images = self.__dict__.get("_window_images")
-        if images is None:
-            return None
-        region = np.asarray(region, dtype=bool)
-        base = float(np.sum(self.model_image[region]))
-        return float(max(
-            (abs(float(np.sum(img[region])) - base) for img in images if img is not None),
-            default=0.0))
 
     def aperture_uncertainty(self, region: np.ndarray, cov: np.ndarray | None = None) -> float:
         """1-sigma uncertainty on the summed flux inside a region [Jy].
@@ -4429,7 +4019,6 @@ def fit_dataset(
     chi2_target: float = 1.0,
     warn_on_chi2: bool = True,
     system: LinearSystem | None = None,
-    window_criterion: str | None = None,
 ) -> SingleFit:
     """Fit one Interferometer dataset (one channel, or the MFS stack).
 
@@ -4449,11 +4038,6 @@ def fit_dataset(
     ``system`` is the coefficient-invariant `LinearSystem` for this dataset
     and mesh. Built here when not given; the adaptive first pass hands its own
     to the second so F and D are built once per fit, not once per stage.
-
-    ``window_criterion`` is, for a fixed ``prior``, the criterion that chose
-    it (the MFS fit's `SingleFit.criterion_used` for a cube channel); the
-    systematic window is measured by it (`SingleFit._window_metric`). Without
-    it a fixed prior is taken as chosen by ``criterion`` once resolved.
     """
     mesh_shape = geometry.mesh_shape
     n_data = n_data_of(dataset)
@@ -4882,11 +4466,7 @@ def fit_dataset(
                 chi2_final / n_data, chi2_target,
             )
 
-    if scan is None and window_criterion is None:
-        window_criterion = resolve_criterion(
-            criterion, n_data, int(np.prod(mesh_shape)))
     return SingleFit(
         fit=fit, geometry=geometry, prior=prior, scan=scan,
         positive_only=bool(positive_only),
-        window_criterion=window_criterion or "",
     )

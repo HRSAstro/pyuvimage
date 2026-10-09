@@ -165,10 +165,11 @@ def test_switches_take_true_and_false(tmp_path, captured):
 
 def test_an_old_no_uncertainty_key_still_repeats_its_run(tmp_path, captured):
     """input_parameters.json written before Oct 2026 carries the boolean
-    "no-uncertainty"; false meant the map was made (now "systematic")."""
+    "no-uncertainty"; false meant the map was made (now "statistical": the
+    statistical + prior-systematic map it made was removed)."""
     path = write(tmp_path, {"dataset": "d.npz", "fov": 1, "no-uncertainty": False})
     cli.main(["fit", "--config", path])
-    assert captured[-1][1]["uncertainty"] == "systematic"
+    assert captured[-1][1]["uncertainty"] == "statistical"
     path = write(tmp_path, {"dataset": "d.npz", "fov": 1, "no-uncertainty": True})
     cli.main(["fit", "--config", path])
     assert captured[-1][1]["uncertainty"] == "none"

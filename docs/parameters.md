@@ -54,7 +54,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `--uncertainty` | `none` | What the uncertainty products contain. `none`: no `uncertainty.fits` or `snr.fits` (fastest). `statistical`: the posterior width at the fitted prior strength. `systematic`: statistical + the prior-strength systematic (also `uncertainty_systematic.fits`). `bayesian`: the posterior marginalised over the prior strength, weighted by the evidence (also `model_bayesian.fits`, the posterior mean those errors belong to). See [uncertainty.md](uncertainty.md) for how far each can be trusted. Replaces `--no-uncertainty`; old config files with `"no-uncertainty": false` run as `systematic`. |
+| `--uncertainty` | `none` | What the uncertainty products contain. `none`: no `uncertainty.fits` or `snr.fits` (fastest). `statistical`: the posterior width at the fitted prior strength. `bayesian`: the posterior marginalised over the prior strength, weighted by the evidence (also `model_bayesian.fits`, the posterior mean those errors belong to). See [uncertainty.md](uncertainty.md) for how far each can be trusted. Replaces `--no-uncertainty`; old config files with `"no-uncertainty": false` run as `statistical` (the statistical + prior-systematic map they made was removed in Oct 2026). |
 
 **Solver / data**
 

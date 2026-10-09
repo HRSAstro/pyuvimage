@@ -201,12 +201,11 @@ def test_the_loud_warning_still_wins_above_the_threshold(caplog):
     assert "--criterion structure" not in caplog.text
 
 
-# --- the systematic window of a `structure` fit ---------------------------------
+# --- the structure ratio's own noise scatter ------------------------------------
 
 def test_the_structure_ratio_scatter_matches_noise_realisations():
     """`structure_ratio_scatter` against the ratio's actual scatter over pure
-    noise: the systematic window of a `structure` fit uses it as its
-    tolerance, so it has to be the real noise scale, not a guess."""
+    noise: it is the ratio's noise scale, so it has to be measured, not guessed."""
     from pyuvimage import mock
     from pyuvimage.fitting import structure_ratio_scatter
     from pyuvimage.pointsource import ARCSEC_TO_RAD
@@ -233,60 +232,6 @@ def test_the_structure_ratio_scatter_matches_noise_realisations():
         z = rng.normal(size=len(d)) * n.real + 1j * rng.normal(size=len(d)) * n.imag
         ratios.append(np.std(np.real((w * z) @ E) / w.sum()) / rms)
     assert structure_ratio_scatter(imager) == pytest.approx(np.std(ratios), rel=0.25)
-
-
-@pytest.mark.parametrize("criterion, metric", [
-    ("structure", "structure ratio"),
-    ("structure->evidence (ratio unreachable)", "structure ratio"),
-    ("structure->discrepancy (ratio unreachable)", "chi^2"),
-    ("discrepancy", "chi^2"),
-    ("discrepancy->evidence (unreachable target)", "chi^2"),
-    ("evidence", "chi^2"),
-])
-def test_the_window_is_measured_in_what_chose_the_strength(criterion, metric):
-    """On REBELS-25 (3e6 data) chi^2 moved < 400 across 12 decades against a
-    tolerance of 2442, so a chi^2 window opened to +/-6 dex and the
-    systematic swallowed the model (snr.fits <= 1.3 on a 15-sigma source).
-    A strength `structure` chose is bracketed by the structure ratio."""
-    from pyuvimage.fitting import PriorScan, SingleFit
-
-    sf = SingleFit(fit=None, geometry=None, prior={}, scan=PriorScan(criterion=criterion),
-                   imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
-    assert sf._window_metric()[0] == metric
-
-
-@pytest.mark.parametrize("criterion, metric", [
-    ("structure", "structure ratio"),
-    ("structure->discrepancy (ratio unreachable)", "chi^2"),
-    ("discrepancy", "chi^2"),
-    ("", "chi^2"),
-])
-def test_a_frozen_prior_window_follows_the_criterion_that_chose_it(criterion, metric):
-    """Cube channels have no scan (the prior is frozen from the MFS fit). They
-    fell back to chi^2, and on REBELS-25 each channel's window opened to
-    +/-6 dex: 24 non-negative solves per channel, most of the run time."""
-    from pyuvimage.fitting import SingleFit
-
-    sf = SingleFit(fit=None, geometry=None, prior={}, scan=None,
-                   window_criterion=criterion,
-                   imager=SimpleNamespace(dirty_beam=np.ones((2, 2))))
-    assert sf.criterion_used == criterion
-    assert sf._window_metric()[0] == metric
-
-
-def test_fit_dataset_records_the_criterion_of_a_fixed_prior():
-    from pyuvimage import fitting, mock
-
-    uvd, _, geometry, _ = mock.make_demo_dataset(n_vis=60, mesh_n=8, seed=5)
-    uv, d, n = uvd.flattened()
-    ds = fitting.make_dataset(uv, d, n, geometry, transformer="dft")
-    prior = {"coefficient": 1.0, "scale": 0.3}
-    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
-                             positive_only=False)
-    assert sf.scan is None and sf.criterion_used == "structure"
-    sf = fitting.fit_dataset(ds, geometry, prior=prior, criterion="structure",
-                             positive_only=False, window_criterion="discrepancy")
-    assert sf.criterion_used == "discrepancy"
 
 
 # --- snr.fits: S/N at the restoring beam's resolution ---------------------------
@@ -327,4 +272,4 @@ def test_the_smoothed_error_uses_the_full_covariance():
     snr, sigma = sf.beam_snr(beam)
     smooth = fftconvolve(sf.model_image, kernel, mode="same")
     np.testing.assert_allclose(snr * sigma, smooth, rtol=1e-10, atol=1e-14)
-    assert np.all(sigma >= want - 1e-15)    # the systematic only ever adds
+    np.testing.assert_allclose(sigma, want, rtol=1e-8, atol=1e-12 * want.max())

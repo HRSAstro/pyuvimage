@@ -138,7 +138,7 @@ def fit_pair(reg, ds_inj, ds_base, geom, imager_inj, beam_size, positive=True):
     fb = fitting.fit_dataset(ds_base, geom, reg_kind=kind, prior=dict(fa.prior),
                              positive_only=bool(fa.positive_only), criterion=CRITERION,
                              nu=nu, fixed_scale=beam_size, envelope=env,
-                             window_criterion=fa.criterion_used, warn_on_chi2=False)
+                             warn_on_chi2=False)
     return fa, fb
 
 

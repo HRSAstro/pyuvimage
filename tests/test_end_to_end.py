@@ -310,13 +310,9 @@ def test_uncertainty_sampling_formula_matches_monte_carlo(tmp_path):
     assert 0.7 < ratio < 1.35, f"sampling uncertainty is off by {ratio:.2f}x"
 
 
-def test_total_uncertainty_map(tmp_path):
-    """One map, built from two terms, with the checkerboard removed.
-
-    The delivered map is sqrt(statistical^2 + systematic^2) with the
-    mesh/image block pattern replaced by its upper envelope. Checked on a
-    single fit so the terms are all from the same prior.
-    """
+def test_the_uncertainty_map_has_its_checkerboard_removed(tmp_path):
+    """The mesh/image block pattern is replaced by its upper envelope.
+    Checked on a single fit so everything comes from the same prior."""
     from pyuvimage import fitting
     from pyuvimage.fitting import _block_contrast
 
@@ -328,49 +324,25 @@ def test_total_uncertainty_map(tmp_path):
         prior={"coefficient": 1e7, "scale": 0.3, "nu": 1.5},
         positive_only=False)
 
-    stat = sf.model_uncertainty
-    sys_ = sf.prior_systematic()
-    total, terms = sf.model_uncertainty_total()
+    raw = sf.model_uncertainty
+    out, terms = sf.model_uncertainty_statistical()
+    assert terms["type"] == "statistical" and terms["deblocked"]
+    assert np.all(raw >= sf.model_uncertainty_sampling - 1e-12)
 
-    assert np.all(sys_ >= 0)
-    assert terms["systematic_median"] > 0, "prior strength changes nothing?"
-    assert np.all(stat >= sf.model_uncertainty_sampling - 1e-12)
-
-    raw = np.hypot(stat, sys_)
     ovs = geom.oversample
     assert _block_contrast(raw, ovs) > 0.05, "no checkerboard to remove?"
-    assert _block_contrast(total, ovs) < 0.4 * _block_contrast(raw, ovs)
+    assert _block_contrast(out, ovs) < 0.4 * _block_contrast(raw, ovs)
     # the envelope is conservative: it must not sit below the raw map overall
-    assert np.nanmedian(total) >= np.nanmedian(raw)
+    assert np.nanmedian(out) >= np.nanmedian(raw)
     # and it is still the same order of magnitude, not a runaway
-    assert np.nanmedian(total) < 2.0 * np.nanmedian(raw)
-
-
-def test_total_and_systematic_uncertainty_maps_are_written(tmp_path):
-    uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
-        n_vis=250, mesh_n=16, sigma_jy=1e-3, seed=42)
-    pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "u",
-                  reg="matern", uncertainty="systematic")
-    assert (tmp_path / "u" / "uncertainty.fits").exists()
-    assert (tmp_path / "u" / "snr.fits").exists()
-    assert not (tmp_path / "u" / "uncertainty_noise.fits").exists()
-    hdr = fits.getheader(tmp_path / "u" / "uncertainty.fits")
-    assert hdr["ERRTYPE"].strip() == "total"
-    assert hdr["ERRSTAT"] > 0 and hdr["ERRDEBL"]
-    # the prior systematic on its own, never larger than the total it is part of
-    total = fits.getdata(tmp_path / "u" / "uncertainty.fits")
-    sys_ = fits.getdata(tmp_path / "u" / "uncertainty_systematic.fits")
-    assert fits.getheader(tmp_path / "u" / "uncertainty_systematic.fits")["ERRTYPE"].strip() == "systematic"
-    assert sys_.shape == total.shape
-    assert np.nanmax(sys_) > 0
-    assert np.all(sys_ <= total * (1 + 1e-5) + 1e-12)
+    assert np.nanmedian(out) < 2.0 * np.nanmedian(raw)
 
 
 def test_the_default_writes_no_uncertainty_products(tmp_path):
     uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
         n_vis=250, mesh_n=16, sigma_jy=1e-3, seed=42)
     pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "n", reg="matern")
-    for name in ("uncertainty.fits", "uncertainty_systematic.fits", "snr.fits",
+    for name in ("uncertainty.fits", "snr.fits",
                  "model_bayesian.fits"):
         assert not (tmp_path / "n" / name).exists(), name
     params = json.loads((tmp_path / "n" / "fit_parameters.json").read_text())
@@ -384,9 +356,9 @@ def test_statistical_and_bayesian_uncertainty_modes(tmp_path):
                   reg="matern", uncertainty="statistical")
     hdr = fits.getheader(tmp_path / "s" / "uncertainty.fits")
     assert hdr["ERRTYPE"].strip() == "statistical"
-    assert "ERRWLO" not in hdr                      # no window was walked
+    assert hdr["ERRSTAT"] > 0 and hdr["ERRDEBL"]
     assert (tmp_path / "s" / "snr.fits").exists()
-    assert not (tmp_path / "s" / "uncertainty_systematic.fits").exists()
+    assert not (tmp_path / "s" / "model_bayesian.fits").exists()
 
     pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "b",
                   reg="matern", uncertainty="bayesian")
@@ -410,6 +382,10 @@ def test_statistical_and_bayesian_uncertainty_modes(tmp_path):
 def test_unknown_uncertainty_mode_is_refused():
     with pytest.raises(ValueError, match="uncertainty"):
         pyuvimage.api.resolve_uncertainty_mode("everything")
+    # the removed statistical + prior-systematic mode says so
+    with pytest.raises(ValueError, match="removed"):
+        pyuvimage.api.resolve_uncertainty_mode("systematic")
+    assert pyuvimage.api.resolve_uncertainty_mode(None, uncertainty_map=True) == "statistical"
 
 
 def test_uncertainty_is_data_independent_and_prior_shaped():

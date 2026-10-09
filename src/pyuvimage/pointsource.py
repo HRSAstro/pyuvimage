@@ -26,6 +26,7 @@ auto-detected one is kept only if its amplitude clears a significance cut.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -1517,7 +1518,30 @@ class PointAugmentedFit:
         M_inv = cho_solve(sysm._cho, np.eye(sysm.n_mesh), check_finite=False)
         return M_inv @ sysm.F @ M_inv
 
-    def beam_snr(self, beam, mode: str = "systematic") -> tuple[np.ndarray, np.ndarray]:
+    @functools.cached_property
+    def model_uncertainty(self) -> np.ndarray:
+        """`SingleFit.model_uncertainty` from *this* fit's mesh covariance.
+
+        Delegating it, as everything else here is, propagated the mesh-only
+        fit's (F+H)^-1: before the point retune, so with a prior weaker by the
+        retune factor, and without the point amplitudes marginalised out. On
+        the demo S/N series that made `uncertainty.fits` 30x too large at
+        300 sigma, where the retune is largest, while `snr.fits` (built from
+        `posterior_covariance` here) was right.
+        """
+        return self._sf._propagate(self.posterior_covariance)
+
+    @functools.cached_property
+    def model_uncertainty_sampling(self) -> np.ndarray:
+        return self._sf._propagate(self.sampling_covariance)
+
+    def model_uncertainty_statistical(self, deblock: bool = True):
+        """`SingleFit.model_uncertainty_statistical` on `model_uncertainty` above."""
+        from .fitting import SingleFit
+
+        return SingleFit.model_uncertainty_statistical(self, deblock)
+
+    def beam_snr(self, beam, mode: str = "statistical") -> tuple[np.ndarray, np.ndarray]:
         """`SingleFit.beam_snr` for the extended model *plus* the points.
 
         The points enter the smoothed model as the restoring beam at their
@@ -1525,8 +1549,7 @@ class PointAugmentedFit:
         error uses the joint covariance of mesh and amplitudes, whose
         cross-term matters: a point and the mesh under it trade flux, so
         their errors are anticorrelated and adding them independently would
-        overstate the error at the point. The prior systematic is the mesh
-        fit's own window, as in `uncertainty.fits`.
+        overstate the error at the point.
         """
         from scipy.linalg import cho_solve
         from scipy.signal import fftconvolve
@@ -1554,8 +1577,7 @@ class PointAugmentedFit:
         extra = np.asarray(unit)
         smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
         smooth = smooth + np.tensordot(np.asarray(sol.amplitudes), extra, axes=1)
-        stat = sf.smoothed_std(kernel, cov=joint, extra=extra)
-        sigma = stat if mode == "statistical" else np.hypot(stat, sf._smoothed_systematic(kernel))
+        sigma = sf.smoothed_std(kernel, cov=joint, extra=extra)
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = np.where(sigma > 0, smooth / sigma, 0.0)
         return snr, sigma

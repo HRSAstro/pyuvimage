@@ -252,8 +252,8 @@ def test_a_whole_fit_transforms_the_mapping_matrix_once(small, transform_counter
     assert len(transform_counter) == 1
     # ...and the products do not add any
     sf.chi_squared, sf.log_evidence, sf.model_visibilities
-    sf.posterior_covariance, sf.model_uncertainty, sf.prior_systematic()
-    sf.model_uncertainty_total()
+    sf.posterior_covariance, sf.model_uncertainty
+    sf.model_uncertainty_statistical()
     assert len(transform_counter) == 1
     assert len(sf.scan.trials) > 5
 
@@ -293,155 +293,12 @@ def test_single_fit_products_are_computed_once(small):
     )
     assert sf.posterior_covariance is sf.posterior_covariance
     assert sf.model_uncertainty is sf.model_uncertainty
-    assert sf.prior_systematic() is sf.prior_systematic()
-    assert sf.prior_systematic(0.3) is not sf.prior_systematic(0.5)
     assert sf.model_image is sf.model_image
     np.testing.assert_allclose(
         sf.posterior_covariance,
         np.linalg.inv(np.asarray(fit_curv := sf.fit.inversion.curvature_reg_matrix)),
     )
     assert fit_curv.shape == (100, 100)
-
-
-def test_the_systematic_window_is_measured_and_never_narrower_than_the_floor(small):
-    """The window is the range of strengths chi^2 cannot separate, floored at
-    the fixed half-decade the method used before, so the measured systematic
-    can only be larger than the old one -- never smaller."""
-    dataset, geom = small
-    sf = fitting.fit_dataset(
-        dataset, geom, reg_kind="matern", positive_only=True,
-        criterion="discrepancy",
-    )
-    lo, hi = sf.chi2_admissible_dex()
-    assert lo <= -fitting.CHI2_WINDOW_MIN_DEX
-    assert hi >= fitting.CHI2_WINDOW_MIN_DEX
-    assert lo >= -fitting.CHI2_WINDOW_MAX_DEX and hi <= fitting.CHI2_WINDOW_MAX_DEX
-
-    # chi^2 really does stay inside one sigma across the reported window, and
-    # the walk stopped because the next half-decade left it
-    H, positive = sf.regularization_matrix, bool(sf.positive_only)
-    chi2_0 = sf.system.chi_squared(sf.system.solve(H, positive=positive))
-    tol = np.sqrt(2.0 * sf.system.n_data)
-    for dex in (lo, hi):
-        if abs(dex) <= fitting.CHI2_WINDOW_MIN_DEX:
-            continue                    # the floor, not a measurement
-        moved = abs(sf.system.chi_squared(
-            sf.system.solve(10.0**dex * H, positive=positive)) - chi2_0)
-        assert moved <= tol
-
-    measured = sf.prior_systematic()
-    fixed = sf.prior_systematic(fitting.CHI2_WINDOW_MIN_DEX)
-    assert np.all(measured >= fixed - 1e-12)
-
-
-@pytest.fixture(scope="module")
-def wide_window():
-    """A fit whose admissible window opens well past the floor.
-
-    The `small` fixture sits at +/-0.5 dex, so it cannot exercise anything the
-    floor does not already cover -- and a test that only ever sees the floor
-    was how the endpoint-sampling bug below survived.
-    """
-    uvd, _, geom, _ = mock.make_demo_dataset(n_vis=600, mesh_n=14, seed=3)
-    uv, d, n = uvd.flattened()
-    dataset = fitting.make_dataset(uv, d, n, geom, transformer="dft")
-    return fitting.fit_dataset(
-        dataset, geom, reg_kind="matern", positive_only=True,
-        criterion="discrepancy", warn_on_chi2=False,
-    )
-
-
-def test_a_wider_window_never_reports_a_smaller_systematic(wide_window):
-    """The property the floor is supposed to buy, on a fit that can break it.
-
-    A pixel's deviation is *not* monotonic in the scale factor -- the model at
-    10^6 x lambda is not "further from" the fitted one everywhere than the
-    model at 10^0.5 x. So sampling only the window's two edges let a wider
-    window report a *smaller* systematic than the fixed +/-0.5 dex one: across
-    32 mock configurations 7 did, by up to 20% of the peak. `prior_systematic`
-    evaluates every half-decade step the walk accepted, which puts the floor's
-    endpoints in the set and makes this structural rather than lucky.
-    """
-    sf = wide_window
-    lo, hi = sf.chi2_admissible_dex()
-    assert lo < -fitting.CHI2_WINDOW_MIN_DEX, "fixture no longer exercises this"
-
-    measured = sf.prior_systematic()
-    fixed = sf.prior_systematic(fitting.CHI2_WINDOW_MIN_DEX)
-    assert np.all(measured >= fixed - 1e-12)
-    assert np.nanmax(measured) > np.nanmax(fixed), "and it is strictly bigger"
-
-    # the endpoint-only construction is what used to be wrong: the edge alone
-    # would have to beat every interior step, and here it does not
-    base = sf.model_image
-    edge = np.zeros_like(base)
-    for dex in (lo, hi):
-        alt = sf.model_image_at_scale(10.0**dex)
-        if alt is not None:
-            edge = np.maximum(edge, np.abs(alt - base))
-    assert np.any(measured > edge + 1e-12)
-
-
-def test_the_reported_window_follows_the_call_not_the_cache(small):
-    """Both modes share one fit, and each `model_uncertainty_total` must
-    report the window it actually used however they are interleaved."""
-    dataset, geom = small
-    sf = fitting.fit_dataset(
-        dataset, geom, reg_kind="matern", positive_only=True,
-        prior={"coefficient": 10.0, "scale": 0.5},
-    )
-    _, measured = sf.model_uncertainty_total()
-    _, fixed = sf.model_uncertainty_total(0.25)
-    _, again = sf.model_uncertainty_total()      # served from the cache
-    assert fixed["systematic_spread_dex"] == 0.25
-    assert fixed["systematic_window_dex"] == [-0.25, 0.25]
-    assert measured["systematic_spread_dex"] is None
-    assert again["systematic_window_dex"] == measured["systematic_window_dex"]
-    assert again["systematic_window_dex"] != fixed["systematic_window_dex"]
-
-
-def test_the_prior_systematic_of_a_positive_fit_uses_the_positive_solver(small):
-    """`model_image_at_scale` re-solved unconstrained whatever the delivered
-    fit did, so on a non-negative fit the "systematic" compared a non-negative
-    model with two signed ones and booked the positivity constraint itself as
-    prior systematic."""
-    dataset, geom = small
-    sf = fitting.fit_dataset(
-        dataset, geom, reg_kind="matern", positive_only=True,
-        prior={"coefficient": 10.0, "scale": 0.5},
-    )
-    assert sf.positive_only
-    M = fitting.system_for(sf.fit).mapping_matrix
-    mask = sf.fit.dataset.real_space_mask
-    for factor in (10.0, 0.1):
-        alt = sf.model_image_at_scale(factor)
-        assert alt is not None
-        H = factor * sf.regularization_matrix
-        positive = sf.system.solve(H, positive=True)
-        unconstrained = sf.system.solve(H, positive=False)
-        assert np.all(positive >= 0) and np.any(unconstrained < 0)
-        want = np.asarray(ag.Array2D(values=M @ positive, mask=mask).native)
-        # `model_image_at_scale` seeds its solve from the pool of earlier
-        # constrained solutions, the cold solve here does not: same optimum,
-        # reached by a different active-set path, so they agree to ~1e-11
-        # relative rather than to the bit (see `LinearSystem.solve`)
-        np.testing.assert_allclose(alt, want, rtol=1e-8, atol=1e-13)
-        assert not np.allclose(
-            alt, np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native),
-            rtol=1e-6, atol=0,
-        )
-        wrong = np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native)
-        assert np.abs(alt - wrong).max() > 1e-6
-    free = fitting.fit_dataset(
-        dataset, geom, reg_kind="matern", positive_only=False,
-        prior={"coefficient": 10.0, "scale": 0.5},
-    )
-    unconstrained = free.system.solve(0.1 * free.regularization_matrix, positive=False)
-    np.testing.assert_allclose(
-        free.model_image_at_scale(0.1),
-        np.asarray(ag.Array2D(values=M @ unconstrained, mask=mask).native),
-        rtol=0, atol=1e-15,
-    )
 
 
 # --- the fixes that rode along ------------------------------------------------

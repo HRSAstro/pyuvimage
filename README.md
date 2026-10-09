@@ -61,9 +61,8 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `model_reconvolved_pbcor.fits` | Jy/beam | primary-beam-corrected version of it |
 | `residual.fits` | σ | (data − model) dirty image / rms (rms in header `RMS`) |
 | `uncertainty.fits` | Jy/pixel | 1σ per pixel, of the kind `--uncertainty` asked for (`ERRTYPE`) — see below; not written by default |
-| `uncertainty_systematic.fits` | Jy/pixel | `--uncertainty systematic`: the prior-systematic part alone (see the caveats in [docs/uncertainty.md](docs/uncertainty.md)) |
 | `model_bayesian.fits` | Jy/pixel | `--uncertainty bayesian`: the posterior mean marginalised over the prior strength, which `uncertainty.fits` is then the 1σ of |
-| `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (full covariance plus prior systematic), points included |
+| `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (from the full covariance), points included |
 | `dirty_image.fits` | Jy/beam | naturally weighted dirty image of the data |
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
 | `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D), centred on the phase centre — not on the image centre when `--image-centre` is used |
@@ -149,40 +148,29 @@ Off by default; `--uncertainty` chooses what it contains:
 |---|---|---|---|
 | `none` (default) | not written (nor `snr.fits`) | — | — |
 | `statistical` | posterior width at the fitted prior strength | — | one inverse |
-| `systematic` | statistical + prior-strength systematic | `uncertainty_systematic.fits` | + the window walk (≥4 constrained solves) |
 | `bayesian` | posterior marginalised over the prior strength (evidence-weighted) | `model_bayesian.fits` | ~25 unconstrained solves + a few inverses |
 
-On mocks the statistical width alone covers the truth on 0–27% of source
-pixels, statistical + systematic on 2–41%, and the Bayesian posterior on
-56–74% (68% is calibrated); on REBELS-25 all three give a source flux S/N of
-~15. See [docs/uncertainty.md](docs/uncertainty.md).
+On mocks the statistical width alone covers the truth on 0–58% of source
+pixels (falling with S/N) and the Bayesian posterior on 65–85% (68% is
+calibrated); on REBELS-25 both give a source flux S/N of ~15. See
+[docs/uncertainty.md](docs/uncertainty.md), which also explains why the
+earlier statistical + prior-systematic mode was removed.
 
 `uncertainty.fits` is the 1σ per pixel. Do not divide the model by it
 for a significance map: on a model sampled finer than the beam, neighbouring
 pixels are strongly anticorrelated and the per-pixel ratio reads far too low.
-`snr.fits` is the significance map, at the restoring beam's resolution (see
-[docs/uncertainty.md](docs/uncertainty.md)). For `systematic`, two terms,
-added in quadrature, with the median of each in the FITS header:
-
-| term | header key | what it answers |
-|---|---|---|
-| statistical | `ERRSTAT` | how well the data pin this pixel down, given the prior |
-| prior systematic | `ERRSYS` | how much the answer depends on *how strongly* you smoothed |
+`snr.fits` is the significance map, at the restoring beam's resolution.
 
 The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
-with `C = (F+H)^-1`. It is
-optimistic (a regularised model is smoothed, hence biased) so the systematic
-term measures how far each pixel moves when the regularisation strength is
-varied over the range the data cannot distinguish between. Where χ² stops caring about the regularisation strength, the prior
-is choosing the answer. Neither term covers the prior *family* being wrong,
-nor calibration errors.
+with `C = (F+H)^-1`, conditional on the fitted prior strength; it is
+optimistic, increasingly so at low S/N. The Bayesian mode averages over the
+strength with the evidence as weight. Neither covers the prior *family* being
+wrong, nor calibration errors.
 
 **Do not add per-pixel errors in quadrature**: they are correlated over the
 prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
 evaluates `w^T (M C M^T) w` properly — quadrature overstated a compact
 aperture's error by ~1.4× on our mocks.
-
-![uncertainty](figures/uncertainty_total.png)
 
 Details, and the mesh/image checkerboard removal recorded as `ERRDEBL`:
 [docs/uncertainty.md](docs/uncertainty.md).
