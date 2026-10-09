@@ -152,6 +152,8 @@ class ProductSet:
     uncertainty_terms: dict | None = None   # the pieces of `uncertainty`
     source_flux: dict | None = None         # `api._source_flux`: flux and its significance
     snr: np.ndarray | None = None           # S/N at the restoring beam's resolution (`beam_snr`)
+    uncertainty_systematic: np.ndarray | None = None   # prior-systematic term alone, Jy/pixel
+    model_bayesian: np.ndarray | None = None   # marginal posterior mean (uncertainty="bayesian"), Jy/pixel
 
 
 
@@ -297,8 +299,12 @@ def write_products(
         terms = next(
             (p.uncertainty_terms for p in products if p.uncertainty_terms), {}
         ) or {}
+        etype = str(terms.get("type", "systematic"))
         unc_extra = {
-            "ERRTYPE": ("total", "statistical + prior systematic"),
+            "ERRTYPE": ({"systematic": "total"}.get(etype, etype),
+                        {"systematic": "statistical + prior systematic",
+                         "statistical": "posterior width at the fitted strength",
+                         "bayesian": "marginalised over the prior strength"}.get(etype, "")),
             "ERRSTAT": (terms.get("statistical_median", 0.0),
                         "median statistical 1-sigma [Jy/pixel]"),
             "ERRSYS": (terms.get("systematic_median", 0.0),
@@ -314,8 +320,34 @@ def write_products(
             "ERRDEBL": (bool(terms.get("deblocked", False)),
                         "checkerboard replaced by its envelope"),
         }
+        if etype != "systematic":
+            # no window was walked: its keys would only mislead
+            for key in ("ERRSYS", "ERRWLO", "ERRWHI", "ERRWMEA", "ERRWMET"):
+                unc_extra.pop(key, None)
+        lam = terms.get("lambda_posterior")
+        if lam:
+            unc_extra["BAYLAM"] = (lam["log10_coefficient_mean"],
+                                   "posterior mean of log10 prior strength")
+            unc_extra["BAYLSD"] = (lam["log10_coefficient_sd"],
+                                   "posterior sd of log10 prior strength")
         w("uncertainty.fits", stack("uncertainty"),
           hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra=unc_extra))
+        if any(getattr(p, "model_bayesian", None) is not None for p in products):
+            # the posterior mean the Bayesian errors belong to
+            w("model_bayesian.fits", stack("model_bayesian"),
+              hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra={
+                  "COMMENT": "posterior mean marginalised over the prior strength "
+                             "(unconstrained); its 1-sigma is uncertainty.fits"}))
+        if any(getattr(p, "uncertainty_systematic", None) is not None for p in products):
+            # the prior-systematic term on its own, so the share of the total
+            # it makes up can be seen pixel by pixel and the term dropped or
+            # rescaled: it is the least certain part of the budget (see
+            # docs/uncertainty.md, "Caveats on the prior systematic")
+            sys_extra = dict(unc_extra)
+            sys_extra["ERRTYPE"] = ("systematic",
+                                    "prior systematic only")
+            w("uncertainty_systematic.fits", stack("uncertainty_systematic"),
+              hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra=sys_extra))
         # S/N at the restoring beam's resolution, not model / uncertainty
         # pixel by pixel: a model sampled finer than the beam has strongly
         # anticorrelated neighbours, so the per-pixel ratio read ~1/3 of the

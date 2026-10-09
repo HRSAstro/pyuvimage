@@ -41,7 +41,7 @@ def test_the_record_repeats_the_run(tmp_path, captured):
     """Flags -> record -> --config must give the same `run` call."""
     argv = ["fit", str(tmp_path / "d.npz"), "--fov", "5", "--reg", "gibbs",
             "--point=0,0", "--point=-1.5,0.25", "--image-centre=-2,1",
-            "--lambda", "3e4", "--no-streaming", "--no-uncertainty",
+            "--lambda", "3e4", "--no-streaming", "--uncertainty", "statistical",
             "--mesh", "40", "--chunk-k", "2048"]
     cli.main(argv)
     a1, k1 = captured[-1]

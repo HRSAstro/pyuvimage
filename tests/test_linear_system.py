@@ -531,16 +531,18 @@ def _install(monkeypatch, chi2_of, n_pixels=100):
 
 
 def test_the_positivity_probe_runs_at_the_chosen_coefficient(monkeypatch, small):
-    """It used to probe at coefficient 1.0 -- the log-midpoint of the shipped
-    bounds and otherwise arbitrary. Here the constrained solver is fine where
-    the fit will run and far worse at 1.0: positivity must survive."""
+    """It used to probe at coefficient 1.0 -- the log-midpoint of the then
+    shipped bounds and otherwise arbitrary. Here the constrained solver is fine
+    where the fit will run and far worse at an arbitrary 1e3, between the
+    weakest probe (1e0 since Oct 2026) and the chosen coefficient (~1e5):
+    positivity must survive, and no constrained probe may land there."""
     dataset, geom = small
     n_data = 2 * len(np.asarray(dataset.data))
 
     def chi2_of(c, positive):
-        base = n_data * (0.95 + 0.5 * c / (c + 1e3))
-        if positive and abs(np.log10(c)) < 0.5:
-            return 10.0 * base   # a pathology only at c ~ 1
+        base = n_data * (0.95 + 0.5 * c / (c + 1e6))
+        if positive and abs(np.log10(c) - 3.0) < 0.5:
+            return 10.0 * base   # a pathology only at c ~ 1e3
         return base
 
     system = _install(monkeypatch, chi2_of)
@@ -553,7 +555,7 @@ def test_the_positivity_probe_runs_at_the_chosen_coefficient(monkeypatch, small)
     # the constrained side of the check is the delivered fit's own solve now
     # (`fit_at`, which the fake pops from `seen`), not a second probe; what
     # must not happen is a constrained probe at the old arbitrary c = 1
-    assert not any(abs(np.log10(c)) < 0.5 and pos for c, pos in system.seen)
+    assert not any(abs(np.log10(c) - 3.0) < 0.5 and pos for c, pos in system.seen)
 
 
 def test_a_solver_that_fails_at_the_chosen_coefficient_is_caught(monkeypatch, small):

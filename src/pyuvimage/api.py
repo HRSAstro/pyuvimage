@@ -74,6 +74,27 @@ class RunResult:
         return self.products[0].rms
 
 
+def resolve_uncertainty_mode(uncertainty: str | None, uncertainty_map: bool | None = None) -> str:
+    """The uncertainty mode from the new keyword or the deprecated boolean.
+
+    ``uncertainty`` wins; otherwise ``uncertainty_map`` True means
+    "systematic" (what it always produced) and False "none"; with neither,
+    "none" (the default since Oct 2026: the uncertainty products cost as much
+    as the fit on large data, and which kind to trust is the user's call --
+    docs/uncertainty.md).
+    """
+    if uncertainty is None:
+        if uncertainty_map is None:
+            return "none"
+        return "systematic" if uncertainty_map else "none"
+    mode = str(uncertainty).lower()
+    if mode not in fitting.UNCERTAINTY_MODES:
+        raise ValueError(
+            f"uncertainty must be one of {', '.join(fitting.UNCERTAINTY_MODES)}, "
+            f"not {uncertainty!r}")
+    return mode
+
+
 def resolve_streaming(
     streaming,
     dataset,
@@ -247,7 +268,8 @@ def run(
     dish_diameter: float | None = None,
     pb_factor: float = primary_beam.DEFAULT_PB_FACTOR,
     pb_in_model: bool = False,
-    uncertainty_map: bool = True,
+    uncertainty: str | None = None,
+    uncertainty_map: bool | None = None,
     point_sources: bool | str | tuple | list | None = None,
     point_significance: float = 5.0,
     max_points: int = 5,
@@ -346,6 +368,15 @@ def run(
             ``out``. The CLI passes its options in ``--config`` form, so a run
             can be repeated with ``pyuvimage fit --config``; a direct call
             records this function's own keyword arguments instead.
+        uncertainty: what the uncertainty products contain -- "none"
+            (default: no uncertainty.fits or snr.fits), "statistical" (the
+            posterior width at the fitted prior strength), "systematic"
+            (statistical + the prior-strength systematic, with
+            uncertainty_systematic.fits) or "bayesian" (the posterior
+            marginalised over the prior strength, with model_bayesian.fits);
+            see `fitting.UNCERTAINTY_MODES` and docs/uncertainty.md.
+        uncertainty_map: deprecated: True means uncertainty="systematic",
+            False "none". Ignored when ``uncertainty`` is given.
         pynufft_shift: apply the half-pixel phase ramp that aligns the pynufft
             transformer with the DFT (default). False reproduces the
             uncorrected upstream transformer: self-consistent, but the sky
@@ -376,6 +407,7 @@ def run(
         )
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
+    uncertainty = resolve_uncertainty_mode(uncertainty, uncertainty_map)
     stream, header = resolve_streaming(
         streaming, dataset, mode=mode, inversion=inversion,
         point_sources=point_sources, image_centre=image_centre, chunk_k=chunk_k,
@@ -391,7 +423,7 @@ def run(
             kernel_cache=kernel_cache, mask_shape=mask_shape, oversample=oversample,
             pb_correction=pb_correction, dish_diameter=dish_diameter,
             pb_factor=pb_factor, pb_in_model=pb_in_model,
-            uncertainty_map=uncertainty_map, write=write,
+            uncertainty=uncertainty, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
             point_sources=point_sources, point_significance=point_significance,
             max_points=max_points, point_retune=point_retune,
@@ -778,7 +810,7 @@ def run(
         products.append(
             _products_for(mfs_fit, mfs_dataset, geometry, uvd,
                           uvd.central_frequency, pb_correction, dish, pb_factor,
-                          oversample, uncertainty_map, imager=imager)
+                          oversample, uncertainty, imager=imager)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
         _report_dynamic_range(products[0], n_data_all, criterion)
@@ -889,7 +921,7 @@ def run(
             products.append(
                 _products_for(sf, ds_c, geometry, uvd, float(ch.frequencies[0]),
                               pb_correction, dish, pb_factor, oversample,
-                              uncertainty_map)
+                              uncertainty)
             )
         freqs = uvd.frequencies
 
@@ -910,6 +942,7 @@ def run(
         transformer_requested=transformer,
     )
     parameters["source_flux"] = _source_flux_records(products)
+    parameters["uncertainty"] = _uncertainty_records(products, uncertainty)
     # the record says which path ran; `run_streamed` writes a dict here
     parameters["streaming"] = False
     parameters["reload"] = bool(reload)
@@ -952,7 +985,8 @@ def run_streamed(
     dish_diameter: float | None = None,
     pb_factor: float = primary_beam.DEFAULT_PB_FACTOR,
     pb_in_model: bool = False,
-    uncertainty_map: bool = True,
+    uncertainty: str | None = None,
+    uncertainty_map: bool | None = None,
     write: bool = True,
     mode: str = "mfs",
     inversion: str = "auto",
@@ -1005,6 +1039,7 @@ def run_streamed(
 
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
+    uncertainty = resolve_uncertainty_mode(uncertainty, uncertainty_map)
     if cube_prior not in ("channel", "mfs"):
         raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
     point_sources = normalise_point_sources(point_sources)
@@ -1252,7 +1287,7 @@ def run_streamed(
     if not cube:
         products = [_products_for(
             mfs_fit, stub, geometry, header, header.central_frequency, pb_correction,
-            dish, pb_factor, oversample, uncertainty_map, imager=imager,
+            dish, pb_factor, oversample, uncertainty, imager=imager,
         )]
         _report_dynamic_range(products[0], n_data_all, criterion)
         freqs = np.atleast_1d(header.central_frequency)
@@ -1302,7 +1337,7 @@ def run_streamed(
             )
             products.append(_products_for(
                 sf, stub_c, geometry, header, float(freqs[c]), pb_correction,
-                dish, pb_factor, oversample, uncertainty_map, imager=imager_c,
+                dish, pb_factor, oversample, uncertainty, imager=imager_c,
             ))
             del sf, stub_c, imager_c
         mfs_fit = mfs_summary
@@ -1317,6 +1352,7 @@ def run_streamed(
         channel_chi2_per_datum=channel_chi2 if cube else None,
     )
     parameters["source_flux"] = _source_flux_records(products)
+    parameters["uncertainty"] = _uncertainty_records(products, uncertainty)
     parameters["streaming"] = {
         "chunk_k": chunk_k, "n_visibilities_streamed": int(header.n_samples),
         "seconds_streaming": float(terms.seconds), "reload": bool(reload),
@@ -1892,7 +1928,7 @@ STRUCTURE_RATIO_SUGGEST = 1.25
 SOURCE_REGION_SIGMA = 3.0
 
 
-def _source_flux(sf, model_image, beam, rms, pixel_scale) -> dict | None:
+def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "systematic") -> dict | None:
     """The model's flux in the source region, with its significance.
 
     Per-pixel S/N (`snr.fits`) reads low on any model sampled finer than the
@@ -1927,8 +1963,9 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale) -> dict | None:
         region = labels == labels[peak]
         flux = float(np.sum(model_image[region]))
         stat = float(sf.aperture_uncertainty(region))
-        sys_ = sf.aperture_systematic(region)
+        sys_ = sf.aperture_systematic(region) if mode == "systematic" else None
         total = float(np.hypot(stat, sys_)) if sys_ is not None else None
+        bayes = sf.aperture_bayesian(region) if mode == "bayesian" else None
     except Exception as e:                         # never let this kill a fit
         logger.debug("source flux failed: %s", e)
         return None
@@ -1943,7 +1980,14 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale) -> dict | None:
         "flux_error_jy": total,
         "snr_stat": flux / stat if stat > 0 else None,
         "snr": flux / total if total else None,
+        "uncertainty": mode,
     }
+    if bayes is not None:
+        # the marginal posterior's own flux and error: the errors belong to
+        # the posterior mean (model_bayesian.fits), not to model.fits
+        record["flux_bayesian_jy"] = bayes[0]
+        record["flux_error_bayesian_jy"] = bayes[1]
+        record["snr"] = bayes[0] / bayes[1] if bayes[1] > 0 else None
     logger.info(
         "source flux %.4g Jy in %.3g arcsec^2 (%s): +- %.2g statistical%s = "
         "%.1f sigma. Per-pixel S/N (snr.fits) is far lower on a model "
@@ -1954,6 +1998,15 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale) -> dict | None:
         record["snr"] if record["snr"] else record["snr_stat"],
     )
     return record
+
+
+def _uncertainty_records(products, mode):
+    """`fit_parameters.json`'s ``uncertainty``: the mode and what it measured."""
+    recs = []
+    for p in products:
+        t = dict(p.uncertainty_terms or {})
+        recs.append({k: v for k, v in t.items() if not isinstance(v, np.ndarray)})
+    return {"mode": mode, "terms": recs[0] if len(recs) == 1 else recs}
 
 
 def _source_flux_records(products):
@@ -2061,7 +2114,7 @@ def _products_for(
     dish: float | None,
     pb_factor: float,
     oversample: int,
-    uncertainty_map: bool = True,
+    uncertainty_mode: str = "systematic",
     imager: "beam_mod.DirtyImager | None" = None,
 ) -> ProductSet:
     if imager is None or imager.dataset is not dataset:
@@ -2090,14 +2143,26 @@ def _products_for(
         resid_dirty = imager.dirty_image(resid_vis)
     uncertainty = None
     uncertainty_terms = None
+    uncertainty_systematic = None
     # the systematic window of a `structure` fit is measured on residual maps;
     # hand the fit the imager already built rather than have it build another
     base_fit = getattr(sf, "_sf", sf)
     if getattr(base_fit, "imager", "absent") is None:
         base_fit.imager = imager
-    if uncertainty_map:
-        try:
+    model_bayesian = None
+    if uncertainty_mode == "bayesian" and getattr(sf, "solution", None) is not None \
+            and len(getattr(sf.solution, "grid_positions", []) or []):
+        logger.warning(
+            "--uncertainty bayesian is not available with point components "
+            "(their amplitudes are not in the marginalised system); using "
+            "--uncertainty systematic for this fit")
+        uncertainty_mode = "systematic"
+    started = time.time()
+    try:
+        if uncertainty_mode == "systematic":
             uncertainty, uncertainty_terms = sf.model_uncertainty_total()
+            # from the same cached walk, so no extra solves
+            uncertainty_systematic = sf.model_uncertainty_systematic()
             logger.info(
                 "model uncertainty: median %.3g Jy/pixel "
                 "(statistical %.3g, prior systematic %.3g); "
@@ -2107,8 +2172,19 @@ def _products_for(
                 uncertainty_terms["systematic_median"],
                 100 * uncertainty_terms["checkerboard_amplitude"],
             )
-        except Exception as e:  # never let the error bar kill the fit
-            logger.warning("uncertainty map failed: %s: %s", type(e).__name__, e)
+        elif uncertainty_mode == "statistical":
+            uncertainty, uncertainty_terms = sf.model_uncertainty_statistical()
+            logger.info("model uncertainty (statistical only): median %.3g Jy/pixel",
+                        uncertainty_terms["total_median"])
+        elif uncertainty_mode == "bayesian":
+            uncertainty, uncertainty_terms = sf.model_uncertainty_bayesian()
+            model_bayesian = sf.bayesian_mean_image
+            logger.info("model uncertainty (Bayesian, marginalised over the prior "
+                        "strength): median %.3g Jy/pixel", uncertainty_terms["total_median"])
+    except Exception as e:  # never let the error bar kill the fit
+        logger.warning("uncertainty map failed: %s: %s", type(e).__name__, e)
+    if uncertainty_terms is not None:
+        uncertainty_terms["seconds_map"] = time.time() - started
     rms = imager.rms
     bf = beam_mod.fit_beam(imager.dirty_beam, geometry.pixel_scale)
     reconvolved = beam_mod.restore(
@@ -2137,17 +2213,20 @@ def _products_for(
         model_pbcor = primary_beam.pb_correct(model_image, pb)
         reconvolved_pbcor = primary_beam.pb_correct(reconvolved, pb)
 
-    source_flux = _source_flux(sf, model_image, bf, rms, geometry.pixel_scale)
+    source_flux = _source_flux(sf, model_image, bf, rms, geometry.pixel_scale,
+                               mode=uncertainty_mode if uncertainty is not None else "none")
     snr = None
     if uncertainty is not None and hasattr(sf, "beam_snr"):
         started = time.time()
         try:
-            snr, _ = sf.beam_snr(bf)
+            snr, _ = sf.beam_snr(bf, mode=uncertainty_mode)
             logger.info(
                 "S/N map at the restoring beam's resolution: peak %.1f (%.0f s)",
                 float(np.nanmax(snr)), time.time() - started)
         except Exception as e:          # never let the S/N map kill a fit
             logger.warning("S/N map failed: %s: %s", type(e).__name__, e)
+        if uncertainty_terms is not None:
+            uncertainty_terms["seconds_snr"] = time.time() - started
     return ProductSet(
         snr=snr,
         source_flux=source_flux,
@@ -2155,6 +2234,8 @@ def _products_for(
         model_image=model_image,
         uncertainty=uncertainty,
         uncertainty_terms=uncertainty_terms,
+        uncertainty_systematic=uncertainty_systematic,
+        model_bayesian=model_bayesian,
         dirty_image=dirty_image,
         dirty_model=dirty_model,
         residual_sigma=resid_dirty / rms,

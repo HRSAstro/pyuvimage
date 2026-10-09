@@ -154,13 +154,24 @@ def test_a_single_point_need_not_be_wrapped_in_a_list(tmp_path, captured):
 
 def test_switches_take_true_and_false(tmp_path, captured):
     path = write(tmp_path, {"dataset": "d.npz", "fov": 1,
-                            "no-uncertainty": True, "no-pb": False,
+                            "uncertainty": "bayesian", "no-pb": False,
                             "point-sources": True})
     cli.main(["fit", "--config", path])
     kwargs = captured[-1][1]
-    assert kwargs["uncertainty_map"] is False
+    assert kwargs["uncertainty"] == "bayesian"
     assert kwargs["pb_correction"] is True
     assert kwargs["point_sources"] is True
+
+
+def test_an_old_no_uncertainty_key_still_repeats_its_run(tmp_path, captured):
+    """input_parameters.json written before Oct 2026 carries the boolean
+    "no-uncertainty"; false meant the map was made (now "systematic")."""
+    path = write(tmp_path, {"dataset": "d.npz", "fov": 1, "no-uncertainty": False})
+    cli.main(["fit", "--config", path])
+    assert captured[-1][1]["uncertainty"] == "systematic"
+    path = write(tmp_path, {"dataset": "d.npz", "fov": 1, "no-uncertainty": True})
+    cli.main(["fit", "--config", path])
+    assert captured[-1][1]["uncertainty"] == "none"
 
 
 def test_null_is_the_unset_value(tmp_path, captured):

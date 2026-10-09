@@ -376,8 +376,16 @@ def main(argv: list[str] | None = None) -> int:
         "cheaper than growing the field to reach it. The output WCS follows.",
     )
     p_fit.add_argument(
-        "--no-uncertainty", action="store_true",
-        help="skip the per-pixel 1 sigma posterior map",
+        "--uncertainty", default="none",
+        choices=["none", "statistical", "systematic", "bayesian"],
+        help="what the uncertainty products contain (default none: no "
+             "uncertainty.fits or snr.fits). statistical: the posterior width "
+             "at the fitted prior strength. systematic: statistical + the "
+             "prior-strength systematic (also uncertainty_systematic.fits). "
+             "bayesian: the posterior marginalised over the prior strength, "
+             "weighted by the evidence (also model_bayesian.fits, the "
+             "posterior mean those errors belong to). See docs/uncertainty.md "
+             "for how far each can be trusted.",
     )
     p_fit.add_argument(
         "--point-sources", action="store_true",
@@ -627,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
             pb_correction=not args.no_pb,
             dish_diameter=args.dish_diameter,
             pb_in_model=args.pb_in_model,
-            uncertainty_map=not args.no_uncertainty,
+            uncertainty=args.uncertainty,
             point_sources=point_sources,
             point_significance=args.point_significance,
             max_points=args.max_points,

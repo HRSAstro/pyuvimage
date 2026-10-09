@@ -60,7 +60,9 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `model_reconvolved.fits` | Jy/beam | model ⊗ fitted Gaussian beam + residuals — the CLEAN-image analogue |
 | `model_reconvolved_pbcor.fits` | Jy/beam | primary-beam-corrected version of it |
 | `residual.fits` | σ | (data − model) dirty image / rms (rms in header `RMS`) |
-| `uncertainty.fits` | Jy/pixel | total 1σ per pixel — see below |
+| `uncertainty.fits` | Jy/pixel | 1σ per pixel, of the kind `--uncertainty` asked for (`ERRTYPE`) — see below; not written by default |
+| `uncertainty_systematic.fits` | Jy/pixel | `--uncertainty systematic`: the prior-systematic part alone (see the caveats in [docs/uncertainty.md](docs/uncertainty.md)) |
+| `model_bayesian.fits` | Jy/pixel | `--uncertainty bayesian`: the posterior mean marginalised over the prior strength, which `uncertainty.fits` is then the 1σ of |
 | `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (full covariance plus prior systematic), points included |
 | `dirty_image.fits` | Jy/beam | naturally weighted dirty image of the data |
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
@@ -141,12 +143,26 @@ residual of 3.9–5.0σ; see [docs/design-notes.md](docs/design-notes.md).
 
 ## The uncertainty map
 
-`uncertainty.fits` is the total 1σ per pixel. Do not divide the model by it
+Off by default; `--uncertainty` chooses what it contains:
+
+| mode | `uncertainty.fits` | extra products | cost |
+|---|---|---|---|
+| `none` (default) | not written (nor `snr.fits`) | — | — |
+| `statistical` | posterior width at the fitted prior strength | — | one inverse |
+| `systematic` | statistical + prior-strength systematic | `uncertainty_systematic.fits` | + the window walk (≥4 constrained solves) |
+| `bayesian` | posterior marginalised over the prior strength (evidence-weighted) | `model_bayesian.fits` | ~25 unconstrained solves + a few inverses |
+
+On mocks the statistical width alone covers the truth on 0–27% of source
+pixels, statistical + systematic on 2–41%, and the Bayesian posterior on
+56–74% (68% is calibrated); on REBELS-25 all three give a source flux S/N of
+~15. See [docs/uncertainty.md](docs/uncertainty.md).
+
+`uncertainty.fits` is the 1σ per pixel. Do not divide the model by it
 for a significance map: on a model sampled finer than the beam, neighbouring
 pixels are strongly anticorrelated and the per-pixel ratio reads far too low.
 `snr.fits` is the significance map, at the restoring beam's resolution (see
-[docs/uncertainty.md](docs/uncertainty.md)). Two terms, added in quadrature,
-with the median of each in the FITS header:
+[docs/uncertainty.md](docs/uncertainty.md)). For `systematic`, two terms,
+added in quadrature, with the median of each in the FITS header:
 
 | term | header key | what it answers |
 |---|---|---|

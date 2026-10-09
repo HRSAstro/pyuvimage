@@ -1517,7 +1517,7 @@ class PointAugmentedFit:
         M_inv = cho_solve(sysm._cho, np.eye(sysm.n_mesh), check_finite=False)
         return M_inv @ sysm.F @ M_inv
 
-    def beam_snr(self, beam) -> tuple[np.ndarray, np.ndarray]:
+    def beam_snr(self, beam, mode: str = "systematic") -> tuple[np.ndarray, np.ndarray]:
         """`SingleFit.beam_snr` for the extended model *plus* the points.
 
         The points enter the smoothed model as the restoring beam at their
@@ -1535,7 +1535,9 @@ class PointAugmentedFit:
 
         sf, sol = self._sf, self.solution
         if not sol.grid_positions:
-            return sf.beam_snr(beam)
+            return sf.beam_snr(beam, mode=mode)
+        if mode == "bayesian":
+            raise ValueError("Bayesian uncertainties are not available with point components")
         kernel = gaussian_kernel(beam, sf.geometry.pixel_scale,
                                  tuple(sf.geometry.shape_native))
         sysm = sol.system
@@ -1553,7 +1555,7 @@ class PointAugmentedFit:
         smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
         smooth = smooth + np.tensordot(np.asarray(sol.amplitudes), extra, axes=1)
         stat = sf.smoothed_std(kernel, cov=joint, extra=extra)
-        sigma = np.hypot(stat, sf._smoothed_systematic(kernel))
+        sigma = stat if mode == "statistical" else np.hypot(stat, sf._smoothed_systematic(kernel))
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = np.where(sigma > 0, smooth / sigma, 0.0)
         return snr, sigma

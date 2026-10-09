@@ -1,0 +1,154 @@
+[
+  {
+    "dataset": "J0116 245 GHz",
+    "n_sigma": 1.0,
+    "criterion": "structure",
+    "coefficient": 63995928.38778279,
+    "window_dex": [
+      -0.5,
+      0.5
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 1.7284381153260475e-07,
+    "statistical_median": 7.951820030366568e-07,
+    "flux_jy": 0.03349796448592026,
+    "flux_error_jy": 0.0006584413228910549,
+    "flux_error_sys_jy": 0.0006018583278278103,
+    "flux_snr": 50.874638819506174,
+    "flux_snr_stat": 125.44072167784564,
+    "peak_snr_beam": 66.55946483907411
+  },
+  {
+    "dataset": "J0116 245 GHz",
+    "n_sigma": 5.0,
+    "criterion": "structure",
+    "coefficient": 63995928.38778279,
+    "window_dex": [
+      -1.0,
+      0.5
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 2.791152979514429e-07,
+    "statistical_median": 7.951820030366568e-07,
+    "flux_jy": 0.03349796448592026,
+    "flux_error_jy": 0.0006584413228910422,
+    "flux_error_sys_jy": 0.0006018583278277964,
+    "flux_snr": 50.874638819507155,
+    "flux_snr_stat": 125.44072167784564,
+    "peak_snr_beam": 66.55946483907425
+  },
+  {
+    "dataset": "J1446 220 GHz",
+    "n_sigma": 1.0,
+    "criterion": "structure",
+    "coefficient": 105071.36517231503,
+    "window_dex": [
+      -6.0,
+      1.0
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 2.925597826014129e-07,
+    "statistical_median": 3.1245300214599925e-06,
+    "flux_jy": 0.01101228371415768,
+    "flux_error_jy": 0.00022376829481766993,
+    "flux_error_sys_jy": 0.00012797703185889707,
+    "flux_snr": 49.21288658489653,
+    "flux_snr_stat": 59.99295778261664,
+    "peak_snr_beam": 63.78369667651648
+  },
+  {
+    "dataset": "J1446 220 GHz",
+    "n_sigma": 5.0,
+    "criterion": "structure",
+    "coefficient": 105071.36517231503,
+    "window_dex": [
+      -6.0,
+      2.5
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 5.983061187805563e-07,
+    "statistical_median": 3.1245300214599997e-06,
+    "flux_jy": 0.011012283714157682,
+    "flux_error_jy": 0.00022376829481766895,
+    "flux_error_sys_jy": 0.00012797703185889533,
+    "flux_snr": 49.21288658489675,
+    "flux_snr_stat": 59.99295778261665,
+    "peak_snr_beam": 63.78369667651655
+  },
+  {
+    "dataset": "Ruby 200 GHz",
+    "n_sigma": 1.0,
+    "criterion": "structure->evidence (unreachable target)",
+    "coefficient": 18768.842935762186,
+    "window_dex": [
+      -6.0,
+      3.0
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 3.618216615408873e-08,
+    "statistical_median": 4.864327649614679e-06,
+    "flux_jy": 0.003829168263997653,
+    "flux_error_jy": 0.00016795479002923393,
+    "flux_error_sys_jy": 0.00010111254365416811,
+    "flux_snr": 22.798803554999264,
+    "flux_snr_stat": 28.5527830084462,
+    "peak_snr_beam": 22.50481234178861
+  },
+  {
+    "dataset": "Ruby 200 GHz",
+    "n_sigma": 5.0,
+    "criterion": "structure->evidence (unreachable target)",
+    "coefficient": 18768.842935762186,
+    "window_dex": [
+      -6.0,
+      4.5
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 1.332364115325808e-07,
+    "statistical_median": 4.864327649614669e-06,
+    "flux_jy": 0.003829168263997653,
+    "flux_error_jy": 0.0004174193885287615,
+    "flux_error_sys_jy": 0.00039528961649678727,
+    "flux_snr": 9.173431731319331,
+    "flux_snr_stat": 28.552783008446212,
+    "peak_snr_beam": 22.439190032139315
+  },
+  {
+    "dataset": "REBELS-25 [CII]",
+    "n_sigma": 1.0,
+    "criterion": "structure",
+    "coefficient": 830679693.0471885,
+    "window_dex": [
+      -0.5,
+      0.5
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 3.2957297450921696e-08,
+    "statistical_median": 2.7828936347826556e-07,
+    "flux_jy": 0.001200390884277565,
+    "flux_error_jy": 8.255975824414955e-05,
+    "flux_error_sys_jy": 1.864169914478071e-05,
+    "flux_snr": 14.53966084454503,
+    "flux_snr_stat": 14.925109150015535,
+    "peak_snr_beam": 10.015011263984677
+  },
+  {
+    "dataset": "REBELS-25 [CII]",
+    "n_sigma": 5.0,
+    "criterion": "structure",
+    "coefficient": 830679693.0471885,
+    "window_dex": [
+      -3.0,
+      2.0
+    ],
+    "window_metric": "structure ratio",
+    "systematic_median": 1.9697521211092754e-07,
+    "statistical_median": 2.782893634782654e-07,
+    "flux_jy": 0.0012003908842775641,
+    "flux_error_jy": 0.0002204960910502403,
+    "flux_error_sys_jy": 0.0002053044700782425,
+    "flux_snr": 5.444046098776661,
+    "flux_snr_stat": 14.925109150015535,
+    "peak_snr_beam": 9.79425281647816
+  }
+]

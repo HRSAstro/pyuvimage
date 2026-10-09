@@ -14,8 +14,10 @@ to stop trusting the tool.
 
     python scripts/figure_snr_series.py            # fit, then plot
     python scripts/figure_snr_series.py --plot     # re-plot from the cache
+    python scripts/figure_snr_series.py --criterion discrepancy
 
-Writes figures/snr_series.{pdf,png}.
+Writes figures/snr_series.{pdf,png} (criterion `structure`, the default since
+Oct 2026), or figures/snr_series_<criterion>.{pdf,png} for any other.
 """
 
 from __future__ import annotations
@@ -34,7 +36,18 @@ import figure_style as fs  # noqa: E402  (same directory)
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
-CACHE = Path("/tmp/pyuvimage_fig_snr")
+#: how the prior strength is chosen; set from the command line
+CRITERION = "structure"
+#: `fitting.STRUCTURE_WINDOW_N_SIGMA` for structure fits; set from the command line
+WINDOW_SIGMA = 1.0
+
+
+def _tag() -> str:
+    return CRITERION + (f"_window{WINDOW_SIGMA:g}" if WINDOW_SIGMA != 1.0 else "")
+
+
+def cache() -> Path:
+    return Path(f"/tmp/pyuvimage_fig_snr_{_tag()}")
 
 #: the envelope prior, as in `figure_point_source.py` -- see the note there
 REG = "gaussian"
@@ -60,9 +73,9 @@ def fit_all() -> None:
     from pyuvimage import mock
     import pyuvimage
 
-    if CACHE.exists():
-        shutil.rmtree(CACHE)
-    CACHE.mkdir(parents=True)
+    if cache().exists():
+        shutil.rmtree(cache())
+    cache().mkdir(parents=True)
 
     records = []
     for i, sigma in enumerate(SIGMAS):
@@ -75,8 +88,8 @@ def fit_all() -> None:
             point_flux_jy=POINT_FLUX, point_centre=POINT_CENTRE, seed=0,
         )
         if i == 0:
-            np.save(CACHE / "truth.npy", np.asarray(truth, dtype=float))
-            (CACHE / "geometry.json").write_text(json.dumps({
+            np.save(cache() / "truth.npy", np.asarray(truth, dtype=float))
+            (cache() / "geometry.json").write_text(json.dumps({
                 "pixel_scale": geom.pixel_scale,
                 "mesh_pixel_scale": geom.mesh_pixel_scale,
                 "point_flux": POINT_FLUX,
@@ -85,12 +98,12 @@ def fit_all() -> None:
                 "reg": REG,
             }, indent=2))
 
-        out = CACHE / f"snr{i}"
+        out = cache() / f"snr{i}"
         t = time.time()
         try:
             pyuvimage.run(
                 uvd, fov=FOV, out=out, mesh_shape=(MESH_N, MESH_N),
-                reg=REG, criterion="discrepancy", point_sources=True,
+                reg=REG, criterion=CRITERION, point_sources=True,
                 uncertainty_map=True, pb_correction=False,
                 mask_shape="square",
             )
@@ -101,11 +114,11 @@ def fit_all() -> None:
                         "seconds": time.time() - t})
         print(f"  sigma {sigma:.2e}  {time.time() - t:5.1f} s  {failed}",
               flush=True)
-    (CACHE / "runs.json").write_text(json.dumps(records, indent=2))
+    (cache() / "runs.json").write_text(json.dumps(records, indent=2))
 
 
 def _load(i: int):
-    d = CACHE / f"snr{i}"
+    d = cache() / f"snr{i}"
     if not (d / "model.fits").exists():
         return None
     hdr = fits.getheader(d / "model_reconvolved.fits")
@@ -137,9 +150,9 @@ def plot() -> None:
     from pyuvimage.products import to_fits_orientation
 
     fs.use_paper_style()
-    geo = json.loads((CACHE / "geometry.json").read_text())
+    geo = json.loads((cache() / "geometry.json").read_text())
     pix, mpix = geo["pixel_scale"], geo["mesh_pixel_scale"]
-    truth_sb = to_fits_orientation(np.load(CACHE / "truth.npy")) / mpix**2
+    truth_sb = to_fits_orientation(np.load(cache() / "truth.npy")) / mpix**2
 
     runs = [(i, _load(i)) for i in range(len(SIGMAS))]
     runs = [(i, r) for i, r in runs if r is not None]
@@ -272,7 +285,7 @@ def plot() -> None:
     # calibration, and it is not a detail a caption can be trusted to carry.
     k = ref["model"].shape[0] // truth_sb.shape[0]
     truth_img = to_fits_orientation(
-        np.kron(np.load(CACHE / "truth.npy"), np.ones((k, k))) / k**2)
+        np.kron(np.load(cache() / "truth.npy"), np.ones((k, k))) / k**2)
     src = truth_img > 0.02 * truth_img.max()
     quoted, actual = [], []
     for _, r in runs:
@@ -308,7 +321,8 @@ def plot() -> None:
         ax.set_xlim(snr.max() * 1.7, snr.min() * 0.55)   # bright on the left,
                                                          # matching the panels
 
-    for p in fs.save(fig, "snr_series"):
+    stem = "snr_series" if _tag() == "structure" else f"snr_series_{_tag()}"
+    for p in fs.save(fig, stem):
         print("wrote", p)
 
     # the numbers behind the trend panel, for the caption
@@ -325,7 +339,15 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--plot", action="store_true",
                     help="skip fitting and re-plot from the cache")
+    ap.add_argument("--criterion", default="structure",
+                    choices=["structure", "discrepancy", "evidence"])
+    ap.add_argument("--structure-window-sigma", type=float, default=1.0,
+                    help="structure-fit systematic window, in units of the ratio's scatter")
     args = ap.parse_args()
+    CRITERION = args.criterion
+    WINDOW_SIGMA = args.structure_window_sigma
+    from pyuvimage import fitting as _fitting
+    _fitting.STRUCTURE_WINDOW_N_SIGMA = WINDOW_SIGMA
     if not args.plot:
         fit_all()
     plot()

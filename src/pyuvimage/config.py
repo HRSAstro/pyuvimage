@@ -151,6 +151,21 @@ def _convert(action: argparse.Action, key: str, value: Any) -> Any:
     return value
 
 
+def _legacy_keys(config: dict[str, Any], table) -> dict[str, Any]:
+    """Translate keys older files carry into the options that replaced them.
+
+    ``no-uncertainty`` (a boolean, until Oct 2026) became ``uncertainty``
+    with a mode: false meant the map was made, which is what "systematic"
+    produces, and true meant none. Files written by earlier runs
+    (input_parameters.json) then repeat exactly.
+    """
+    out = dict(config)
+    for old in ("no-uncertainty", "no_uncertainty"):
+        if old in out and _normalise("uncertainty") in table and "uncertainty" not in out:
+            out["uncertainty"] = "none" if bool(out.pop(old)) else "systematic"
+    return out
+
+
 def apply_config(
     parser: argparse.ArgumentParser, config: dict[str, Any], source: str,
 ) -> list[str]:
@@ -161,6 +176,7 @@ def apply_config(
     ``pyuvimage fit --config params.json`` alone is a complete command.
     """
     table = _lookup(parser)
+    config = _legacy_keys(config, table)
     values: dict[str, Any] = {}
     unknown = []
     for key, raw in config.items():

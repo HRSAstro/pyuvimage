@@ -115,7 +115,9 @@ def _fake_solution(n_data, floor_free, floor_positive, gain=0.5):
     def solution(coefficient, positive):
         floor = floor_positive if positive else floor_free
         c = float(coefficient)
-        response = gain * c / (c + 1e3)
+        # the knee sits where interferometric coefficients do (fitted values
+        # run 4e3-2e11), well above the search's weakest probe at 1e0
+        response = gain * c / (c + 1e6)
         return n_data * (floor + response), np.full(4, 1.0 + response)
     return solution
 
@@ -181,9 +183,13 @@ def test_an_unreachable_target_does_not_switch_the_prior_off(
 
     assert np.log10(sf.prior["coefficient"]) > LOG_COEFFICIENT_BOUNDS[0] + 1.0
     # it lands at the knee: just above the floor the solver can reach, by
-    # however much chi^2/N is uncertain at *this* dataset size
+    # however much chi^2/N is uncertain at *this* dataset size -- to within
+    # the re-bisection gate, the tolerance the code itself works to (whether
+    # the delivered fit lands just inside or just outside that gate depends on
+    # where the bisection happens to stop)
     assert sf.chi_squared / n_data == pytest.approx(
-        1.02 * (1.0 + chi2_floor_tolerance(n_data)), rel=0.02
+        1.02 * (1.0 + chi2_floor_tolerance(n_data)),
+        rel=fitting.chi2_rebisect_tolerance(n_data),
     )
     assert np.isfinite(sf.scan.chi2_floor)
     assert sf.scan.chi2_floor / n_data == pytest.approx(1.02, rel=1e-3)

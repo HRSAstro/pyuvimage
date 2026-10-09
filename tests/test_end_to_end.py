@@ -1,5 +1,7 @@
 """End-to-end regression tests on simulated data (slow-ish: ~1-2 min)."""
 
+import json
+
 import numpy as np
 import pytest
 from astropy.io import fits
@@ -344,17 +346,70 @@ def test_total_uncertainty_map(tmp_path):
     assert np.nanmedian(total) < 2.0 * np.nanmedian(raw)
 
 
-def test_only_one_uncertainty_map_is_written(tmp_path):
+def test_total_and_systematic_uncertainty_maps_are_written(tmp_path):
     uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
         n_vis=250, mesh_n=16, sigma_jy=1e-3, seed=42)
     pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "u",
-                  reg="matern")
+                  reg="matern", uncertainty="systematic")
     assert (tmp_path / "u" / "uncertainty.fits").exists()
     assert (tmp_path / "u" / "snr.fits").exists()
     assert not (tmp_path / "u" / "uncertainty_noise.fits").exists()
     hdr = fits.getheader(tmp_path / "u" / "uncertainty.fits")
     assert hdr["ERRTYPE"].strip() == "total"
     assert hdr["ERRSTAT"] > 0 and hdr["ERRDEBL"]
+    # the prior systematic on its own, never larger than the total it is part of
+    total = fits.getdata(tmp_path / "u" / "uncertainty.fits")
+    sys_ = fits.getdata(tmp_path / "u" / "uncertainty_systematic.fits")
+    assert fits.getheader(tmp_path / "u" / "uncertainty_systematic.fits")["ERRTYPE"].strip() == "systematic"
+    assert sys_.shape == total.shape
+    assert np.nanmax(sys_) > 0
+    assert np.all(sys_ <= total * (1 + 1e-5) + 1e-12)
+
+
+def test_the_default_writes_no_uncertainty_products(tmp_path):
+    uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
+        n_vis=250, mesh_n=16, sigma_jy=1e-3, seed=42)
+    pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "n", reg="matern")
+    for name in ("uncertainty.fits", "uncertainty_systematic.fits", "snr.fits",
+                 "model_bayesian.fits"):
+        assert not (tmp_path / "n" / name).exists(), name
+    params = json.loads((tmp_path / "n" / "fit_parameters.json").read_text())
+    assert params["uncertainty"]["mode"] == "none"
+
+
+def test_statistical_and_bayesian_uncertainty_modes(tmp_path):
+    uvd, truth, geom, comps = mock.make_extended_plus_compact_dataset(
+        n_vis=250, mesh_n=16, sigma_jy=1e-3, seed=42)
+    pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "s",
+                  reg="matern", uncertainty="statistical")
+    hdr = fits.getheader(tmp_path / "s" / "uncertainty.fits")
+    assert hdr["ERRTYPE"].strip() == "statistical"
+    assert "ERRWLO" not in hdr                      # no window was walked
+    assert (tmp_path / "s" / "snr.fits").exists()
+    assert not (tmp_path / "s" / "uncertainty_systematic.fits").exists()
+
+    pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=tmp_path / "b",
+                  reg="matern", uncertainty="bayesian")
+    hdr = fits.getheader(tmp_path / "b" / "uncertainty.fits")
+    assert hdr["ERRTYPE"].strip() == "bayesian"
+    assert np.isfinite(hdr["BAYLAM"]) and hdr["BAYLSD"] > 0
+    assert (tmp_path / "b" / "model_bayesian.fits").exists()
+    assert (tmp_path / "b" / "snr.fits").exists()
+    params = json.loads((tmp_path / "b" / "fit_parameters.json").read_text())
+    assert params["uncertainty"]["mode"] == "bayesian"
+    assert params["uncertainty"]["terms"]["lambda_posterior"]["n_mixture_components"] >= 1
+    stat = fits.getdata(tmp_path / "s" / "uncertainty.fits")
+    bayes = fits.getdata(tmp_path / "b" / "uncertainty.fits")
+    # marginalising over the strength can only add variance to the
+    # conditional posterior at one strength... at the same strength; the
+    # strengths differ here, so ask only that both are sane and comparable
+    assert np.all(np.isfinite(bayes)) and np.nanmedian(bayes) > 0
+    assert 0.1 < np.nanmedian(bayes) / np.nanmedian(stat) < 10
+
+
+def test_unknown_uncertainty_mode_is_refused():
+    with pytest.raises(ValueError, match="uncertainty"):
+        pyuvimage.api.resolve_uncertainty_mode("everything")
 
 
 def test_uncertainty_is_data_independent_and_prior_shaped():

@@ -87,10 +87,61 @@ CHI2_WINDOW_MAX_DEX = 6.0
 #: window can only ever widen the old fixed one, never narrow it.
 CHI2_WINDOW_MIN_DEX = 0.5
 
-LOG_COEFFICIENT_BOUNDS = (-6.0, 6.0)
+#: How far the structure ratio may move, in units of its own noise scatter
+#: (`structure_ratio_scatter`), before a strength leaves the systematic window
+#: of a `structure` fit. 1 (the default) is the ratio's 1-sigma noise. Under
+#: test (Oct 2026): at low S/N the ratio barely responds to the strength, the
+#: 1-sigma window stays at its half-decade floor, and the quoted error falls
+#: ~10x short of the actual error on the demo mock at 5 sigma; 5 brings the
+#: mock's coverage to ~1 at peak S/N <= 60. See
+#: claude/snr-series-structure-window.md in the project notes.
+STRUCTURE_WINDOW_N_SIGMA = 1.0
+
+#: Where the coefficient search starts, in log10. The lower end is the
+#: weakest prior, probed first in every search (the floor check needs it). Both
+#: ends were PyAutoLabs' LogUniform(1e-6, 1e6) prior, set for optical/IR
+#: imaging; interferometric fits land well above it: fitted coefficients on
+#: real data run from 4e3 to 2e11, mostly 1e5-1e10, and the mocks sit at
+#: 1e7-3e10 (claude/lambda-search-range.md). Starting at 1e9 saves the +3-dex
+#: extension probes on most fits; 1e0 is still >3 decades below the weakest
+#: fitted coefficient seen, and the evidence search extends past either end
+#: when its best value sits there.
+LOG_COEFFICIENT_BOUNDS = (0.0, 9.0)
 # ...but the coefficient's meaningful magnitude depends on the data units, so
 # the bracket is extended up to here when the shipped range is too narrow.
 MAX_LOG_COEFFICIENT = 18.0
+
+#: What the uncertainty products contain (`api.run(uncertainty=...)`,
+#: `--uncertainty`):
+#:   none        -- no uncertainty map, S/N map or systematic (fastest);
+#:   statistical -- the posterior width at the fitted prior strength only;
+#:   systematic  -- statistical + the prior-strength systematic (the window
+#:                  walk; docs/uncertainty.md);
+#:   bayesian    -- the posterior marginalised over the prior strength, with
+#:                  the evidence as its weight (`SingleFit.bayesian_posterior`).
+UNCERTAINTY_MODES = ("none", "statistical", "systematic", "bayesian")
+
+#: The evidence grid of `SingleFit.bayesian_posterior`, in dex about the
+#: fitted strength: a coarse pass finds the peak, a fine pass resolves it.
+#: The posterior on log10(lambda) is 0.07-0.3 dex wide on the demo series and
+#: 0.16 on REBELS-25 (claude/marginal-lambda-and-search-start.md), so 0.1 dex
+#: steps resolve it and +-1 dex about the peak holds all its weight.
+BAYES_COARSE_SPAN_DEX = 4.0
+BAYES_COARSE_STEP_DEX = 0.5
+BAYES_FINE_HALF_WIDTH_DEX = 1.0
+BAYES_FINE_STEP_DEX = 0.1
+#: grid points whose weight is below this fraction of the total are dropped
+#: from the marginal covariance (each kept point costs one inverse)
+BAYES_MIN_WEIGHT = 1e-6
+
+#: How finely the chi^2 / structure bisections locate the coefficient, in dex.
+#: Was 0.02. The data determine the coefficient far less finely than that:
+#: MacKay's posterior width on log10(lambda), sqrt(2/gamma)/ln 10, is 0.08 dex
+#: at a peak S/N of 300 on the demo and 0.7 dex at 5 (claude/mackay-lambda-
+#: test.md), so the last two or three halvings bought nothing but solves. The
+#: delivered coefficient is the bracket's midpoint, within half this of the
+#: crossing.
+BISECTION_TOLERANCE_DEX = 0.1
 
 # chi^2 = N is not always reachable. Positivity raises chi^2, and a mesh has
 # only so much freedom, so the *constrained* fit can floor above the target
@@ -3330,7 +3381,7 @@ def optimise_prior(
                     lo = mid
                 else:
                     hi = mid
-                if hi - lo < 0.02:
+                if hi - lo < BISECTION_TOLERANCE_DEX:
                     break
             best_c = 0.5 * (lo + hi)
             if not two_d:
@@ -3741,9 +3792,13 @@ class SingleFit:
             var += np.sum(img ** 2, axis=0)
         return np.sqrt(var)
 
-    def beam_snr(self, beam) -> tuple[np.ndarray, np.ndarray]:
+    def beam_snr(self, beam, mode: str = "systematic") -> tuple[np.ndarray, np.ndarray]:
         """(S/N, 1-sigma) of the model at the resolution of the restoring
         `beam` (a `beam.BeamFit`).
+
+        ``mode`` is the uncertainty mode (`UNCERTAINTY_MODES`): "statistical"
+        leaves the prior systematic out; "bayesian" is the marginal posterior
+        mean over its own marginal error (`bayesian_posterior`).
 
         The model convolved with the (peak-normalised) restoring beam, over
         its own error: the statistical part from the full covariance
@@ -3760,9 +3815,15 @@ class SingleFit:
 
         kernel = gaussian_kernel(beam, self.geometry.pixel_scale,
                                  tuple(self.geometry.shape_native))
-        smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
-        stat = self.smoothed_std(kernel)
-        sigma = np.hypot(stat, self._smoothed_systematic(kernel))
+        if mode == "bayesian":
+            post = self.bayesian_posterior
+            smooth = fftconvolve(np.nan_to_num(self.bayesian_mean_image), kernel, mode="same")
+            sigma = self.smoothed_std(kernel, cov=post["cov"])
+        else:
+            smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
+            stat = self.smoothed_std(kernel)
+            sigma = (stat if mode == "statistical"
+                     else np.hypot(stat, self._smoothed_systematic(kernel)))
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = np.where(sigma > 0, smooth / sigma, 0.0)
         return snr, sigma
@@ -3903,7 +3964,7 @@ class SingleFit:
                     system.residual_dirty_image(values, imager), chi2,
                     imager, n_data)
 
-            tolerance = structure_ratio_scatter(imager)
+            tolerance = STRUCTURE_WINDOW_N_SIGMA * structure_ratio_scatter(imager)
             if not (np.isfinite(tolerance) and tolerance > 0):
                 metric_name, imager = "chi^2", None
         if imager is None:
@@ -4098,6 +4159,7 @@ class SingleFit:
         if deblock:
             total = _deblock(total, self.geometry.oversample)
         terms = {
+            "type": "systematic",
             "statistical_median": float(np.nanmedian(stat)),
             "systematic_median": float(np.nanmedian(sys_)),
             "total_median": float(np.nanmedian(total)),
@@ -4114,6 +4176,159 @@ class SingleFit:
             "deblocked": bool(deblock),
         }
         return total, terms
+
+    def model_uncertainty_systematic(
+        self, spread_dex: float | None = None, deblock: bool = True
+    ) -> np.ndarray:
+        """The prior-systematic term of `model_uncertainty_total` alone [Jy/pixel].
+
+        Written as its own product (`uncertainty_systematic.fits`) so that a
+        user can see how much of the total comes from the choice of prior
+        strength, and drop or rescale it: it is the least certain part of the
+        error budget (see docs/uncertainty.md, "Caveats on the prior
+        systematic"). Served from the same cache as the total, so asking for
+        both costs one walk. Deblocked like the total, so the two share a grid
+        convention.
+        """
+        sys_ = self.prior_systematic(spread_dex)
+        return _deblock(sys_, self.geometry.oversample) if deblock else sys_
+
+    def model_uncertainty_statistical(self, deblock: bool = True) -> tuple[np.ndarray, dict]:
+        """The statistical 1-sigma alone, `uncertainty="statistical"`:
+        sqrt(diag(M C M^T)) at the fitted strength, deblocked like the total.
+        Conditional on the prior and its strength -- on the demo series it
+        covers the truth on 0-27% of source pixels (docs/uncertainty.md)."""
+        stat = np.asarray(self.model_uncertainty)
+        out = _deblock(stat, self.geometry.oversample) if deblock else stat
+        terms = {
+            "type": "statistical",
+            "statistical_median": float(np.nanmedian(stat)),
+            "systematic_median": 0.0,
+            "total_median": float(np.nanmedian(out)),
+            "deblocked": bool(deblock),
+        }
+        return out, terms
+
+    @functools.cached_property
+    def bayesian_posterior(self) -> dict:
+        """The posterior marginalised over the prior strength.
+
+        With the prior's shape held at the fitted one (for `adaptive`, its
+        brightness map) and only the strength lambda free, a flat prior on
+        log lambda gives p(log lambda | d) proportional to the evidence Z.
+        The image posterior is then a mixture of the conditional Gaussians,
+        whose mean and covariance are
+
+            mean = sum_k w_k s_k
+            cov  = sum_k w_k [ C_k + (s_k - mean)(s_k - mean)^T ]
+
+        (law of total variance), with s_k = (F+H_k)^-1 D, C_k = (F+H_k)^-1 and
+        w_k proportional to Z_k on a grid in log lambda. One dimension needs no
+        sampler. The grid: a coarse pass (BAYES_COARSE_*) about the fitted
+        strength locates the evidence peak -- walking further out while the
+        peak sits at an edge -- and a fine pass (BAYES_FINE_*) resolves it.
+        Each grid point is one unconstrained solve and one evidence; each
+        point kept in the mixture costs one inverse.
+
+        Unconstrained throughout: the evidence and the Gaussian posterior are
+        exact only without positivity, so the mean can dip slightly below
+        zero. On the demo series this posterior covers the truth on 56-74% of
+        source pixels against 0-41% for the conditional error with or without
+        the prior systematic (`scripts/marginal_lambda_mock.py`).
+        """
+        system, H0 = self.system, np.asarray(self.regularization_matrix)
+        cache: dict[float, tuple[np.ndarray | None, float]] = {}
+
+        def at(dex):
+            key = round(float(dex), 6)
+            if key not in cache:
+                H = 10.0 ** key * H0
+                try:
+                    v = system.solve(H, positive=False)
+                    z = float(system.log_evidence(v, H))
+                except Exception:                 # singular: no weight
+                    v, z = None, -np.inf
+                cache[key] = (v, z)
+            return cache[key][1]
+
+        started = time.perf_counter()
+        step, span = BAYES_COARSE_STEP_DEX, BAYES_COARSE_SPAN_DEX
+        coarse = list(np.arange(-span, span + 1e-9, step))
+        for d in coarse:
+            at(d)
+        # walk out while the best is at an edge
+        while True:
+            best = max(coarse, key=at)
+            if best == coarse[-1] and coarse[-1] < MAX_LOG_COEFFICIENT:
+                coarse.append(coarse[-1] + step); at(coarse[-1])
+            elif best == coarse[0] and coarse[0] > -MAX_LOG_COEFFICIENT:
+                coarse.insert(0, coarse[0] - step); at(coarse[0])
+            else:
+                break
+        fine = best + np.arange(-BAYES_FINE_HALF_WIDTH_DEX,
+                                BAYES_FINE_HALF_WIDTH_DEX + 1e-9, BAYES_FINE_STEP_DEX)
+        z = np.array([at(d) for d in fine])
+        w = np.exp(z - np.nanmax(z))
+        w = np.where(np.isfinite(w), w, 0.0)
+        w /= w.sum()
+        keep = w >= BAYES_MIN_WEIGHT
+        w_k = w[keep] / w[keep].sum()
+        F = np.asarray(system.F)
+        mean = None
+        second = None
+        for wk, d in zip(w_k, fine[keep]):
+            v = cache[round(float(d), 6)][0]
+            C = np.linalg.inv(F + 10.0 ** d * H0)
+            outer = np.outer(v, v)
+            mean = wk * v if mean is None else mean + wk * v
+            second = wk * (C + outer) if second is None else second + wk * (C + outer)
+        cov = second - np.outer(mean, mean)
+        cov = 0.5 * (cov + cov.T)
+        mu = float(np.sum(w * fine))
+        sd = float(np.sqrt(np.sum(w * (fine - mu) ** 2)))
+        info = {
+            "log10_coefficient_fitted": float(np.log10(self.coefficient)),
+            "log10_coefficient_mean": float(np.log10(self.coefficient) + mu),
+            "log10_coefficient_sd": sd,
+            "offset_from_fitted_dex": mu,
+            "n_evidence_evaluations": len(cache),
+            "n_mixture_components": int(keep.sum()),
+            "seconds": time.perf_counter() - started,
+        }
+        logger.info(
+            "Bayesian uncertainty: log10(lambda) posterior %.2f +- %.2f "
+            "(%+.2f dex from the fitted strength), %d evidence evaluations, "
+            "%d inverses, %.0f s",
+            info["log10_coefficient_mean"], sd, mu, len(cache), int(keep.sum()),
+            info["seconds"],
+        )
+        return {"mean": mean, "cov": cov, "info": info}
+
+    @functools.cached_property
+    def bayesian_mean_image(self) -> np.ndarray:
+        """The marginal posterior mean on the image grid (`bayesian_posterior`)."""
+        return self._image_from_values(self.bayesian_posterior["mean"])
+
+    def model_uncertainty_bayesian(self, deblock: bool = True) -> tuple[np.ndarray, dict]:
+        """The marginal posterior 1-sigma, `uncertainty="bayesian"` [Jy/pixel]."""
+        post = self.bayesian_posterior
+        sd = self._propagate(post["cov"])
+        out = _deblock(sd, self.geometry.oversample) if deblock else sd
+        terms = {
+            "type": "bayesian",
+            "statistical_median": float(np.nanmedian(sd)),
+            "systematic_median": 0.0,
+            "total_median": float(np.nanmedian(out)),
+            "deblocked": bool(deblock),
+            "lambda_posterior": dict(post["info"]),
+        }
+        return out, terms
+
+    def aperture_bayesian(self, region: np.ndarray) -> tuple[float, float]:
+        """(flux, 1-sigma) inside a region from the marginal posterior [Jy]."""
+        region = np.asarray(region, dtype=bool)
+        flux = float(np.sum(self.bayesian_mean_image[region]))
+        return flux, self.aperture_uncertainty(region, cov=self.bayesian_posterior["cov"])
 
     def _parameter_slice(self, obj):
         """Index range of one linear object within the stacked parameter vector."""
@@ -4139,7 +4354,7 @@ class SingleFit:
             (abs(float(np.sum(img[region])) - base) for img in images if img is not None),
             default=0.0))
 
-    def aperture_uncertainty(self, region: np.ndarray) -> float:
+    def aperture_uncertainty(self, region: np.ndarray, cov: np.ndarray | None = None) -> float:
         """1-sigma uncertainty on the summed flux inside a region [Jy].
 
         Per-pixel errors must NOT be added in quadrature: the posterior
@@ -4168,7 +4383,7 @@ class SingleFit:
         mask = self.fit.dataset.real_space_mask
         w_native = region.astype(float)
         w = np.asarray(ag.Array2D(values=w_native, mask=mask).slim)
-        cov = self.posterior_covariance
+        cov = self.posterior_covariance if cov is None else np.asarray(cov)
         var = 0.0
         for obj, _ in self.fit.inversion.reconstruction_dict.items():
             M = np.asarray(obj.mapping_matrix)
@@ -4593,7 +4808,7 @@ def fit_dataset(
                     lo = mid
                 else:
                     hi = mid
-                if hi - lo < 0.02:
+                if hi - lo < BISECTION_TOLERANCE_DEX:
                     break
             usable = [
                 (co, c) for co, c, _ in tried if np.isfinite(c) and c > 0

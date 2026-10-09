@@ -54,7 +54,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `--no-uncertainty` | off (map **on**) | Skip `uncertainty.fits` and `snr.fits` (the S/N map needs the prior-systematic window the uncertainty map measures). |
+| `--uncertainty` | `none` | What the uncertainty products contain. `none`: no `uncertainty.fits` or `snr.fits` (fastest). `statistical`: the posterior width at the fitted prior strength. `systematic`: statistical + the prior-strength systematic (also `uncertainty_systematic.fits`). `bayesian`: the posterior marginalised over the prior strength, weighted by the evidence (also `model_bayesian.fits`, the posterior mean those errors belong to). See [uncertainty.md](uncertainty.md) for how far each can be trusted. Replaces `--no-uncertainty`; old config files with `"no-uncertainty": false` run as `systematic`. |
 
 **Solver / data**
 
@@ -399,7 +399,7 @@ set. A minimal file is just:
 The rules, in full:
 
 - **A key is the flag without its dashes.** `"fov"`, `"pixel-scale"`,
-  `"no-uncertainty"`. Underscores work too (`"pixel_scale"`), as does the
+  `"no-pb"`. Underscores work too (`"pixel_scale"`), as does the
   destination a flag sets where the two differ — `"lambda"` and
   `"coefficient"` are the same parameter, as are `"scale"` and `"reg_scale"`.
   Setting one parameter twice under two names refuses rather than picking one.

@@ -2,8 +2,22 @@
 
 [← back to the README](../README.md)
 
-One map, `uncertainty.fits`, in Jy/pixel: the best total 1σ per pixel the fit
-can estimate. **It is not the denominator of a significance map.** On a model
+**Choosing what is computed (`--uncertainty`).** Off by default (`none`).
+`statistical` writes the posterior width at the fitted prior strength;
+`systematic` adds the prior-strength systematic described below;
+`bayesian` writes the posterior marginalised over the prior strength, with
+the evidence as its weight (`SingleFit.bayesian_posterior`), together with
+`model_bayesian.fits`, the posterior mean those errors belong to. The header
+key `ERRTYPE` says which. What each is worth is in "Caveats on the prior
+systematic" at the end: on the demo mocks only `bayesian` is close to
+calibrated at low S/N, and on REBELS-25 the three agree.
+
+For `systematic`, two maps, in Jy/pixel: `uncertainty.fits`, the total 1σ
+per pixel, and `uncertainty_systematic.fits`, the prior-systematic part of
+it on its own (same header). The second exists because that part is the least
+certain piece of the budget — see "Caveats on the prior systematic" below —
+and a reader should be able to see how much of the total it makes up, and to
+drop or rescale it. **It is not the denominator of a significance map.** On a model
 sampled finer than the beam neighbouring pixels are strongly anticorrelated:
 each one is poorly determined while their sum is not. On REBELS-25 (0.03"
 pixels, 0.24" beam) `model / uncertainty` peaked at ~3 on a 14.5σ source, and
@@ -179,3 +193,74 @@ properly. On our mock quadrature *overstates* a compact aperture's error by
 
 Everything above is conditional on the noise map being right and on the fitted
 hyperparameters; it does not include the uncertainty in those.
+
+## Caveats on the prior systematic
+
+The statistical term is well defined: it is the posterior width *given* the
+prior and its strength, and it was checked against Monte Carlo to 0.5%. The
+prior systematic is not a posterior quantity. It is a heuristic answer to
+"how much does the result depend on how strongly we smoothed?", and its size
+depends on choices that the data do not fix. Report the two terms separately
+(`ERRSTAT`/`ERRSYS`, `uncertainty_systematic.fits`, and the stat/sys split of
+`source_flux` in `fit_parameters.json`), and treat the systematic as an
+indication rather than a calibrated 1σ. What we know about it (Oct 2026; the
+numbers are from `scripts/figure_snr_series.py` and
+`scripts/test_structure_window.py`):
+
+- **Its size is set by the window rule, and the rule is a choice.** For a
+  `discrepancy` fit the window is where χ² stays within √(2N); for a
+  `structure` fit, where the structure ratio stays within
+  `STRUCTURE_WINDOW_N_SIGMA` × its noise scatter (default 1). Neither is a
+  posterior on the strength. On REBELS-25 the χ² rule gives ±6 dex and the
+  structure rule ±0.5 dex on the same fit; the source-flux S/N is ~1 with the
+  first and 14.5 with the second.
+- **The structure window does not open at low S/N.** The structure ratio
+  barely responds to the strength when the data are weak (0.78 → 1.12 over
+  ±6 dex on the demo at 5σ, against 0.49 → 7.1 at 300σ), so at the default
+  tolerance the window stays at its ±0.5 dex floor. On the demo mock the quoted
+  1σ then falls ~10× short of the actual error at a peak S/N of 5, and below
+  it from ~20σ down. A tolerance of 5× the scatter brings the mock's quoted
+  error above the actual error at every S/N, leaves the bright real datasets
+  unchanged (J0116 and J1446: source-flux S/N 51 and 49 either way), and
+  roughly triples the error on the faint ones (REBELS-25: S/N 14.5 → 5.4). It
+  is under test, not the default.
+- **It cannot see the smoothing bias at the fitted strength.** The structure
+  criterion over-smooths at low S/N: on the demo the strength closest to the
+  truth is 0.5–1.5 dex weaker than the one chosen, and the recovered extended
+  flux falls from 0.93 of the truth at 58σ to 0.27 at 5σ. Varying the
+  strength around the chosen value measures sensitivity, not this bias; an
+  error bar wide enough to cover it there has to come from somewhere else.
+- **Positivity inflates it at weak priors.** Non-negative solves at weak
+  priors keep the positive noise excursions and drop the negative ones, so
+  flux is added from noise; on REBELS-25 the source-region flux moves by up to
+  65% across the weak side of the window. Measuring the window with
+  unconstrained solves does not help — they fit the noise instead.
+- **Other codes mostly leave it out.** PyAutoArray's
+  `reconstruction_noise_map` is √diag((F+H)⁻¹) at a fixed coefficient; in
+  PyAutoGalaxy/PyAutoLens the coefficient is a sampled model parameter, so
+  quantities computed per sample are marginalised over it, but the per-pixel
+  noise map is not. Suyu et al. (2006) treat the strength as a delta function
+  and note that the resulting errors understate the error against the truth.
+  The EHT (2019, Paper IV) quote the spread over a "top set" of regulariser
+  weights validated on synthetic data and say explicitly that it is not a
+  posterior — the closest analogue of what is done here.
+- **Marginalising over the strength does not fix it either.** For one
+  hyperparameter the posterior on log λ is the evidence on a grid, and the
+  image posterior marginalised over it follows from the law of total variance
+  (`scripts/marginal_lambda_mock.py`; no sampler is needed in one dimension).
+  On the demo series the posterior on log₁₀ λ is only 0.07–0.28 dex wide and
+  the spread between strengths adds ≤1% to the variance. What does improve
+  the low-S/N error bars is *where* the evidence puts λ: 1–1.4 dex weaker
+  than `structure`, close to the strength nearest the truth. With the
+  unconstrained posterior at the evidence optimum, the fraction of source
+  pixels whose error lies within the quoted 1σ is 0.57–0.71 at peak S/N ≤ 58
+  (0.68 if calibrated) against 0.02–0.35 for the shipped `structure` fit, and
+  the recovered extended flux is 0.72–0.98 against 0.27–0.93. At high S/N
+  every version under-covers (≈0.5), from resolution, not from λ.
+- **Better-founded alternatives, not yet implemented.** MacKay (1992) gives
+  the width of the posterior on the strength, σ(ln λ) ≈ √(2/γ) with γ the
+  effective number of well-determined parameters, which would set the window
+  from the fit itself; and the residual-based literature (Rust & O'Leary 2008;
+  Hansen et al. 2006) shows the expected residual of a correctly regularised
+  fit is *below* the raw noise, which suggests the structure ratio's target
+  should be below 1 (≈0.9 on the demo) — removing much of the bias above.

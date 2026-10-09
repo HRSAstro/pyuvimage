@@ -41,7 +41,7 @@
   "cube-prior": "mfs",
 
   "_products": "what is written alongside the model image.",
-  "no-uncertainty": false,
+  "uncertainty": "none",
   "no-pb": false,
   "dish-diameter": null,
 
