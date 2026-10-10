@@ -2134,13 +2134,6 @@ def _products_for(
     uncertainty = None
     uncertainty_terms = None
     model_bayesian = None
-    if uncertainty_mode == "bayesian" and getattr(sf, "solution", None) is not None \
-            and len(getattr(sf.solution, "grid_positions", []) or []):
-        logger.warning(
-            "--uncertainty bayesian is not available with point components "
-            "(their amplitudes are not in the marginalised system); using "
-            "--uncertainty statistical for this fit")
-        uncertainty_mode = "statistical"
     started = time.time()
     try:
         if uncertainty_mode == "statistical":
@@ -2149,7 +2142,13 @@ def _products_for(
                         uncertainty_terms["total_median"])
         elif uncertainty_mode == "bayesian":
             uncertainty, uncertainty_terms = sf.model_uncertainty_bayesian()
-            model_bayesian = sf.bayesian_mean_image
+            # extended mean plus the points at their Bayesian fluxes, as
+            # model.fits carries the points at theirs
+            from .products import add_points
+
+            model_bayesian = add_points(sf.bayesian_mean_image,
+                                        getattr(sf, "points", None),
+                                        geometry.pixel_scale, "flux_bayesian")
             logger.info("model uncertainty (Bayesian, marginalised over the prior "
                         "strength): median %.3g Jy/pixel", uncertainty_terms["total_median"])
     except Exception as e:  # never let the error bar kill the fit

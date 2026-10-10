@@ -3542,6 +3542,62 @@ def _deblock(image: np.ndarray, oversample: int) -> np.ndarray:
     return np.where(finite, smoothed, np.nan)
 
 
+def evidence_grid(at) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The grid in log10 lambda (dex about the fitted strength) that
+    `SingleFit.bayesian_posterior` marginalises over, and its weights.
+
+    ``at(dex)`` returns ln Z at that offset (-inf where the system is
+    singular) and should cache its own solves: a coarse pass
+    (BAYES_COARSE_*) locates the evidence peak -- walking further out while
+    the peak sits at an edge -- and a fine pass (BAYES_FINE_*) resolves it.
+    Returns (fine offsets, normalised weights, mask of the weights kept,
+    w >= BAYES_MIN_WEIGHT).
+    """
+    step, span = BAYES_COARSE_STEP_DEX, BAYES_COARSE_SPAN_DEX
+    coarse = list(np.arange(-span, span + 1e-9, step))
+    for d in coarse:
+        at(d)
+    # walk out while the best is at an edge
+    while True:
+        best = max(coarse, key=at)
+        if best == coarse[-1] and coarse[-1] < MAX_LOG_COEFFICIENT:
+            coarse.append(coarse[-1] + step); at(coarse[-1])
+        elif best == coarse[0] and coarse[0] > -MAX_LOG_COEFFICIENT:
+            coarse.insert(0, coarse[0] - step); at(coarse[0])
+        else:
+            break
+    fine = best + np.arange(-BAYES_FINE_HALF_WIDTH_DEX,
+                            BAYES_FINE_HALF_WIDTH_DEX + 1e-9, BAYES_FINE_STEP_DEX)
+    z = np.array([at(d) for d in fine])
+    w = np.exp(z - np.nanmax(z))
+    w = np.where(np.isfinite(w), w, 0.0)
+    w /= w.sum()
+    return fine, w, w >= BAYES_MIN_WEIGHT
+
+
+def lambda_posterior_info(coefficient, fine, w, keep, n_evaluations, started) -> dict:
+    """The record `bayesian_posterior` keeps of the posterior on log10 lambda."""
+    mu = float(np.sum(w * fine))
+    sd = float(np.sqrt(np.sum(w * (fine - mu) ** 2)))
+    info = {
+        "log10_coefficient_fitted": float(np.log10(coefficient)),
+        "log10_coefficient_mean": float(np.log10(coefficient) + mu),
+        "log10_coefficient_sd": sd,
+        "offset_from_fitted_dex": mu,
+        "n_evidence_evaluations": int(n_evaluations),
+        "n_mixture_components": int(keep.sum()),
+        "seconds": time.perf_counter() - started,
+    }
+    logger.info(
+        "Bayesian uncertainty: log10(lambda) posterior %.2f +- %.2f "
+        "(%+.2f dex from the fitted strength), %d evidence evaluations, "
+        "%d inverses, %.0f s",
+        info["log10_coefficient_mean"], sd, mu, n_evaluations, int(keep.sum()),
+        info["seconds"],
+    )
+    return info
+
+
 @dataclass
 class SingleFit:
     """Everything downstream products need from one fit.
@@ -3857,26 +3913,7 @@ class SingleFit:
             return cache[key][1]
 
         started = time.perf_counter()
-        step, span = BAYES_COARSE_STEP_DEX, BAYES_COARSE_SPAN_DEX
-        coarse = list(np.arange(-span, span + 1e-9, step))
-        for d in coarse:
-            at(d)
-        # walk out while the best is at an edge
-        while True:
-            best = max(coarse, key=at)
-            if best == coarse[-1] and coarse[-1] < MAX_LOG_COEFFICIENT:
-                coarse.append(coarse[-1] + step); at(coarse[-1])
-            elif best == coarse[0] and coarse[0] > -MAX_LOG_COEFFICIENT:
-                coarse.insert(0, coarse[0] - step); at(coarse[0])
-            else:
-                break
-        fine = best + np.arange(-BAYES_FINE_HALF_WIDTH_DEX,
-                                BAYES_FINE_HALF_WIDTH_DEX + 1e-9, BAYES_FINE_STEP_DEX)
-        z = np.array([at(d) for d in fine])
-        w = np.exp(z - np.nanmax(z))
-        w = np.where(np.isfinite(w), w, 0.0)
-        w /= w.sum()
-        keep = w >= BAYES_MIN_WEIGHT
+        fine, w, keep = evidence_grid(at)
         w_k = w[keep] / w[keep].sum()
         F = np.asarray(system.F)
         mean = None
@@ -3889,24 +3926,7 @@ class SingleFit:
             second = wk * (C + outer) if second is None else second + wk * (C + outer)
         cov = second - np.outer(mean, mean)
         cov = 0.5 * (cov + cov.T)
-        mu = float(np.sum(w * fine))
-        sd = float(np.sqrt(np.sum(w * (fine - mu) ** 2)))
-        info = {
-            "log10_coefficient_fitted": float(np.log10(self.coefficient)),
-            "log10_coefficient_mean": float(np.log10(self.coefficient) + mu),
-            "log10_coefficient_sd": sd,
-            "offset_from_fitted_dex": mu,
-            "n_evidence_evaluations": len(cache),
-            "n_mixture_components": int(keep.sum()),
-            "seconds": time.perf_counter() - started,
-        }
-        logger.info(
-            "Bayesian uncertainty: log10(lambda) posterior %.2f +- %.2f "
-            "(%+.2f dex from the fitted strength), %d evidence evaluations, "
-            "%d inverses, %.0f s",
-            info["log10_coefficient_mean"], sd, mu, len(cache), int(keep.sum()),
-            info["seconds"],
-        )
+        info = lambda_posterior_info(self.coefficient, fine, w, keep, len(cache), started)
         return {"mean": mean, "cov": cov, "info": info}
 
     @functools.cached_property

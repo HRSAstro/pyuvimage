@@ -165,15 +165,22 @@ def model_with_points(p, pixel_scale: float) -> np.ndarray:
     analytically. Shared by the FITS writer and the summary panel so the two
     can never disagree -- the summary used to drop points entirely.
     """
-    img = np.array(p.model_image)
-    if not p.points:
-        return img
+    return add_points(p.model_image, p.points, pixel_scale)
+
+
+def add_points(image, points, pixel_scale: float, flux_attr: str = "flux") -> np.ndarray:
+    """A copy of ``image`` with each point's ``flux_attr`` in its nearest pixel
+    (`model_with_points`; ``"flux_bayesian"`` for `model_bayesian.fits`)."""
+    img = np.array(image)
     n = img.shape[0]
-    for pt in p.points:
+    for pt in points or []:
+        flux = getattr(pt, flux_attr, None)
+        if flux is None:
+            continue
         row = int(round((n - 1) / 2 - pt.d_dec / pixel_scale))
         col = int(round((n - 1) / 2 - pt.d_ra / pixel_scale))
         if 0 <= row < n and 0 <= col < img.shape[1]:
-            img[row, col] += pt.flux
+            img[row, col] += flux
     return img
 
 
@@ -305,7 +312,8 @@ def write_products(
             w("model_bayesian.fits", stack("model_bayesian"),
               hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra={
                   "COMMENT": "posterior mean marginalised over the prior strength "
-                             "(unconstrained); its 1-sigma is uncertainty.fits"}))
+                             "(unconstrained; points at their Bayesian fluxes in "
+                             "the nearest pixel); its 1-sigma is uncertainty.fits"}))
         # S/N at the restoring beam's resolution, not model / uncertainty
         # pixel by pixel: a model sampled finer than the beam has strongly
         # anticorrelated neighbours, so the per-pixel ratio read ~1/3 of the

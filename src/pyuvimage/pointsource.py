@@ -50,33 +50,33 @@ class PointSource:
     d_ra: float          # offset from the phase centre [arcsec], +ve East
     d_dec: float         # offset from the phase centre [arcsec], +ve North
     flux: float          # Jy
-    flux_error: float    # 1 sigma, Jy: statistical and systematic combined
+    flux_error: float    # 1 sigma, Jy: statistical, at the delivered prior strength
     user_supplied: bool = False
-    flux_error_stat: float = 0.0   # from the amplitude covariance alone
-    flux_error_sys: float = 0.0    # from the choice of prior strength
+    #: `--uncertainty bayesian` only: the amplitude's mean and 1 sigma
+    #: marginalised over the prior strength (`PointAugmentedFit.bayesian_posterior`)
+    flux_bayesian: float | None = None
+    flux_error_bayesian: float | None = None
 
     @property
     def significance(self) -> float:
-        """Detection significance, on the *statistical* error only.
-
-        The systematic below is a scale uncertainty on an already-detected
-        source; folding it into the detection significance would make a real
-        point source look marginal because we are unsure of its brightness.
-        """
-        err = self.flux_error_stat or self.flux_error
+        """Detection significance: flux over its statistical error, the
+        quantity the detection cut was applied to."""
+        err = self.flux_error
         return abs(self.flux) / err if err > 0 else np.inf
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "d_ra_arcsec": float(self.d_ra),
             "d_dec_arcsec": float(self.d_dec),
             "flux_jy": float(self.flux),
             "flux_error_jy": float(self.flux_error),
-            "flux_error_stat_jy": float(self.flux_error_stat),
-            "flux_error_sys_jy": float(self.flux_error_sys),
             "significance": float(self.significance),
             "position": "user" if self.user_supplied else "auto-detected",
         }
+        if self.flux_bayesian is not None:
+            out["flux_bayesian_jy"] = float(self.flux_bayesian)
+            out["flux_error_bayesian_jy"] = float(self.flux_error_bayesian)
+        return out
 
 
 def image_to_sky(x: float, y: float) -> tuple[float, float]:
@@ -772,6 +772,28 @@ class AugmentedSystem:
     def chi_squared(self, positions) -> float:
         return self.solve(positions)[2]
 
+    def log_evidence(self, positions):
+        """(mesh, amplitudes, amplitude covariance, ln Z) at the current scale.
+
+        The evidence of the joint mesh + point model with no prior on the
+        amplitudes, up to a constant that does not depend on the scale:
+
+            ln Z = -1/2 [chi^2 + s^T H s + ln det(F + H) + ln det S - ln det H]
+
+        ln det(F + H) + ln det S is the log determinant of the whole bordered
+        matrix [[F+H, B], [B^T, C]], split the way `solve` eliminates the mesh;
+        ln det H is taken as n_mesh ln(scale), dropping ln det H0, which is
+        the same at every scale. For comparing scales only -- the absolute
+        value is not the mesh-only `LinearSystem.log_evidence`.
+        """
+        mesh, amps, chi2, Saa = self.solve(positions)
+        H = self.h_scale * self.H
+        log_det_FH = 2.0 * np.sum(np.log(np.diag(self._cho[0])))
+        log_det_S = -np.linalg.slogdet(Saa)[1] if len(amps) else 0.0
+        log_det_H = self.n_mesh * np.log(self.h_scale)
+        z = -0.5 * (chi2 + mesh @ H @ mesh + log_det_FH + log_det_S - log_det_H)
+        return mesh, amps, Saa, float(z)
+
     def model_visibilities(self, mesh_values, positions, amplitudes) -> np.ndarray:
         vis = self.mesh.forward(mesh_values)
         if len(positions):
@@ -1314,40 +1336,11 @@ def fit_point_sources(
                         2.3548 * best_sigma / float(beam_fwhm), gain,
                     )
 
-    # Systematic on the amplitude: how far it moves when the regularisation
-    # strength is varied over the range that is defensible for these data.
-    # The split of flux between a point and the mesh underneath it is broken
-    # only by the prior, so the amplitude inherits the prior's arbitrariness.
-    # Without this the quoted error is purely statistical and conditional on
-    # one strength, and it is badly optimistic -- across the generalisation
-    # mocks it gave pulls of up to 24 sigma on fluxes only 20% off.
-    sys_err = np.zeros(len(accepted))
-    if accepted:
-        held = system.h_scale
-        alternatives = [held * 3.0, held / 3.0]
-        if factor != 1.0:
-            alternatives.append(held / factor)   # the un-retuned strength
-        deviations = []
-        for alt_scale in alternatives:
-            if not system.set_regularization_scale(alt_scale):
-                continue
-            try:
-                alt = system.solve(accepted)[1]
-            except (np.linalg.LinAlgError, ValueError):
-                continue
-            if len(alt) == len(amps):
-                deviations.append(np.abs(np.asarray(alt) - np.asarray(amps)))
-        system.set_regularization_scale(held)
-        if deviations:
-            sys_err = np.max(np.vstack(deviations), axis=0)
-
     points = [
         PointSource(
             *grid_to_sky(y, x), flux=float(a),
-            flux_error=float(np.hypot(np.sqrt(max(cov[i, i], 0.0)), sys_err[i])),
+            flux_error=float(np.sqrt(max(cov[i, i], 0.0))),
             user_supplied=user_flags[i] if i < len(user_flags) else False,
-            flux_error_stat=float(np.sqrt(max(cov[i, i], 0.0))),
-            flux_error_sys=float(sys_err[i]),
         )
         for i, ((y, x), a) in enumerate(zip(accepted, amps))
     ]
@@ -1497,17 +1490,7 @@ class PointAugmentedFit:
     @property
     def model_image(self) -> np.ndarray:
         """The *extended* model on the product grid; points are separate."""
-        import autogalaxy as ag
-
-        for obj, _ in self._sf.fit.inversion.reconstruction_dict.items():
-            if type(obj).__name__ == "Mapper":
-                slim = np.asarray(obj.mapping_matrix) @ self.solution.mesh_values
-                return np.asarray(
-                    ag.Array2D(
-                        values=slim, mask=self._sf.fit.dataset.real_space_mask
-                    ).native
-                )
-        raise RuntimeError("no mesh in the inversion")
+        return self._mesh_image(self.solution.mesh_values)
 
     @property
     def sampling_covariance(self) -> np.ndarray:
@@ -1541,6 +1524,125 @@ class PointAugmentedFit:
 
         return SingleFit.model_uncertainty_statistical(self, deblock)
 
+    def _mesh_image(self, mesh_values: np.ndarray) -> np.ndarray:
+        """Mesh values on the product grid, through the mesh's mapping matrix."""
+        import autogalaxy as ag
+
+        for obj, _ in self._sf.fit.inversion.reconstruction_dict.items():
+            if type(obj).__name__ == "Mapper":
+                slim = np.asarray(obj.mapping_matrix) @ np.asarray(mesh_values)
+                return np.asarray(
+                    ag.Array2D(
+                        values=slim, mask=self._sf.fit.dataset.real_space_mask
+                    ).native
+                )
+        raise RuntimeError("no mesh in the inversion")
+
+    def _joint_covariance(self) -> np.ndarray:
+        """Covariance of (mesh values, point amplitudes) at the delivered prior."""
+        sysm, sol = self.solution.system, self.solution
+        _, B, _ = sysm._column_terms(sol.grid_positions)
+        MinvB = cho_solve(sysm._cho, B, check_finite=False)
+        Caa = np.asarray(sol.amplitude_covariance)
+        Csa = -MinvB @ Caa
+        return np.block([[self.posterior_covariance, Csa], [Csa.T, Caa]])
+
+    @functools.cached_property
+    def bayesian_posterior(self) -> dict:
+        """`SingleFit.bayesian_posterior` with the point amplitudes in it.
+
+        For each strength lambda on the evidence grid the mesh and the
+        amplitudes are solved together (positions held at the fitted ones,
+        unconstrained, no prior on the amplitudes), and the evidence is
+
+            ln Z = -1/2 [chi^2 + s^T H s + ln det(F + H) + ln det S - ln det H] + const
+
+        with S = C - B^T (F+H)^-1 B the amplitudes' curvature once the mesh
+        is allowed to trade flux with them (`AugmentedSystem.solve`). The
+        flat prior on the amplitudes adds only a constant, which cancels in
+        the weights. The mixture is then taken over the joint vector
+        (s, a), so the amplitudes' marginal error includes how far they move
+        with lambda -- what the old +-0.5 dex point-flux systematic tried to
+        capture by hand.
+
+        Returns `SingleFit.bayesian_posterior`'s keys for the mesh ("mean",
+        "cov", "info") plus "amp_mean", "amp_cov" and "joint_cov", and
+        records each point's Bayesian flux and error on the point itself
+        (`PointSource.flux_bayesian`, `flux_error_bayesian`), so
+        `point_sources.json` carries them.
+        """
+        import time
+
+        from .fitting import evidence_grid, lambda_posterior_info
+
+        sol = self.solution
+        if not sol.grid_positions:
+            return self._sf.bayesian_posterior
+        system, positions = sol.system, sol.grid_positions
+        held = float(system.h_scale)
+        n_mesh = system.n_mesh
+        _, B, _ = system._column_terms(positions)
+        cache: dict[float, tuple] = {}
+
+        def at(dex):
+            key = round(float(dex), 6)
+            if key not in cache:
+                scale = held * 10.0 ** key
+                try:
+                    if not system.set_regularization_scale(scale):
+                        raise np.linalg.LinAlgError("F + H not positive definite")
+                    mesh, amps, Saa, z = system.log_evidence(positions)
+                    cache[key] = ((mesh, amps, Saa), z)
+                except Exception:                 # singular: no weight
+                    cache[key] = (None, -np.inf)
+            return cache[key][1]
+
+        started = time.perf_counter()
+        try:
+            fine, w, keep = evidence_grid(at)
+            w_k = w[keep] / w[keep].sum()
+            mean = second = None
+            for wk, d in zip(w_k, fine[keep]):
+                mesh, amps, Saa = cache[round(float(d), 6)][0]
+                system.set_regularization_scale(held * 10.0 ** d)
+                Minv = cho_solve(system._cho, np.eye(n_mesh), check_finite=False)
+                MinvB = Minv @ B
+                Csa = -MinvB @ Saa
+                C = np.block([[Minv + MinvB @ Saa @ MinvB.T, Csa], [Csa.T, Saa]])
+                theta = np.concatenate([mesh, amps])
+                mean = wk * theta if mean is None else mean + wk * theta
+                term = wk * (C + np.outer(theta, theta))
+                second = term if second is None else second + term
+        finally:
+            # the system is shared with everything else: hand it back as found
+            system.set_regularization_scale(held)
+        cov = second - np.outer(mean, mean)
+        cov = 0.5 * (cov + cov.T)
+        info = lambda_posterior_info(self.coefficient, fine, w, keep, len(cache), started)
+        amp_mean, amp_cov = mean[n_mesh:], cov[n_mesh:, n_mesh:]
+        for i, pt in enumerate(sol.points):
+            pt.flux_bayesian = float(amp_mean[i])
+            pt.flux_error_bayesian = float(np.sqrt(max(amp_cov[i, i], 0.0)))
+        return {"mean": mean[:n_mesh], "cov": cov[:n_mesh, :n_mesh],
+                "amp_mean": amp_mean, "amp_cov": amp_cov, "joint_cov": cov,
+                "info": info}
+
+    @functools.cached_property
+    def bayesian_mean_image(self) -> np.ndarray:
+        """The extended part of the marginal posterior mean, on the image grid."""
+        if not self.solution.grid_positions:
+            return self._sf.bayesian_mean_image
+        return self._mesh_image(self.bayesian_posterior["mean"])
+
+    def model_uncertainty_bayesian(self, deblock: bool = True):
+        """`SingleFit.model_uncertainty_bayesian` on the joint posterior above:
+        the extended model's marginal 1-sigma, amplitudes marginalised out."""
+        from .fitting import SingleFit
+
+        if not self.solution.grid_positions:
+            return self._sf.model_uncertainty_bayesian(deblock)
+        return SingleFit.model_uncertainty_bayesian(self, deblock)
+
     def beam_snr(self, beam, mode: str = "statistical") -> tuple[np.ndarray, np.ndarray]:
         """`SingleFit.beam_snr` for the extended model *plus* the points.
 
@@ -1549,9 +1651,9 @@ class PointAugmentedFit:
         error uses the joint covariance of mesh and amplitudes, whose
         cross-term matters: a point and the mesh under it trade flux, so
         their errors are anticorrelated and adding them independently would
-        overstate the error at the point.
+        overstate the error at the point. ``mode="bayesian"`` uses the
+        marginal posterior's mean and joint covariance (`bayesian_posterior`).
         """
-        from scipy.linalg import cho_solve
         from scipy.signal import fftconvolve
 
         from .beam import gaussian_kernel
@@ -1560,23 +1662,22 @@ class PointAugmentedFit:
         if not sol.grid_positions:
             return sf.beam_snr(beam, mode=mode)
         if mode == "bayesian":
-            raise ValueError("Bayesian uncertainties are not available with point components")
+            post = self.bayesian_posterior
+            mesh_img, amps, joint = (self.bayesian_mean_image, post["amp_mean"],
+                                     post["joint_cov"])
+        else:
+            mesh_img, amps, joint = (self.model_image, np.asarray(sol.amplitudes),
+                                     self._joint_covariance())
         kernel = gaussian_kernel(beam, sf.geometry.pixel_scale,
                                  tuple(sf.geometry.shape_native))
-        sysm = sol.system
-        _, B, _ = sysm._column_terms(sol.grid_positions)
-        MinvB = cho_solve(sysm._cho, B, check_finite=False)
-        Caa = np.asarray(sol.amplitude_covariance)
-        Csa = -MinvB @ Caa
-        joint = np.block([[self.posterior_covariance, Csa], [Csa.T, Caa]])
         geom = sf.geometry
         unit = [restore_points(geom.shape_native, geom.pixel_scale,
                                [PointSource(p.d_ra, p.d_dec, flux=1.0,
                                             flux_error=0.0)], beam)
                 for p in self.points]
         extra = np.asarray(unit)
-        smooth = fftconvolve(np.nan_to_num(self.model_image), kernel, mode="same")
-        smooth = smooth + np.tensordot(np.asarray(sol.amplitudes), extra, axes=1)
+        smooth = fftconvolve(np.nan_to_num(mesh_img), kernel, mode="same")
+        smooth = smooth + np.tensordot(np.asarray(amps), extra, axes=1)
         sigma = sf.smoothed_std(kernel, cov=joint, extra=extra)
         with np.errstate(invalid="ignore", divide="ignore"):
             snr = np.where(sigma > 0, smooth / sigma, 0.0)

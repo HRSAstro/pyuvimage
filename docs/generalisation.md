@@ -47,7 +47,7 @@ recurring problem — recovered at x0.52 in the crowded field, missed outright
 in three others: a point on top of bright compact extended emission is
 genuinely degenerate with it, and the prior is what breaks the tie. The other
 outliers are at the highest S/N (pulls of 7-8 on fluxes 2% off), where the
-systematic term stops keeping up; see the uncertainty section.
+statistical error is far too small; see point-sources.md.
 
 Below, the same nine fits drawn out — dirty image, model, reconvolved model,
 residual and total uncertainty, with true points marked in green and fitted
@@ -82,7 +82,9 @@ Six real defects came out of this, all fixed:
    Once the points are known the map is rebuilt from the extended model alone
    and the fit repeated: 110% and 100%, and the false positives disappeared.
 6. **Point flux errors were statistical only**, giving pulls to 24 sigma. A
-   prior-strength systematic is now added in quadrature.
+   prior-strength systematic was added in quadrature for a time; it was
+   removed in Oct 2026 (an uncalibrated heuristic), and these pulls are back
+   for points on extended emission -- see point-sources.md.
 
 **What still fails, loudly.** A field of view that does not contain the
 emission is unrecoverable: chi^2/N runs to 350, and the point fitter, given a

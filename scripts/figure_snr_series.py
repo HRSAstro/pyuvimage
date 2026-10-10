@@ -18,11 +18,9 @@ to stop trusting the tool.
 
 Writes figures/snr_series.{pdf,png} (criterion `structure`, uncertainty
 `statistical`), or figures/snr_series_<criterion>_<uncertainty>.{pdf,png} for
-any other pair. The uncertainty row is statistical because the mock carries a
-point component and `--uncertainty bayesian` is not available with point
-components (it falls back to statistical wherever a point is found, which
-would mix the two across the series); the Bayesian comparison is
-`marginal_lambda_mock.py`.
+any other pair. Point error bars are the statistical `flux_error_jy`, or the
+Bayesian `flux_error_bayesian_jy` (and flux) with `--uncertainty bayesian`.
+The Bayesian comparison of the extended model is `marginal_lambda_mock.py`.
 """
 
 from __future__ import annotations
@@ -133,7 +131,12 @@ def _load(i: int):
     rms = float(hdr["RMS"])
     return {
         "dirty": dirty,
-        "model": fits.getdata(d / "model.fits").astype(float),
+        # in bayesian mode the errors belong to the marginal posterior mean,
+        # so that is what the flux and error panels score
+        "model": fits.getdata(d / ("model_bayesian.fits"
+                                   if UNCERTAINTY == "bayesian"
+                                   and (d / "model_bayesian.fits").exists()
+                                   else "model.fits")).astype(float),
         # the restored image: at six columns across a page a one-pixel delta
         # is smaller than a rendered pixel and simply disappears, so the top
         # row shows the model convolved with the beam, which is also what a
@@ -234,12 +237,15 @@ def plot() -> None:
     mesh_ratio, pt_ratio, pt_err, sig, detected = [], [], [], [], []
     for _, r in runs:
         total = float(np.nansum(r["model"]))
-        pf = sum(p["flux_jy"] for p in r["points"])
+        pf = sum(p.get("flux_bayesian_jy", p["flux_jy"]) if UNCERTAINTY == "bayesian"
+                 else p["flux_jy"] for p in r["points"])
         mesh_ratio.append((total - pf) / truth_ext)
         if r["points"]:
             p0 = r["points"][0]
-            pt_ratio.append(p0["flux_jy"] / geo["point_flux"])
-            pt_err.append(p0["flux_error_jy"] / geo["point_flux"])
+            bayes = UNCERTAINTY == "bayesian" and "flux_bayesian_jy" in p0
+            pt_ratio.append(p0["flux_bayesian_jy" if bayes else "flux_jy"] / geo["point_flux"])
+            pt_err.append(p0["flux_error_bayesian_jy" if bayes else "flux_error_jy"]
+                          / geo["point_flux"])
             sig.append(p0["significance"])
             detected.append(True)
         else:

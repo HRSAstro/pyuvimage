@@ -31,8 +31,9 @@ and the covariance are the marginal posterior's (`model_bayesian.fits` and its
 covariance). With point components the points are added as the restoring beam
 at their fitted positions, and the error uses the joint covariance of mesh
 and amplitudes, whose cross-term is negative (a point and the mesh beneath it
-trade flux); `bayesian` is not available with point components and falls back
-to `statistical` with a warning. The header carries the beam it refers to.
+trade flux); in `bayesian` mode that joint covariance is the marginal one,
+with the amplitudes in the mixture (see "Point sources" below). The header
+carries the beam it refers to.
 
 **For a number to quote, use a region.** Every run reports one: `source_flux`
 in `fit_parameters.json`, and a line in the log — the flux inside the region
@@ -90,6 +91,27 @@ so it differs from `model.fits`: on the demo mocks the evidence sits 1–1.4 dex
 weaker than `structure` (a sharper, lumpier map); on REBELS-25, 0.5 dex
 stronger. On bright sources the two agree (REBELS-25 source flux 1.20 vs
 1.17 mJy).
+
+## Point sources
+
+Point components are solved together with the mesh, with no prior on their
+amplitudes. `point_sources.json` always carries each point's statistical
+error (`flux_error_jy`, at the delivered prior strength, the mesh
+marginalised out). With `--uncertainty bayesian` the amplitudes go into the
+evidence-weighted mixture with the mesh: at each λ the joint system is
+solved, its evidence is
+
+    ln Z = −½ [χ² + sᵀHs + ln det(F+H) + ln det S − ln det H] + const
+
+(S = C − Bᵀ(F+H)⁻¹B, the amplitudes' curvature with the mesh marginalised
+out; the flat amplitude prior adds only a constant), and the mixture is taken
+over (s, a) together. Each point then gets `flux_bayesian_jy` ±
+`flux_error_bayesian_jy`; `model_bayesian.fits` carries the points at those
+fluxes; `uncertainty.fits` is the extended model's marginal error with the
+amplitudes marginalised out; `snr.fits` uses the joint marginal covariance.
+On the demo S/N series (one 4 mJy point beside a disc) the Bayesian pulls are
+0.2–1.0 against 1.4–1.7 statistical; where a point sits on extended emission
+both under-state the error badly (docs/point-sources.md).
 
 ## How far each can be trusted
 

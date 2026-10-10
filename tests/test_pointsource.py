@@ -288,27 +288,67 @@ def test_retune_survives_a_singular_curvature():
     assert np.isfinite(system.chi_squared(pos))
 
 
-def test_error_bars_include_the_prior_systematic(crowded):
-    """A purely statistical error is optimistic by an order of magnitude.
+def test_point_errors_are_statistical_and_bayesian_ones_marginalise_lambda(crowded):
+    """`flux_error` is the amplitude's statistical 1 sigma, sqrt(S^-1_ii) at
+    the delivered prior; the fixed +-0.5 dex systematic once added to it is
+    gone. `--uncertainty bayesian` adds the amplitude marginalised over the
+    prior strength (`PointAugmentedFit.bayesian_posterior`)."""
+    from pyuvimage.pointsource import PointAugmentedFit
 
-    The split of flux between a point and the mesh under it is broken only by
-    the prior, so the amplitude inherits the prior's arbitrariness.  Across
-    the generalisation mocks, statistical-only errors gave pulls up to 24
-    sigma on fluxes that were 20% off.
-    """
     uvd, _, geom, comps = crowded
     _, ds, fit = _system(uvd, geom)
     sol = fit_point_sources(
         fit.fit.inversion, ds, geom, beam_fwhm=_beam(ds, geom))
     assert sol.points
-    for p in sol.points:
-        assert p.flux_error >= p.flux_error_stat
+    for i, p in enumerate(sol.points):
         assert p.flux_error == pytest.approx(
-            np.hypot(p.flux_error_stat, p.flux_error_sys), rel=1e-9)
-        # significance stays on the statistical error: a scale uncertainty
-        # must not make a real detection look marginal
-        assert p.significance == pytest.approx(
-            abs(p.flux) / p.flux_error_stat, rel=1e-9)
+            np.sqrt(sol.amplitude_covariance[i, i]), rel=1e-12)
+        assert p.significance == pytest.approx(abs(p.flux) / p.flux_error, rel=1e-12)
+        assert "flux_error_sys_jy" not in p.as_dict()
+        assert "flux_bayesian_jy" not in p.as_dict()
+
+    held = sol.system.h_scale
+    pa = PointAugmentedFit(fit, sol)
+    post = pa.bayesian_posterior
+    assert sol.system.h_scale == held            # the shared system is handed back
+    k, n = len(sol.points), sol.system.n_mesh
+    assert post["joint_cov"].shape == (n + k, n + k)
+    assert np.all(np.linalg.eigvalsh(post["amp_cov"]) > 0)
+    for i, p in enumerate(sol.points):
+        assert p.flux_bayesian == pytest.approx(post["amp_mean"][i])
+        assert p.flux_error_bayesian == pytest.approx(np.sqrt(post["amp_cov"][i, i]))
+        assert {"flux_bayesian_jy", "flux_error_bayesian_jy"} <= set(p.as_dict())
+    mesh_sd, terms = pa.model_uncertainty_bayesian(deblock=False)
+    np.testing.assert_allclose(mesh_sd, fit._propagate(post["cov"]), rtol=1e-12)
+    assert terms["type"] == "bayesian"
+
+
+def test_the_point_evidence_is_the_bordered_systems(crowded):
+    """`AugmentedSystem.log_evidence` splits ln det of the bordered matrix
+    [[F+H, B], [B^T, C]] as ln det(F+H) + ln det S, and drops ln det H0. Its
+    differences between strengths must equal the brute-force evidence's."""
+    uvd, _, geom, comps = crowded
+    system, ds, fit = _system(uvd, geom)
+    pos = [sky_to_grid(*c["centre"]) for c in comps["points"]]
+
+    def brute(scale):
+        _, B, Dp = system._column_terms(pos)
+        P = system._column_terms(pos)[0]
+        C = system._point_gram(pos, None, P)
+        H = scale * system.H
+        G = np.block([[system.F + H, B], [B.T, C]])
+        theta = np.linalg.solve(G, np.concatenate([system.D, Dp]))
+        s = theta[:system.n_mesh]
+        F_aug = np.block([[system.F, B], [B.T, C]])
+        chi2 = system.chi2_const + theta @ F_aug @ theta - 2 * theta @ np.concatenate([system.D, Dp])
+        return -0.5 * (chi2 + s @ H @ s + np.linalg.slogdet(G)[1] - np.linalg.slogdet(H)[1])
+
+    z = {}
+    for scale in (0.1, 1.0, 10.0):
+        assert system.set_regularization_scale(scale)
+        z[scale] = system.log_evidence(pos)[3]
+    for scale in (0.1, 10.0):
+        assert z[scale] - z[1.0] == pytest.approx(brute(scale) - brute(1.0), abs=1e-4)
 
 
 def test_point_fitting_is_refused_when_the_mesh_fit_has_not_converged(caplog):

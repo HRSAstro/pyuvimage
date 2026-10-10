@@ -431,3 +431,21 @@ def test_uncertainty_is_data_independent_and_prior_shaped():
                           "ell_floor": 0.25})
     spread = lambda a: float(np.percentile(a, 99) / np.percentile(a, 50))
     assert spread(ug) > spread(u1), "non-stationary prior shows no structure"
+
+
+def test_bayesian_mode_with_point_sources(tmp_path):
+    """The point amplitudes are in the marginalised system: no fallback to
+    statistical, and point_sources.json carries the Bayesian fluxes."""
+    uvd, truth, geom, comps = mock.make_demo_dataset(n_vis=600, point_flux_jy=0.004, seed=3)
+    out = tmp_path / "bp"
+    pyuvimage.run(uvd, fov=3.0, mesh_shape=(16, 16), out=out, reg="matern",
+                  point_sources=True, uncertainty="bayesian")
+    pts = json.loads((out / "point_sources.json").read_text())["points"]
+    assert pts
+    for p in pts:
+        assert p["flux_error_bayesian_jy"] > 0 and np.isfinite(p["flux_bayesian_jy"])
+        assert "flux_error_sys_jy" not in p
+    assert fits.getheader(out / "uncertainty.fits")["ERRTYPE"].strip() == "bayesian"
+    assert (out / "model_bayesian.fits").exists()
+    snr = fits.getdata(out / "snr.fits")
+    assert np.isfinite(snr).any() and np.nanmax(snr) > 5

@@ -131,16 +131,28 @@ Compare panels 2-4 of the figure against the truth in panel 1: the retuned
 model is much the closest, and the striping in the mesh-only panel is what a
 prior tuned around an unmodelled compact source costs.
 
-The retune's own cost is that the point's *statistical* error is conditional
-on the stiffer prior and is far too small on its own — 3.3e-5 here, which
-would make a 2%-low flux a 7 sigma discrepancy. So the quoted `flux_error` is
-not the statistical error alone: it adds, in quadrature, how far the amplitude
-moves when the regularisation strength is varied over the range these data
-allow. Both terms are written separately to `point_sources.json`
-(`flux_error_stat_jy`, `flux_error_sys_jy`). Across the generalisation tests
-below that turns pulls of up to 24 sigma into pulls under 3. Detection
-significance still uses the statistical error alone — a scale uncertainty
-should not make a real source look marginal.
+**Point flux errors.** `flux_error_jy` is the amplitude's statistical 1σ,
+sqrt of the diagonal of S⁻¹ with S = C − Bᵀ(F+H)⁻¹B: the amplitude's
+curvature once the mesh beneath it is allowed to trade flux with it, at the
+delivered prior strength. Detection significance is flux over this error.
+With `--uncertainty bayesian` each point also gets `flux_bayesian_jy` and
+`flux_error_bayesian_jy`: the amplitude's mean and 1σ marginalised over the
+prior strength, from the same evidence-weighted mixture as the extended model
+(`PointAugmentedFit.bayesian_posterior`; the evidence is that of the joint
+mesh + point system, `AugmentedSystem.log_evidence`).
+
+**How far to trust them.** On a single point beside a smooth disc (the demo
+S/N series, true 4 mJy) the statistical pulls are 1.4–1.7 at every S/N and the
+Bayesian ones 0.2–1.0: the evidence prefers a weaker prior, which leaves the
+point its own flux. Where a point sits *on* extended emission neither is
+honest. On the generalisation mocks (below) pulls of 4–22σ remain in both:
+the posterior on λ is only 0.04–0.08 dex wide there, and how the flux is
+shared between a point and the mesh under it is decided by the prior's
+*shape*, which no error at fixed shape can see. Read point fluxes on extended
+emission as model-dependent at the 5–40% level. (Until Oct 2026 a fixed
+±0.5 dex variation of λ was added to the error by hand, which brought those
+pulls under 3; it was removed with the prior-systematic uncertainty mode, as
+an uncalibrated heuristic — see uncertainty.md.)
 
 Point components appear in `point_sources.json` with positions, fluxes and
 1 sigma errors; in `model.fits` as flux dropped into the nearest pixel (the
