@@ -43,6 +43,9 @@ logging.basicConfig(level=logging.WARNING, format="%(message)s")
 CRITERION = "structure"
 #: the uncertainty mode (`fitting.UNCERTAINTY_MODES`); set from the command line
 UNCERTAINTY = "statistical"
+#: the top row: the restored model ("restored") or the dirty image ("dirty");
+#: set from the command line (default: dirty for bayesian, restored otherwise)
+TOP_ROW = "restored"
 
 
 def _tag() -> str:
@@ -177,9 +180,17 @@ def plot() -> None:
     # width is the *highest* S/N run's noise, so the faint columns are not
     # flattened into the linear regime -- they are noisier, and seeing that
     # is the point of the figure.
-    models_sb = [r["restored"] for _, r in runs]
+    models_sb = [r["dirty" if TOP_ROW == "dirty" else "restored"] for _, r in runs]
+    top_label = "dirty image" if TOP_ROW == "dirty" else "model $\\otimes$ beam"
     vmax_i = max(float(np.nanmax(m)) for m in models_sb)
-    norm_i = fs.asinh_norm(vmax_i, linear_width=2.0 * ref["rms"])
+    if TOP_ROW == "dirty":
+        # linear and signed: the dirty image's sidelobes and negative noise
+        # are the content, and an asinh stretch at the bright end's noise
+        # level fills the whole field with the beam's wings
+        from matplotlib.colors import Normalize
+        norm_i = Normalize(vmin=-0.15 * vmax_i, vmax=vmax_i)
+    else:
+        norm_i = fs.asinh_norm(vmax_i, linear_width=2.0 * ref["rms"])
     # Residuals are already in units of each column's own sigma, so one scale
     # is meaningful across the series without renormalising anything.
     rmax = 2.0 * np.ceil(max(float(np.nanmax(np.abs(r["resid"])))
@@ -211,7 +222,7 @@ def plot() -> None:
                              norm=norm_u)
         ax_m.set_title(f"{r['peak_snr']:.0f}$\\sigma$", pad=2.5, color=fs.INK)
         if col == 0:
-            for ax, t in ((ax_m, "model $\\otimes$ beam"), (ax_r, "residual"),
+            for ax, t in ((ax_m, top_label), (ax_r, "residual"),
                           (ax_u, "1$\\sigma$ uncertainty")):
                 ax.set_ylabel(t, color=fs.INK, fontsize=6.6, labelpad=3)
             fs.add_beam(ax_m, beam, ext)
@@ -223,8 +234,8 @@ def plot() -> None:
             fs.panel_label(ax_m, "no point", loc="lower right", size=5.2)
 
     fs.hcolorbar(fig, im_i, [gs_img[2, 0], gs_img[2, 1]],
-                 "model $\\otimes$ beam [Jy/beam]", 0.013, pad=0.055,
-                 shrink=0.86, ticks=[0.0, 1e-4, 1e-3])
+                 f"{top_label} [Jy/beam]", 0.013, pad=0.055,
+                 shrink=0.86, ticks=None if TOP_ROW == "dirty" else [0.0, 1e-4, 1e-3])
     fs.hcolorbar(fig, im_r, [gs_img[2, 2], gs_img[2, 3]],
                  "residual [$\\sigma$]", 0.013, pad=0.055, shrink=0.86)
     fs.hcolorbar(fig, im_u, [gs_img[2, 4], gs_img[2, n - 1]],
@@ -354,9 +365,13 @@ if __name__ == "__main__":
     ap.add_argument("--criterion", default="structure",
                     choices=["structure", "discrepancy", "evidence"])
     ap.add_argument("--uncertainty", default="statistical", choices=["statistical", "bayesian"])
+    ap.add_argument("--top-row", choices=["restored", "dirty"], default=None,
+                    help="top row: model (x) beam or the dirty image "
+                         "(default: dirty for bayesian, restored otherwise)")
     args = ap.parse_args()
     CRITERION = args.criterion
     UNCERTAINTY = args.uncertainty
+    TOP_ROW = args.top_row or ("dirty" if UNCERTAINTY == "bayesian" else "restored")
     if not args.plot:
         fit_all()
     plot()
