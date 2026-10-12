@@ -879,6 +879,20 @@ def current_memory_gb() -> float:
         return 0.0
 
 
+def per_fit_memory_gb(n_vis: int, n_mesh_pixels: int, n_image_pixels: int | None,
+                      transformer_cls=None, inversion: str = "dense") -> float:
+    """Peak memory one fit of ``n_vis`` visibilities allocates [GB], resident
+    baseline excluded: what `check_memory` estimates, per fit. `parallel`
+    sizes its worker count with it."""
+    if inversion == "sparse" and n_image_pixels:
+        return sparse_peak_memory_gb(
+            n_image_pixels, n_mesh_pixels,
+            chunk_k=sparse_chunk_k_for_budget(n_image_pixels),
+            n_vis=n_vis, transformer_cls=transformer_cls)
+    return (estimate_peak_memory_gb(n_vis, n_mesh_pixels, n_image_pixels)
+            + transformer_memory_gb(transformer_cls, n_vis, n_mesh_pixels))
+
+
 def check_memory(
     n_vis: int,
     n_mesh_pixels: int,

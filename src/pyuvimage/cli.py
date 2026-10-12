@@ -352,6 +352,13 @@ def main(argv: list[str] | None = None) -> int:
         "is n_image_pixels x N complex",
     )
     p_fit.add_argument(
+        "--workers", default="1", metavar="N",
+        help="cube mode: fit N channels at once, each in its own process "
+             "(default 1). 0 or auto: one per core. Capped by the number of "
+             "channels and by the memory N channel fits need; BLAS threads "
+             "are shared out between the workers",
+    )
+    p_fit.add_argument(
         "--cube-prior", default="mfs", choices=["mfs", "channel"],
         help="cube mode only: what the shared prior is fitted on. mfs "
         "(default) uses every channel's visibilities at once -- free on the "
@@ -624,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
             kernel_cache=args.kernel_cache,
             streaming=args.streaming,
             chunk_k=args.chunk_k,
+            workers=args.workers,
             reload=args.reload,
             pynufft_shift=not args.no_pynufft_shift,
             chi2_target=args.chi2_target,

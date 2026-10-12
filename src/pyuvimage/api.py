@@ -22,7 +22,7 @@ import autogalaxy as ag
 
 from . import beam as beam_mod
 from . import envelope as envelope_mod
-from . import fitting, primary_beam
+from . import fitting, parallel, primary_beam
 from .grids import (
     ImageGeometry,
     nyquist_pixel_scale_arcsec,
@@ -284,6 +284,7 @@ def run(
     reload: bool = False,
     pynufft_shift: bool = True,
     input_parameters: dict | None = None,
+    workers: int | str = 1,
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -377,6 +378,11 @@ def run(
             posterior width at the fitted prior strength) or "bayesian" (the posterior
             marginalised over the prior strength, with model_bayesian.fits);
             see `fitting.UNCERTAINTY_MODES` and docs/uncertainty.md.
+        workers: cube mode only -- how many channels to fit at once, each in
+            its own process (`parallel`): 1 (default, serial), a number, or 0
+            / "auto" for one per core. Capped by the channel count and by the
+            memory available for that many channel fits; BLAS threads are
+            shared out between the workers.
         uncertainty_map: deprecated: True means uncertainty="statistical",
             False "none". Ignored when ``uncertainty`` is given.
         pynufft_shift: apply the half-pixel phase ramp that aligns the pynufft
@@ -431,6 +437,7 @@ def run(
             max_points=max_points, point_retune=point_retune,
             chunk_k=chunk_k, reload=reload,
             header=header, cube_prior=cube_prior, transformer=transformer,
+            workers=workers,
         )
     uvd = (
         dataset
@@ -867,61 +874,53 @@ def run(
         mfs_dataset = None
         gc.collect()
         channel_chi2: list[float] = []
-        for c in range(uvd.n_chan):
+        shared = dict(
+            n_chan=uvd.n_chan, geometry=geometry, transformer_cls=transformer_cls,
+            mask_shape=mask_shape, inversion=inversion,
+            kernel_cache_dir=kernel_cache_dir, reload=reload, reg=reg,
+            frozen=frozen, positive_only=positive_only,
+            enforce_positive=enforce_positive, criterion=criterion, nu=nu,
+            envelope=envelope, chi2_target=chi2_target, cube_points=cube_points,
+            beam_size=beam_size, meta=uvd.meta, pb_correction=pb_correction,
+            dish=dish, pb_factor=pb_factor, oversample=oversample,
+            uncertainty=uncertainty,
+        )
+
+        def task(c):
             ch = uvd.select(channel=c)
             uv_c, d_c, n_c = ch.flattened()
-            # release the previous channel before allocating the next: the
-            # right-hand side is built while the old binding is still live,
-            # so without this two channels overlap at the peak
-            ds_c = sf = None
-            gc.collect()
-            ds_c = fitting.make_dataset(
-                uv_c, d_c, n_c, geometry, transformer_cls,
-                mask_shape=mask_shape
-            )
-            if inversion == "sparse":
-                # This channel's own kernel. `sparse_kernel_key` hashes the uv
-                # coordinates and the noise, so the channels key apart on
-                # their own and the cache needs no channel index.
-                ds_c = fitting.with_sparse_operator(
-                    ds_c, uv_c, n_c, geometry, cache_dir=kernel_cache_dir,
-                    reuse_cache=not reload,
-                )
-            sf = fitting.fit_dataset(
-                ds_c, geometry, reg_kind=reg, prior=frozen,
-                positive_only=positive_only, enforce_positive=enforce_positive,
-                criterion=criterion, nu=nu,
-                envelope=envelope,
-                chi2_target=chi2_target,
-                # one summary line per channel below; the per-fit warning
-                # against a target the channels never chose was noise
-                warn_on_chi2=False,
-            )
-            if cube_points:
-                from .pointsource import PointAugmentedFit, fit_point_sources
+            return dict(shared, index=c, uv=uv_c, data=d_c, noise=n_c,
+                        frequency=float(ch.frequencies[0]))
 
-                sol_c = fit_point_sources(
-                    sf.fit.inversion, ds_c, geometry, positions=cube_points,
-                    refine=False, retune=False, beam_fwhm=beam_size,
-                    chi2_target=chi2_target, check_positions=False,
-                )
-                if sol_c.points:
-                    sf = PointAugmentedFit(sf, sol_c)
-            n_data_c = 2 * len(d_c)
-            channel_chi2.append(float(sf.chi_squared) / n_data_c)
+        n_workers = parallel.resolve_workers(
+            workers, uvd.n_chan,
+            per_task_gb=fitting.per_fit_memory_gb(
+                max(uvd.n_samples // uvd.n_chan, 1), n_pix, n_image_pixels,
+                transformer_cls, inversion))
+
+        def report(res):
+            c, chi2_n = res["index"], res["chi2_per_datum"]
+            channel_chi2.append(chi2_n)
             logger.log(
-                logging.WARNING
-                if sf.chi_squared / n_data_c > 1.3 * chi2_target else logging.INFO,
-                "channel %d/%d: chi2/N = %.3f%s", c + 1, uvd.n_chan,
-                sf.chi_squared / n_data_c,
-                "" if not cube_points else
-                f", point flux {sum(p.flux for p in sf.points):.4g} Jy",
+                logging.WARNING if chi2_n > 1.3 * chi2_target else logging.INFO,
+                "channel %d/%d: chi2/N = %.3f%s", c + 1, uvd.n_chan, chi2_n,
+                "" if res["point_flux"] is None else
+                f", point flux {res['point_flux']:.4g} Jy",
             )
-            products.append(
-                _products_for(sf, ds_c, geometry, uvd, float(ch.frequencies[0]),
-                              pb_correction, dish, pb_factor, oversample,
-                              uncertainty)
-            )
+            products.append(res["products"])
+
+        if n_workers == 1:
+            for c in range(uvd.n_chan):
+                gc.collect()
+                report(_fit_cube_channel(task(c)))
+        else:
+            # every channel is submitted at once (each task carries only its
+            # own visibilities); results are taken in channel order
+            with parallel.worker_pool(n_workers) as pool:
+                futures = [pool.submit(_fit_cube_channel, task(c))
+                           for c in range(uvd.n_chan)]
+                for f in futures:
+                    report(f.result())
         freqs = uvd.frequencies
 
     parameters = _parameter_record(
@@ -1000,6 +999,7 @@ def run_streamed(
     header=None,
     cube_prior: str = "mfs",
     transformer: str = "auto",
+    workers: int | str = 1,
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
 
@@ -1314,29 +1314,43 @@ def run_streamed(
         mfs_summary = _fit_summary(mfs_fit)
         products = []
         freqs = header.frequencies
-        for c, key in enumerate(channels):
-            terms_c = per_channel[key]
-            stub_c = stm.stub_dataset_from_terms(terms_c, geometry, mask)
-            imager_c = fitting.imager_for(stub_c)
-            sf = fitting.fit_dataset(
-                stub_c, geometry, reg_kind=reg, prior=frozen,
-                positive_only=positive_only, enforce_positive=enforce_positive,
-                criterion=criterion, nu=nu, envelope=envelope,
-                chi2_target=chi2_target, warn_on_chi2=False,
-            )
-            n_data_c = 2 * int(terms_c.n_vis)
-            channel_chi2.append(float(sf.chi_squared) / n_data_c)
+        shared = dict(
+            n_chan=len(channels), geometry=geometry, mask=mask, reg=reg,
+            frozen=frozen, positive_only=positive_only,
+            enforce_positive=enforce_positive, criterion=criterion, nu=nu,
+            envelope=envelope, chi2_target=chi2_target, meta=header.meta,
+            pb_correction=pb_correction, dish=dish, pb_factor=pb_factor,
+            oversample=oversample, uncertainty=uncertainty,
+        )
+
+        def task(c, key):
+            return dict(shared, index=c, terms=per_channel[key],
+                        frequency=float(freqs[c]))
+
+        n_workers = parallel.resolve_workers(
+            workers, len(channels),
+            per_task_gb=fitting.per_fit_memory_gb(
+                0, n_pix, n_image_pixels, None, "sparse"))
+
+        def report(res):
+            c, chi2_n = res["index"], res["chi2_per_datum"]
+            channel_chi2.append(chi2_n)
             logger.log(
-                logging.WARNING
-                if sf.chi_squared / n_data_c > 1.3 * chi2_target else logging.INFO,
+                logging.WARNING if chi2_n > 1.3 * chi2_target else logging.INFO,
                 "channel %d/%d (%.6g GHz): chi2/N = %.3f", c + 1, len(channels),
-                float(freqs[c]) / 1e9, sf.chi_squared / n_data_c,
+                float(freqs[c]) / 1e9, chi2_n,
             )
-            products.append(_products_for(
-                sf, stub_c, geometry, header, float(freqs[c]), pb_correction,
-                dish, pb_factor, oversample, uncertainty, imager=imager_c,
-            ))
-            del sf, stub_c, imager_c
+            products.append(res["products"])
+
+        if n_workers == 1:
+            for c, key in enumerate(channels):
+                report(_fit_streamed_channel(task(c, key)))
+        else:
+            with parallel.worker_pool(n_workers) as pool:
+                futures = [pool.submit(_fit_streamed_channel, task(c, key))
+                           for c, key in enumerate(channels)]
+                for f in futures:
+                    report(f.result())
         mfs_fit = mfs_summary
 
     parameters = _parameter_record(
@@ -2092,6 +2106,94 @@ def _report_dynamic_range(
             "lever.",
             ratio, 100.0 * ratio,
         )
+
+
+def _fit_cube_channel(task: dict) -> dict:
+    """Fit one cube channel at the frozen prior and build its products.
+
+    Module-level, and given everything it needs in ``task`` (a dict of plain
+    data), so that it can run in a worker process as well as in this one
+    (`--workers`, `parallel.worker_pool`). Returns the channel's
+    `ProductSet` and the numbers the caller logs.
+    """
+    from types import SimpleNamespace
+
+    c = task["index"]
+    parallel.set_task_label(f"channel {c + 1}/{task['n_chan']}")
+    geometry = task["geometry"]
+    uv_c, d_c, n_c = task["uv"], task["data"], task["noise"]
+    ds_c = fitting.make_dataset(
+        uv_c, d_c, n_c, geometry, task["transformer_cls"],
+        mask_shape=task["mask_shape"],
+    )
+    if task["inversion"] == "sparse":
+        # This channel's own kernel. `sparse_kernel_key` hashes the uv
+        # coordinates and the noise, so the channels key apart on their own
+        # and the cache needs no channel index.
+        ds_c = fitting.with_sparse_operator(
+            ds_c, uv_c, n_c, geometry, cache_dir=task["kernel_cache_dir"],
+            reuse_cache=not task["reload"],
+        )
+    sf = fitting.fit_dataset(
+        ds_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
+        positive_only=task["positive_only"],
+        enforce_positive=task["enforce_positive"],
+        criterion=task["criterion"], nu=task["nu"],
+        envelope=task["envelope"],
+        chi2_target=task["chi2_target"],
+        # one summary line per channel from the caller; the per-fit warning
+        # against a target the channels never chose was noise
+        warn_on_chi2=False,
+    )
+    point_flux = None
+    if task["cube_points"]:
+        from .pointsource import PointAugmentedFit, fit_point_sources
+
+        sol_c = fit_point_sources(
+            sf.fit.inversion, ds_c, geometry, positions=task["cube_points"],
+            refine=False, retune=False, beam_fwhm=task["beam_size"],
+            chi2_target=task["chi2_target"], check_positions=False,
+        )
+        if sol_c.points:
+            sf = PointAugmentedFit(sf, sol_c)
+        point_flux = float(sum(p.flux for p in getattr(sf, "points", None) or []))
+    chi2_n = float(sf.chi_squared) / (2 * len(d_c))
+    products = _products_for(
+        sf, ds_c, geometry, SimpleNamespace(meta=task["meta"]), task["frequency"],
+        task["pb_correction"], task["dish"], task["pb_factor"],
+        task["oversample"], task["uncertainty"],
+    )
+    return {"index": c, "products": products, "chi2_per_datum": chi2_n,
+            "point_flux": point_flux}
+
+
+def _fit_streamed_channel(task: dict) -> dict:
+    """`_fit_cube_channel` for the streamed path: one channel's fit from its
+    accumulated terms (`streaming.SparseTerms`), no visibilities held."""
+    from types import SimpleNamespace
+
+    from . import streaming as stm
+
+    c = task["index"]
+    parallel.set_task_label(f"channel {c + 1}/{task['n_chan']}")
+    geometry, terms_c = task["geometry"], task["terms"]
+    stub_c = stm.stub_dataset_from_terms(terms_c, geometry, task["mask"])
+    imager_c = fitting.imager_for(stub_c)
+    sf = fitting.fit_dataset(
+        stub_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
+        positive_only=task["positive_only"],
+        enforce_positive=task["enforce_positive"],
+        criterion=task["criterion"], nu=task["nu"], envelope=task["envelope"],
+        chi2_target=task["chi2_target"], warn_on_chi2=False,
+    )
+    chi2_n = float(sf.chi_squared) / (2 * int(terms_c.n_vis))
+    products = _products_for(
+        sf, stub_c, geometry, SimpleNamespace(meta=task["meta"]),
+        task["frequency"], task["pb_correction"], task["dish"],
+        task["pb_factor"], task["oversample"], task["uncertainty"],
+        imager=imager_c,
+    )
+    return {"index": c, "products": products, "chi2_per_datum": chi2_n}
 
 
 def _products_for(

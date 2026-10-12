@@ -39,6 +39,7 @@
 
   "_cube": "cube mode only.",
   "cube-prior": "mfs",
+  "workers": 1,
 
   "_products": "what is written alongside the model image.",
   "uncertainty": "none",
