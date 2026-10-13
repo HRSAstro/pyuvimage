@@ -105,3 +105,35 @@ def test_structure_ratio_is_measured_inside_the_mask_region():
     imager.structure_region = region
     masked = fitting._structure_ratio_from_map(resid, 1600.0, imager, 1600)
     assert whole > 1.5 and masked == pytest.approx(1.0, abs=0.08)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cube_channels_use_the_shared_hilbert_mesh_and_mask(tmp_path, streaming, caplog):
+    from pyuvimage.grids import resolve_geometry
+
+    fov, m, f0 = 3.0, 16, 230e9
+    freqs = f0 * (1.0 + 1e-3 * np.arange(2))
+    uvw = mock.random_uv_coverage(1500, m / (2.0 * fov / 206265.0) * 299792458.0 / f0, f0, seed=7)
+    geom = resolve_geometry(fov, float(np.max(np.hypot(uvw[:, 0], uvw[:, 1])) * freqs.max()
+                                       / 299792458.0), mesh_shape=(m, m))
+    truth = mock.exponential_image(geom.shape_native, geom.pixel_scale, flux_jy=0.05,
+                                   r_eff_arcsec=0.4)
+    meta = {"phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0, "dish_diameter_m": 12.0}
+    uvd = mock.simulate(truth, geom.pixel_scale, uvw, freqs, sigma_jy=3e-4, seed=8, meta=meta)
+    c = SkyCoord(150.0 * u.deg, 2.0 * u.deg)
+    region = tmp_path / "c.crtf"
+    region.write_text("#CRTFv0\ncircle [[%s, %s], 1.2arcsec] coord=J2000\n" % (
+        c.ra.to_string(u.hour, sep=":", precision=4),
+        c.dec.to_string(u.deg, sep=".", precision=3, alwayssign=True)))
+    data = uvd.write(tmp_path / "ds") if streaming else uvd
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        res = api.run(data, fov=fov, out=tmp_path / "o", mode="cube", mesh_shape=(m, m),
+                      pb_correction=False, mesh_type="hilbert", mesh_points=120,
+                      emission_mask=str(region), streaming=streaming, write=False)
+    assert "every channel is fitted on the MFS fit's hilbert" in caplog.text
+    allowed = mask.load(region, res.products[0].model_image.shape, res.geometry.pixel_scale, meta)
+    assert len(res.products) == 2
+    for p in res.products:
+        model = np.asarray(p.model_image)
+        assert np.abs(model[~allowed]).max() < 0.01 * model.max()
+        assert model.sum() == pytest.approx(0.05, rel=0.05)

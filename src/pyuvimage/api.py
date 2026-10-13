@@ -957,6 +957,12 @@ def run(
                 "too, so each channel is a single fit rather than its own "
                 "two-pass search"
             )
+        if geometry.mesh is not None:
+            logger.info(
+                "cube mode: every channel is fitted on the MFS fit's %s -- "
+                "the mesh, like the prior, is built once from the MFS data and "
+                "shared, so its point density follows the MFS brightness",
+                geometry.mesh.describe())
         mfs_fit = _fit_summary(mfs_fit)
         mfs_dataset = None
         gc.collect()
@@ -1449,6 +1455,12 @@ def run_streamed(
                 "too, so each channel is a single fit rather than its own "
                 "two-pass search"
             )
+        if geometry.mesh is not None:
+            logger.info(
+                "cube mode: every channel is fitted on the MFS fit's %s -- "
+                "the mesh, like the prior, is built once from the MFS data and "
+                "shared, so its point density follows the MFS brightness",
+                geometry.mesh.describe())
         mfs_summary = _fit_summary(mfs_fit)
         products = []
         freqs = header.frequencies
