@@ -19,10 +19,48 @@ of the same data takes **78 s on 2 cores with a 0.9 GB peak**.
 |---|---|---|
 | data term F s | F = Mᵀ W̃ M formed | Mᵀ W̃ (M s): the w-tilde convolution, one FFT pair on the padded image grid; M the mapper's sparse interpolation matrix |
 | prior | Matérn ν = 1.5, C⁻¹ dense | Matérn ν = 1 in its sparse-precision (SPDE) form, C⁻¹ = W⁻¹ c L² W⁻¹, L = κ² − ∇² (Lindgren et al. 2011) |
-| solve | Cholesky / NNLS | conjugate gradients, preconditioned with the sparse P = κ₀ MᵀM + λC⁻¹ (W̃ replaced by its peak κ₀, as Powell et al.), factorised once per λ |
+| solve | Cholesky / NNLS | conjugate gradients; preconditioner below |
 | ln det H | Cholesky | exact, from the sparse factor of L |
 | ln det(F + H) | Cholesky | ln det P exactly + ln det(P⁻¹A) by stochastic Lanczos quadrature (10 fixed probes, ≤40 steps) |
 | criteria | all | `structure`, `discrepancy`, `evidence`; the adaptive prior's two passes as on the dense path |
+
+**The preconditioner.** Two, chosen by the prior:
+
+- *Unweighted prior* (plain Matérn, exponential, the adaptive prior's first
+  pass): the **uv weight density**. On the mesh, F is nearly a convolution by
+  the dirty beam, so in Fourier space it multiplies by the gridded uv weight
+  density ρ(k); the SPDE precision is a convolution too. ρ is measured once
+  (the beam at every lag, two matrix-vector products), smoothed by one uv
+  cell, and (ρ + λ q)⁻¹ is applied by FFT. No factorisation is needed.
+- *Weighted prior* (the adaptive second pass, the envelope): Powell et al.'s
+  sparse **P = κ₀ MᵀM + λC⁻¹** (W̃ replaced by its peak κ₀), factorised once
+  per λ. It follows the per-pixel weights exactly, which a Fourier
+  preconditioner cannot: with adaptive weights it needs ~3× fewer
+  iterations.
+
+Measured (iterations per solve):
+
+| case | sparse P | uv density | ring average ("radial") |
+|---|---|---|---|
+| mock, 96², λ = 1e8 / 1e9 | 790 / 310 | 572 / 200 | 572 / 214 |
+| NGC 4274, 192², λ = 1e10 / 1e11 | 185 / 62 | 275 / 60 | 502 / 99 |
+| NGC 4274, whole fit | 78 s | 79 s | 90 s |
+
+The density preconditioner is also ~2× cheaper per iteration. The ring
+average (density by baseline length alone) loses on NGC 4274 because its
+coverage is elongated, not round; a Gaussian radial model does worse still.
+`matfree.UNWEIGHTED_PRECONDITIONER` selects `"density"` (default),
+`"radial"` or `"sparse"`. The evidence always uses the sparse P, whose
+determinant is exact.
+
+**What sets the cost.** The iterations depend on how strong the chosen prior
+is relative to the data: roughly λ^-0.4 at fixed data. A bright,
+high-S/N source picks a weak prior, and then the uneven uv coverage sets the
+conditioning; a faint one picks a strong prior, which dominates most modes
+and makes the system easy. The prior-to-data ratio per pixel, λ/κ₀, is ~300
+for NGC 4274 (23–270 iterations per solve at 192 × 192) and ~0.03 for the
+benchmark mock (thousands at 192 × 192, `scripts/bench_solvers.py`). More
+visibilities per uv cell help at a given ratio.
 
 F and D agree with the dense path to 1e-16, and the solve and evidence agree
 with a dense solve of the same system to 1e-4 and ~0.2%

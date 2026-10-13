@@ -111,3 +111,32 @@ def test_run_takes_the_matrix_free_path_above_the_switch(small, tmp_path, monkey
     with pytest.raises(NotImplementedError, match="point components"):
         api.run(small["uvd"], fov=3.0, mesh_shape=(16, 16), out=tmp_path / "p",
                 streaming=True, point_sources=True, write=False)
+
+
+@pytest.mark.parametrize("kind", ["density", "radial"])
+def test_fourier_preconditioners_agree_with_the_sparse_one(small, kind):
+    """The uv-density preconditioners change the route, not the answer;
+    weighted priors keep the sparse P, which follows the weights."""
+    data = small["data"]
+    plain = matfree.SparseMaternPrior(small["order"], small["shape"], small["pix"], 0.3)
+    w = 0.01 + 0.99 * np.random.default_rng(4).random(data.n_mesh)
+    weighted = matfree.SparseMaternPrior(small["order"], small["shape"], small["pix"], 0.3,
+                                         weights=w)
+    assert matfree.MatrixFreeSystem(data, plain).preconditioner == "density"
+    assert matfree.MatrixFreeSystem(data, weighted).preconditioner == "sparse"
+    radial = matfree.MatrixFreeSystem(data, plain, preconditioner=kind)
+    sparse = matfree.MatrixFreeSystem(data, plain, preconditioner="sparse")
+    for lam in (1e7, 1e9):
+        a, b = radial.solve(lam), sparse.solve(lam)
+        np.testing.assert_allclose(a.s, b.s, rtol=0, atol=1e-4 * np.abs(b.s).max())   # CG tolerance
+    # the measured density is non-negative and the prior symbol matches C^-1
+    rho, q = radial._spectra()
+    assert (rho >= 0).all()
+    my, mx = small["shape"]
+    e = np.zeros((my, mx)); e[my // 2, mx // 2] = 1.0
+    col = radial._to_grid(plain.Qw @ radial._from_grid(e))
+    stencil = np.zeros(q.shape)
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            stencil[dy, dx] = col[my // 2 + dy, mx // 2 + dx]
+    np.testing.assert_allclose(np.real(np.fft.fft2(stencil)), q, rtol=1e-10, atol=1e-10 * q.max())

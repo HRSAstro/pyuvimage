@@ -205,6 +205,43 @@ def run_all():
         OUT.write_text(json.dumps(rows, indent=1))
     return rows
 
+MF_SOLVE_KEYS = ("t_build_mf", "t_solve_mf", "cg_matvecs", "t_evidence_mf", "lnZ_mf",
+                 "s_rel_diff_mf", "lnZ_rel_diff_mf")
+MF_FIT_KEYS = ("seconds", "coefficient", "chi2_per_datum", "flux_ratio", "rms_err_src",
+               "peak_rss_gb")
+
+
+def rerun_mf():
+    """Re-run the matrix-free rows after a solver change, keeping the
+    previous values beside them (suffix _sparseP: Powell's sparse
+    preconditioner for every prior, before the radial-profile one)."""
+    rows = json.loads(OUT.read_text())
+    for r in rows:
+        if r["stage"] == "solve":
+            args = [sys.executable, __file__, "solve", str(r["mesh"])]
+            keys = MF_SOLVE_KEYS
+        elif r["path"] == "mf":
+            args = [sys.executable, __file__, "fit", str(r["mesh"]), "mf"]
+            keys = MF_FIT_KEYS
+        else:
+            continue
+        t = time.time()
+        out = subprocess.run(args, capture_output=True, text=True, timeout=3600)
+        line = [l for l in out.stdout.splitlines() if l.startswith("ROW ")]
+        if not line:
+            print(r["stage"], r["mesh"], "FAILED", out.stderr[-400:], flush=True)
+            continue
+        new = json.loads(line[-1][4:])
+        for k in keys:
+            if k in r and k + "_sparseP" not in r:
+                r[k + "_sparseP"] = r[k]
+            if k in new:
+                r[k] = new[k]
+        print(r["stage"], r["mesh"], f"{time.time() - t:.0f}s", flush=True)
+        OUT.write_text(json.dumps(rows, indent=1))
+    return rows
+
+
 COLORS = {"dense": "#2a78d6", "sparse": "#eb6834", "mf": "#1baf7a"}
 LABELS = {"dense": "dense (A^T W A)", "sparse": "sparse (w-tilde)", "mf": "matrix-free"}
 
@@ -234,6 +271,10 @@ def plot(rows=None):
         ax.plot(x, y, "o--", color=COLORS[path], ms=2.8, lw=0.8, alpha=0.7)
         x, y = series(sol, solve)
         ax.plot(x, y, "o-", color=COLORS[path], ms=3.2, lw=1.1, label=LABELS[path])
+    x, y = series(sol, "t_solve_mf_sparseP")
+    if len(x):
+        ax.plot(x, y, "o:", color=COLORS["mf"], ms=2.2, lw=0.8, alpha=0.5,
+                label="matrix-free, sparse P only (before)")
     for r in sol:
         if "cg_matvecs" in r:
             unconv = r["cg_matvecs"] >= 5000
@@ -264,6 +305,12 @@ def plot(rows=None):
         rs = sorted((r for r in fit if r["path"] == path), key=lambda r: r["mesh"])
         ax.plot([r["mesh"] ** 2 for r in rs], [r["seconds"] for r in rs], "o-",
                 color=COLORS[path], ms=3, lw=1, label=LABELS[path])
+    rs = sorted((r for r in fit if r["path"] == "mf" and "seconds_sparseP" in r),
+                key=lambda r: r["mesh"])
+    if rs:
+        ax.plot([r["mesh"] ** 2 for r in rs], [r["seconds_sparseP"] for r in rs], "o:",
+                color=COLORS["mf"], ms=2.2, lw=0.8, alpha=0.5,
+                label="matrix-free, sparse P only (before)")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("mesh pixels"); ax.set_ylabel("seconds")
     ax.set_title("whole fit (adaptive, structure; positivity on dense/sparse)", fontsize=6.5)
@@ -358,3 +405,5 @@ if __name__ == "__main__":
         plot(run_all())
     elif what == "plot":
         plot()
+    elif what == "rerun-mf":
+        plot(rerun_mf())

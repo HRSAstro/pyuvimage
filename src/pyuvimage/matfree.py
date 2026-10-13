@@ -15,9 +15,13 @@ instead, and nothing N_mesh x N_mesh is ever formed:
   `SparseMaternPrior`: nu = 1 rather than the dense path's 1.5, which has no
   sparse form.
 
-* **Solve.** Conjugate gradients on (F + lambda C^-1) s = D, preconditioned
-  with the sparse P = kappa_0 M^T M + lambda C^-1 (W~ replaced by its
-  diagonal), factorised once per lambda -- Powell et al.'s preconditioner.
+* **Solve.** Conjugate gradients on (F + lambda C^-1) s = D. Two
+  preconditioners (`MatrixFreeSystem`): for an unweighted prior, the uv
+  weight density -- F and C^-1 both made translation invariant and inverted
+  by FFT, with the data term's spectrum lightly smoothed
+  (`UNWEIGHTED_PRECONDITIONER`); for a weighted prior (adaptive, envelope),
+  Powell et al.'s sparse P = kappa_0 M^T M + lambda C^-1 (W~ replaced by its
+  diagonal), factorised once per lambda.
 
 * **Evidence.** ln det H exactly (sparse); ln det(F + H) = ln det P (exact)
   + ln det(P^-1 A) by stochastic Lanczos quadrature with fixed probes.
@@ -48,6 +52,15 @@ CG_MAXITER = 5000
 SLQ_PROBES = 10
 SLQ_STEPS = 40
 SLQ_SEED = 20221
+
+#: preconditioner for unweighted priors (`MatrixFreeSystem`): "density"
+#: (the uv weight density, lightly smoothed), "radial" (its ring average) or
+#: "sparse" (Powell et al.'s P, as for weighted priors)
+UNWEIGHTED_PRECONDITIONER = "density"
+
+#: smoothing of the uv density for the "density" preconditioner, in cells
+#: of the padded mesh's uv grid
+DENSITY_SMOOTHING_CELLS = 1.0
 
 
 def memory_gb(n_mesh: int, n_image: int) -> float:
@@ -207,6 +220,9 @@ class SparseMaternPrior:
         self.Qw = (self.R.T @ self.R).tocsr()                  # C^-1
         self.n = n
         self.c = c
+        self.h = h
+        self.kappa = kappa
+        self.weighted = weights is not None
         # ln det C^-1 = n ln c + 2 ln det L - 2 sum ln w
         self.log_det_Cinv = float(n * np.log(c) + 2.0 * self.log_det_L
                                   - 2.0 * np.sum(np.log(self.w)))
@@ -225,17 +241,42 @@ class MatrixFreeSystem:
     """(F + lambda C^-1) s = D for one prior shape and any strength lambda.
 
     F is applied through the w-tilde FFT; C^-1 is sparse. Conjugate gradients
-    preconditioned as Powell et al. (2021): P = kappa_0 M^T M + lambda C^-1,
-    i.e. W~ replaced by its peak kappa_0 (the dirty beam's diagonal), which is
-    sparse, factorised once per lambda.
+    with one of two preconditioners:
+
+    * **uv density** (unweighted prior: plain Matern, exponential, the
+      adaptive prior's first pass). On the mesh, F is close to a convolution
+      by the dirty beam, and the SPDE precision is a convolution away from
+      the edges. Both are diagonal in Fourier space, F with the gridded uv
+      weight density rho(k). rho is measured once (two matrix-vector
+      products: the beam at every lag), smoothed by
+      `DENSITY_SMOOTHING_CELLS`, and (rho + lambda q)^-1 applied by FFT on
+      the 2x zero-padded mesh. Unsmoothed, the embedded rho is not positive
+      and fails. The ring average ("radial": density by baseline length
+      alone) does as well on round coverage but ~2.5x worse on NGC 4274,
+      whose coverage is elongated.
+    * **Sparse P** (weighted prior: adaptive second pass, envelope). Powell
+      et al. (2021): P = kappa_0 M^T M + lambda C^-1, i.e. W~ replaced by its
+      peak kappa_0, sparse and factorised once per lambda. It follows the
+      weights exactly, which a Fourier preconditioner cannot; with the
+      adaptive weights it needs ~3x fewer iterations than a Fourier one.
+
+    The evidence always uses the sparse P (`log_det_A`), whose determinant
+    is exact.
     """
 
-    def __init__(self, data: DataOperator, prior: SparseMaternPrior):
+    def __init__(self, data: DataOperator, prior: SparseMaternPrior,
+                 preconditioner: str | None = None):
         self.data, self.prior = data, prior
         self.kappa0 = float(np.asarray(data.kernel_peak))
         self.MtM = (data.MT @ data.M).tocsc()
         self._factor = {}
         self._last = None
+        if preconditioner is None:
+            preconditioner = "sparse" if prior.weighted else UNWEIGHTED_PRECONDITIONER
+        if preconditioner not in ("density", "radial", "sparse"):
+            raise ValueError(f"unknown preconditioner {preconditioner!r}")
+        self.preconditioner = preconditioner
+        self._rho = None
 
     def _P(self, lam):
         from scipy.sparse.linalg import splu
@@ -245,6 +286,73 @@ class MatrixFreeSystem:
             P = (self.kappa0 * self.MtM + lam * self.prior.Qw).tocsc()
             self._factor = {key: (P, splu(P))}            # keep one: they are large
         return self._factor[key]
+
+    # -- the Fourier (uv density) preconditioners -----------------------
+    def _to_grid(self, v):
+        my, mx = self.prior.mesh_shape
+        g = np.zeros(my * mx)
+        g[self.prior.order] = v
+        return g.reshape(my, mx)
+
+    def _from_grid(self, g):
+        return np.asarray(g).reshape(-1)[self.prior.order]
+
+    def _spectra(self):
+        """rho (smoothed, or ring-averaged) and q on the (2 my, 2 mx) padded
+        mesh grid's frequencies."""
+        if self._rho is None:
+            my, mx = self.prior.mesh_shape
+            Ny, Nx = 2 * my, 2 * mx
+
+            def column(y, x):
+                e = np.zeros((my, mx))
+                e[y, x] = 1.0
+                return self._to_grid(self.data.F(self._from_grid(e)))
+
+            # the mesh-space beam at every lag: the corner columns give
+            # (dy >= 0, dx >= 0) and (dy >= 0, dx <= 0); point symmetry the rest
+            c00, c0m = column(0, 0), column(0, mx - 1)
+            K = np.zeros((Ny, Nx))
+            dy, dx = np.meshgrid(np.arange(my), np.arange(mx), indexing="ij")
+            K[dy, dx] = c00
+            K[-dy, -dx] = c00
+            K[dy, -dx] = c0m[:, ::-1]
+            K[-dy, dx] = c0m[:, ::-1]
+            rho = np.real(np.fft.fft2(K))
+            fy = np.fft.fftfreq(Ny)[:, None]
+            fx = np.fft.fftfreq(Nx)[None, :]
+            if self.preconditioner == "radial":
+                # rings of equal baseline length, one padded-grid cell wide
+                ring = np.rint(np.hypot(fy, fx) * max(Ny, Nx)).astype(int)
+                prof = (np.bincount(ring.ravel(), weights=rho.ravel())
+                        / np.maximum(np.bincount(ring.ravel()), 1))
+                rho = prof[ring]
+            else:
+                from scipy.ndimage import gaussian_filter
+
+                rho = gaussian_filter(rho, DENSITY_SMOOTHING_CELLS, mode="wrap")
+            self._rho = np.clip(rho, 0.0, None)
+            p = self.prior
+            lap = 4.0 / p.h ** 2 * (np.sin(np.pi * fy) ** 2 + np.sin(np.pi * fx) ** 2)
+            self._q = p.c * (p.kappa ** 2 + lap) ** 2
+        return self._rho, self._q
+
+    def _fourier(self, lam):
+        from scipy.sparse.linalg import LinearOperator
+
+        rho, q = self._spectra()
+        den = rho + lam * q
+        my, mx = self.prior.mesh_shape
+        shape = den.shape
+
+        def apply(v):
+            g = np.zeros(shape)
+            g[:my, :mx] = self._to_grid(v)
+            return self._from_grid(np.fft.irfft2(np.fft.rfft2(g) / den[:, : shape[1] // 2 + 1],
+                                                 s=shape)[:my, :mx])
+
+        n = self.data.n_mesh
+        return LinearOperator((n, n), matvec=apply, dtype=float)
 
     def solve(self, coefficient: float, x0=None) -> Solution:
         from scipy.sparse.linalg import LinearOperator, cg
@@ -258,9 +366,12 @@ class MatrixFreeSystem:
             count[0] += 1
             return self.data.F(v) + lam * (Qw @ v)
 
-        _, lu = self._P(lam)
         A = LinearOperator((n, n), matvec=matvec, dtype=float)
-        M = LinearOperator((n, n), matvec=lu.solve, dtype=float)
+        if self.preconditioner in ("density", "radial"):
+            M = self._fourier(lam)
+        else:
+            _, lu = self._P(lam)
+            M = LinearOperator((n, n), matvec=lu.solve, dtype=float)
         x0 = self._last if x0 is None else x0
         s, info = cg(A, self.data.D, x0=x0, rtol=CG_RTOL, maxiter=CG_MAXITER, M=M)
         if info > 0:
