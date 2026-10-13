@@ -70,7 +70,7 @@ def test_draw_writes_the_painted_mask_on_the_image_wcs(tmp_path, monkeypatch):
 
     class FakePainter:
         def __init__(self, image, **kw):
-            assert image.shape_native == (40, 40)
+            assert image.shape == (40, 40)
         def mask_from(self):
             return painted
 
@@ -78,3 +78,34 @@ def test_draw_writes_the_painted_mask_on_the_image_wcs(tmp_path, monkeypatch):
     img = mask.write(tmp_path / "img.fits", np.ones((40, 40), bool), 0.1, META)
     out = mask.draw(img, tmp_path / "drawn.fits", backend="Agg")
     np.testing.assert_array_equal(mask.load(out, (40, 40), 0.1, META), painted)
+
+
+def test_draw_works_with_the_older_painter(tmp_path, monkeypatch):
+    """autogalaxy before 2026.10: no vmin / vmax / proposal / mask_from. The
+    painted mask is read from the scribbles, and a starting mask is kept
+    (outlined with mask_overlay) unless erased."""
+    import autogalaxy.gui.scribbler as scrib
+
+    add = np.zeros((40, 40), bool)
+    add[30:35, 5:10] = True
+    erase = np.zeros((40, 40), bool)
+    erase[10:12, 10:40] = True
+    seen = {}
+
+    class OldPainter:
+        def __init__(self, image, segment_names=None, cmap=None, brush_width=0.05,
+                     backend="TkAgg", mask_overlay=None, figsize=(15, 15),
+                     rgb_image=None, extent=None):
+            seen["overlay"] = mask_overlay
+            assert image.shape == (40, 40)
+        def get_scribble_masks(self):
+            return {"1": add, "2": erase}
+
+    monkeypatch.setattr(scrib, "Scribbler", OldPainter)
+    img = mask.write(tmp_path / "img.fits", np.ones((40, 40), bool), 0.1, META)
+    start = np.zeros((40, 40), bool)
+    start[5:15, 5:35] = True
+    prop = mask.write(tmp_path / "start.fits", start, 0.1, META)
+    out = mask.draw(img, tmp_path / "drawn.fits", proposal=prop, backend="Agg")
+    assert seen["overlay"] is not None
+    np.testing.assert_array_equal(mask.load(out, (40, 40), 0.1, META), (start | add) & ~erase)

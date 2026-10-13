@@ -178,14 +178,11 @@ def draw(image_path: str | Path, out: str | Path, proposal: str | Path | None = 
     wcs = WCS(header).celestial
     scale = float(abs(proj_plane_pixel_scales(wcs)[1])) * 3600.0
     native = np.flipud(img)
-    array = ag.Array2D.no_mask(values=native, pixel_scales=scale)
     start = None
     if proposal is not None:
         start = np.flipud(onto(proposal, wcs, img.shape))
-    vmax = float(np.nanpercentile(native, 99.9))
-    painter = Scribbler(image=array, cmap="inferno", vmin=-0.1 * vmax, vmax=vmax,
-                        backend=backend, proposal=start)
-    drawn = np.asarray(painter.mask_from(), dtype=bool)
+    painter = _paint(Scribbler, native, scale, start, backend)
+    drawn = _painted(painter, start)
     if not drawn.any():
         raise ValueError("nothing was painted: no mask written")
     out = Path(out)
@@ -193,6 +190,50 @@ def draw(image_path: str | Path, out: str | Path, proposal: str | Path | None = 
         out, overwrite=True)
     logger.info("mask written to %s (%.1f%% of the image)", out, 100 * drawn.mean())
     return out
+
+
+def _display(native: np.ndarray) -> np.ndarray:
+    """The image as shown while painting: clipped to [-0.1, 1] of its 99.9th
+    percentile and asinh-stretched, so faint emission is visible whatever
+    colour scaling the installed autogalaxy's painter supports."""
+    top = float(np.nanpercentile(native, 99.9)) or float(np.nanmax(np.abs(native))) or 1.0
+    x = np.clip(native / top, -0.1, 1.0)
+    return np.arcsinh(x / 0.05) / np.arcsinh(1.0 / 0.05)
+
+
+def _paint(Scribbler, native, scale, start, backend):
+    """Open autogalaxy's painter, whichever version is installed.
+
+    Releases before 2026.10 take no ``vmin`` / ``vmax`` / ``proposal`` and
+    want a `Cmap` object for colours, so the image is passed pre-stretched and
+    only the keywords this version accepts are given; an existing mask is
+    outlined with ``mask_overlay`` (both versions) and also handed over as the
+    ``proposal`` where that exists.
+    """
+    import inspect
+
+    import autogalaxy as ag
+
+    accepts = inspect.signature(Scribbler.__init__).parameters
+    image = ag.Array2D.no_mask(values=_display(native), pixel_scales=scale).native
+    kw = {"image": image, "backend": backend}
+    if start is not None:
+        if "mask_overlay" in accepts:
+            kw["mask_overlay"] = ag.Mask2D(mask=~start, pixel_scales=scale)
+        if "proposal" in accepts:
+            kw["proposal"] = start
+    return Scribbler(**kw)
+
+
+def _painted(painter, start) -> np.ndarray:
+    """(start | added) & ~erased: the first brush adds, the second erases."""
+    if hasattr(painter, "mask_from"):
+        return np.asarray(painter.mask_from(), dtype=bool)
+    masks = list(painter.get_scribble_masks().values())
+    added = np.asarray(masks[0], dtype=bool)
+    erased = np.asarray(masks[1], dtype=bool) if len(masks) > 1 else np.zeros_like(added)
+    base = np.zeros_like(added) if start is None else np.asarray(start, dtype=bool)
+    return (base | added) & ~erased
 
 
 def _mask_header(header):
