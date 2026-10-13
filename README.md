@@ -359,6 +359,13 @@ default `adaptive` prior; Ruby above is ~30 s sparse and tens of minutes dense.
 Making the output products finer is nearly free either way — the image size is
 not in either scaling law.
 
+**Meshes above 100 × 100** switch to a matrix-free solve on the streamed path
+(w-tilde FFT, a sparse ν = 1 Matérn prior, preconditioned conjugate
+gradients): memory and time no longer go as `n_mesh²` and `n_mesh³`. A
+192 × 192 mesh on 2.6 M visibilities fits in 78 s and 0.9 GB. It has no
+positivity, point components or uncertainty maps yet — see
+[docs/matrix-free.md](docs/matrix-free.md).
+
 ## Noise
 
 **pyuvimage estimates the noise from the visibilities themselves and does not
@@ -429,6 +436,7 @@ Full discussion: [docs/noise.md](docs/noise.md).
 | [docs/uncertainty.md](docs/uncertainty.md) | the uncertainty map in full, with the Monte Carlo validation |
 | [docs/point-sources.md](docs/point-sources.md) | how delta components are solved, and the detection guards |
 | [docs/spectral-windows.md](docs/spectral-windows.md) | multiple spw, MFS bandwidth limits, irregular cube frequencies |
+| [docs/matrix-free.md](docs/matrix-free.md) | meshes above 100 × 100: the matrix-free solve, and what differs from the dense path |
 | [docs/large-datasets.md](docs/large-datasets.md) | 10^5 visibilities: which NUFFT, where the memory goes, and finding the source before choosing `--fov` |
 | [docs/generalisation.md](docs/generalisation.md) | the generalisation suite: a crowded field, four arrays, three noise levels |
 | [docs/design-notes.md](docs/design-notes.md) | the grid trap, reading the residual map, under-constrained fits, and other things that bite |

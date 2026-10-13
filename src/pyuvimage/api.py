@@ -502,6 +502,17 @@ def run(
         )
     n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
     n_image_pixels = int(np.prod(geometry.shape_native))
+    from . import matfree
+
+    if n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS:
+        logger.warning(
+            "a %dx%d mesh (%d pixels) is above the %d where the matrix-free "
+            "solve takes over, but that solve runs on the streamed path only "
+            "and this run is in memory (streaming %r). The dense algebra here "
+            "costs O(n_mesh^3) per solve and O(n_mesh^2) memory: give a "
+            "dataset on disk with --streaming, or a coarser --mesh.",
+            *geometry.mesh_shape, n_pix, matfree.MATRIX_FREE_MIN_MESH_PIXELS,
+            streaming)
     # Order matters here, and it is the opposite of what it used to be.
     #
     # The inversion is resolved FIRST, because the transformer choice depends
@@ -1127,15 +1138,25 @@ def run_streamed(
     chunk_transformer = ag.TransformerDFT
     kernel_cache_dir = Path(kernel_cache) if kernel_cache else (
         Path(out).parent if out is not None else None)
-    fitting.check_memory(
-        header.n_samples, n_pix, None, inversion="sparse",
-        n_image_pixels=n_image_pixels,
-    )
-    logger.info(
-        "  ...that figure counts %d visibilities as held; on the streaming "
-        "path they are not, and the resident total is the model's terms plus "
-        "one chunk of %d", header.n_samples, chunk_k,
-    )
+    from . import matfree
+
+    matrix_free = n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS
+    if matrix_free:
+        logger.info(
+            "matrix-free path (%d mesh pixels > %d): roughly %.2f GB -- image-"
+            "sized FFT buffers and a sparse factorisation, nothing n_mesh^2",
+            n_pix, matfree.MATRIX_FREE_MIN_MESH_PIXELS,
+            matfree.memory_gb(n_pix, n_image_pixels))
+    else:
+        fitting.check_memory(
+            header.n_samples, n_pix, None, inversion="sparse",
+            n_image_pixels=n_image_pixels,
+        )
+        logger.info(
+            "  ...that figure counts %d visibilities as held; on the streaming "
+            "path they are not, and the resident total is the model's terms plus "
+            "one chunk of %d", header.n_samples, chunk_k,
+        )
     if reload:
         logger.info("--reload: the visibilities are streamed again whether or "
                     "not their terms are cached")
@@ -1234,13 +1255,36 @@ def run_streamed(
         )
 
     logger.info("fitting MFS image (%d visibility samples, none held)...", terms.n_vis)
-    mfs_fit = fitting.fit_dataset(
-        stub, geometry, reg_kind=reg, prior=fixed_prior,
-        positive_only=positive_only, enforce_positive=enforce_positive,
-        criterion=criterion, nu=nu, fixed_scale=beam_scale, envelope=envelope,
-        optimise_envelope=optimise_env, chi2_target=chi2_target,
-        warn_on_chi2=not point_sources,   # judged after the points, as in `run`
-    )
+    if matrix_free:
+        if point_sources:
+            raise NotImplementedError(
+                f"point components are not available on the matrix-free path "
+                f"(a {geometry.mesh_shape[0]}x{geometry.mesh_shape[1]} mesh is "
+                f"above {matfree.MATRIX_FREE_MIN_MESH_PIXELS} pixels); use a "
+                "coarser --mesh or drop --point-sources")
+        logger.info(
+            "mesh of %d pixels > %d: matrix-free solve (w-tilde FFT, sparse "
+            "SPDE Matern prior with nu = 1, conjugate gradients with Powell et "
+            "al. 2021's sparse preconditioner). Unconstrained: no positivity "
+            "on this path.", n_pix, matfree.MATRIX_FREE_MIN_MESH_PIXELS)
+        if uncertainty != "none":
+            logger.warning("--uncertainty %s is not available on the matrix-free "
+                           "path yet; no uncertainty.fits or snr.fits", uncertainty)
+            uncertainty = "none"
+        positive_only = False
+        mfs_fit = matfree.fit_matrix_free(
+            terms, geometry, mask, stub, imager, reg_kind=reg, criterion=criterion,
+            scale=beam_scale, nu=nu, envelope=envelope, chi2_target=chi2_target,
+            coefficient=None if coefficient == "auto" else float(coefficient),
+        )
+    else:
+        mfs_fit = fitting.fit_dataset(
+            stub, geometry, reg_kind=reg, prior=fixed_prior,
+            positive_only=positive_only, enforce_positive=enforce_positive,
+            criterion=criterion, nu=nu, fixed_scale=beam_scale, envelope=envelope,
+            optimise_envelope=optimise_env, chi2_target=chi2_target,
+            warn_on_chi2=not point_sources,   # judged after the points, as in `run`
+        )
     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
     point_solution = None
     if point_sources:
@@ -1320,7 +1364,7 @@ def run_streamed(
             enforce_positive=enforce_positive, criterion=criterion, nu=nu,
             envelope=envelope, chi2_target=chi2_target, meta=header.meta,
             pb_correction=pb_correction, dish=dish, pb_factor=pb_factor,
-            oversample=oversample, uncertainty=uncertainty,
+            oversample=oversample, uncertainty=uncertainty, matrix_free=matrix_free,
         )
 
         def task(c, key):
@@ -2179,13 +2223,24 @@ def _fit_streamed_channel(task: dict) -> dict:
     geometry, terms_c = task["geometry"], task["terms"]
     stub_c = stm.stub_dataset_from_terms(terms_c, geometry, task["mask"])
     imager_c = fitting.imager_for(stub_c)
-    sf = fitting.fit_dataset(
-        stub_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
-        positive_only=task["positive_only"],
-        enforce_positive=task["enforce_positive"],
-        criterion=task["criterion"], nu=task["nu"], envelope=task["envelope"],
-        chi2_target=task["chi2_target"], warn_on_chi2=False,
-    )
+    if task.get("matrix_free"):
+        from . import matfree
+
+        frozen = task["frozen"]
+        sf = matfree.fit_matrix_free(
+            terms_c, geometry, task["mask"], stub_c, imager_c, reg_kind=task["reg"],
+            criterion=task["criterion"], scale=frozen["scale"], nu=task["nu"],
+            envelope=task["envelope"], coefficient=frozen["coefficient"],
+            chi2_target=task["chi2_target"],
+        )
+    else:
+        sf = fitting.fit_dataset(
+            stub_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
+            positive_only=task["positive_only"],
+            enforce_positive=task["enforce_positive"],
+            criterion=task["criterion"], nu=task["nu"], envelope=task["envelope"],
+            chi2_target=task["chi2_target"], warn_on_chi2=False,
+        )
     chi2_n = float(sf.chi_squared) / (2 * int(terms_c.n_vis))
     products = _products_for(
         sf, stub_c, geometry, SimpleNamespace(meta=task["meta"]),
