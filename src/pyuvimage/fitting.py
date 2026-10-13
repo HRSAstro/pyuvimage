@@ -1359,7 +1359,7 @@ def sparse_peak_memory_gb(
     n_image_pixels: int,
     n_mesh_pixels: int,
     chunk_k: int = SPARSE_CHUNK_K,
-    batch_size: int = SPARSE_BATCH_SIZE,
+    batch_size: int | None = None,
     kernel_cached: bool = False,
     n_vis: int = 0,
     transformer_cls=None,
@@ -1394,6 +1394,8 @@ def sparse_peak_memory_gb(
     `n_vis=0` reproduces the model-only figure, for callers that only want to
     compare meshes.
     """
+    if batch_size is None:          # as `stub_dataset_from_terms` will size it
+        batch_size = sparse_batch_size_for(n_image_pixels)
     kernel = 0.0 if kernel_cached else sparse_kernel_build_gb(n_image_pixels, chunk_k)
     operator = (
         4.0 * float(n_image_pixels) * (8.0 + 16.0)              # W~ and Khat
@@ -3042,6 +3044,64 @@ class PriorScan:
         }
 
 
+#: chi^2 within this fraction of the weakest prior's is "at the floor"
+CHI2_AT_FLOOR = 0.01
+
+
+def _scan_floor(scan) -> float:
+    """The lowest chi^2 a search reached: its recorded floor (the weakest
+    prior on the delivered solver), else its lowest trial."""
+    if scan is None:
+        return float("nan")
+    floor = float(getattr(scan, "chi2_floor", float("nan")))
+    if np.isfinite(floor):
+        return floor
+    chis = [float(t.get("chi_squared", np.nan)) for t in getattr(scan, "trials", [])
+            if isinstance(t, dict)]
+    chis = [c for c in chis if np.isfinite(c) and c > 0]
+    return min(chis) if chis else float("nan")
+
+
+def chi2_floor_of(single_fit, n_data: int) -> float | None:
+    """chi^2/N of the weakest prior a fit's search tried, if it has one."""
+    floor = _scan_floor(getattr(single_fit, "scan", None))
+    if not (np.isfinite(floor) and n_data):
+        return None
+    return float(floor) / n_data
+
+
+def chi2_excess_message(chi2_per_datum: float, target: float, floor: float | None) -> str:
+    """What a chi^2/N well above its target means.
+
+    When the weakest prior tried sits at the same chi^2/N, smoothing is not
+    the cause: no setting of this model gets closer, so the excess is in the
+    data -- a noise map that is too low, or errors no sky model reproduces --
+    and the products are as good as the data allow. Otherwise the model
+    genuinely fails to reproduce the data. Telling the two apart matters: on
+    NGC 4274 every fit, unconstrained or not, masked or not, sits at 1.35 with
+    a residual that is white at that level, and the old wording called all of
+    them untrustworthy.
+    """
+    head = f"chi^2/N = {chi2_per_datum:.3g} against a target of {target:.3g}"
+    if floor is not None and chi2_per_datum <= floor * (1.0 + CHI2_AT_FLOOR):
+        low = np.sqrt(floor / target) - 1.0
+        return (
+            f"{head}, and the weakest prior tried reaches only {floor:.4g}: the "
+            f"excess is in the data, not in this model's smoothing. Either the "
+            f"noise map is ~{100 * low:.0f}% low, or the data carry errors no "
+            f"sky model can reproduce (residual phase or amplitude calibration "
+            f"errors, emission outside --fov or --mask). If the residual map "
+            f"is white at that level the products are sound relative to it; "
+            f"re-estimate the noise (pyuvimage import --noise) or pass "
+            f"--chi2-target {floor:.3g} to say so."
+        )
+    return (
+        f"{head}: the model does not reproduce the data and its products "
+        f"should not be trusted. Usual causes are emission outside --fov, a "
+        f"mesh too coarse for the S/N, or an underestimated noise map."
+    )
+
+
 def chi2_floor_tolerance(n_data: int | None = None) -> float:
     """How far above the chi^2 floor still counts as "fits essentially as well".
 
@@ -3148,12 +3208,22 @@ def structure_ratio_scatter(imager) -> float:
     it is 0.05.
     """
     beam = np.asarray(imager.dirty_beam, dtype=float)
-    inside = getattr(imager, "inside", None)
-    n_pixels = int(np.sum(inside)) if getattr(inside, "shape", None) == beam.shape \
-        else beam.size
+    inside = _structure_pixels(imager, beam.shape)
+    n_pixels = int(np.sum(inside)) if inside is not None else beam.size
     if n_pixels <= 0:
         return float("nan")
     return float(np.sqrt(np.nansum(beam ** 2) / (2.0 * n_pixels)))
+
+
+def _structure_pixels(imager, shape):
+    """The pixels the structure ratio is measured on, or None for all."""
+    inside = getattr(imager, "inside", None)
+    inside = inside if getattr(inside, "shape", None) == tuple(shape) else None
+    region = getattr(imager, "structure_region", None)
+    if getattr(region, "shape", None) == tuple(shape):
+        region = np.asarray(region, bool)
+        inside = region if inside is None else (inside & region)
+    return inside
 
 
 def _structure_ratio(resid: np.ndarray, chi2: float, imager, n_data: int) -> float:
@@ -3174,9 +3244,13 @@ def _structure_ratio_from_map(resid_map: np.ndarray, chi2: float, imager, n_data
             return float("nan")
         resid_map = np.asarray(resid_map, dtype=float) / rms
         # the transformer returns zeros outside the real-space mask, which
-        # would drag the rms down; measure only where the image is defined
-        inside = imager.inside
-        if getattr(inside, "shape", None) == resid_map.shape:
+        # would drag the rms down; measure only where the image is defined --
+        # and, for a masked mesh, only where the model can act
+        # (`structure_region`): outside an emission mask the residual holds
+        # what the model is forbidden to fit, and counting it makes the
+        # structure target unreachable at any prior
+        inside = _structure_pixels(imager, resid_map.shape)
+        if inside is not None:
             resid_map = resid_map[inside]
         measured = float(np.nanstd(resid_map))
     except Exception as e:  # pragma: no cover - diagnostic only
@@ -3297,6 +3371,10 @@ def optimise_prior(
     # The structure criterion is measured in the image plane, so it needs a
     # dirty imager; build it once and reuse it across every evaluation.
     imager = imager_for(dataset) if criterion == "structure" else None
+    # a masked mesh can only act inside its mask: judge the residual there
+    region = getattr(geometry.mesh, "region", None) if geometry.mesh is not None else None
+    if imager is not None and region is not None:
+        imager.structure_region = region
     # positivity changes the residual map, so the structure search has to run
     # on the solver the delivered fit uses; the other criteria stay on the
     # fast unconstrained solve (the evidence is defined for it).
@@ -4236,7 +4314,7 @@ def fit_dataset(
             dataset, geometry, reg_kind="matern", prior=None,
             positive_only=positive_only, criterion=criterion, nu=nu,
             fixed_scale=fixed_scale, chi2_target=chi2_target,
-            enforce_positive=enforce_positive, warn_on_chi2=warn_on_chi2,
+            enforce_positive=enforce_positive, warn_on_chi2=False,
             system=system,
         )
         envelope["brightness"] = np.clip(first.model_mesh_image.ravel(), 0.0, None)
@@ -4635,13 +4713,9 @@ def fit_dataset(
     if np.isfinite(chi2_final) and warn_on_chi2:
         ratio = chi2_final / (chi2_target * n_data)
         if ratio > CHI2_UNREACHABLE_FACTOR:
-            logger.warning(
-                "chi^2/N = %.3g against a target of %.3g: the model does not "
-                "reproduce the data and its products should not be trusted. "
-                "Usual causes are emission outside --fov, a mesh too coarse "
-                "for the S/N, or an underestimated noise map.",
-                chi2_final / n_data, chi2_target,
-            )
+            floor = _scan_floor(scan)
+            floor = floor / n_data if np.isfinite(floor) else None
+            logger.warning("%s", chi2_excess_message(chi2_final / n_data, chi2_target, floor))
 
     return SingleFit(
         fit=fit, geometry=geometry, prior=prior, scan=scan,

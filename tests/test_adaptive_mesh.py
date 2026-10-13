@@ -75,3 +75,33 @@ def test_mask_options_are_checked(demo, tmp_path):
                 write=False)
     with pytest.raises(ValueError, match="mesh_type"):
         api.run(uvd, fov=3.0, out=tmp_path / "x", mesh_type="voronoi", write=False)
+
+
+def test_chi2_message_tells_a_data_floor_from_a_bad_model():
+    from pyuvimage import fitting
+
+    at_floor = fitting.chi2_excess_message(1.355, 1.0, 1.353)
+    assert "in the data" in at_floor and "--chi2-target 1.35" in at_floor
+    assert "16% low" in at_floor
+    bad = fitting.chi2_excess_message(1.6, 1.0, 1.05)
+    assert "should not be trusted" in bad
+    assert "should not be trusted" in fitting.chi2_excess_message(1.6, 1.0, None)
+
+
+def test_structure_ratio_is_measured_inside_the_mask_region():
+    """Outside a mask the residual holds what the model may not fit; the
+    ratio is taken over the region the mesh carries."""
+    from types import SimpleNamespace
+
+    from pyuvimage import fitting
+
+    rng = np.random.default_rng(1)
+    resid = rng.normal(size=(40, 40))
+    resid[:, :10] += 5.0 * np.sin(np.arange(40) / 3.0)[:, None]     # structure outside
+    region = np.zeros((40, 40), bool)
+    region[:, 12:] = True
+    imager = SimpleNamespace(rms=1.0, inside=np.ones((40, 40), bool))
+    whole = fitting._structure_ratio_from_map(resid, 1600.0, imager, 1600)
+    imager.structure_region = region
+    masked = fitting._structure_ratio_from_map(resid, 1600.0, imager, 1600)
+    assert whole > 1.5 and masked == pytest.approx(1.0, abs=0.08)

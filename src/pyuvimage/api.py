@@ -303,7 +303,7 @@ def _irregular_geometry(dataset, geometry, *, mesh_type, mesh_points, hilbert_po
         del first
     mesh = adaptive_mesh.build(
         geometry, mesh_type, n_points=mesh_points, adapt=adapt, allowed=allowed,
-        power=hilbert_power, floor=hilbert_floor)
+        power=hilbert_power, floor=hilbert_floor, beam=beam_scale)
     logger.info("mesh: %s", mesh.describe())
     return dataclasses.replace(geometry, mesh=mesh)
 
@@ -859,7 +859,7 @@ def run(
         # than alarming -- an unmodelled compact source is the commonest
         # reason for it. The warning after the point fit judges the model the
         # user actually gets.
-        warn_on_chi2=not point_sources,
+        warn_on_chi2=False,   # the delivered model is judged below, once
     )
     # Optional analytic point components, solved in the same linear system.
     # Opt-in: never added unless asked for, and auto-detected candidates are
@@ -896,16 +896,9 @@ def run(
 
     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
     n_data = 2 * len(d)
-    if mfs_fit.chi_squared / n_data > 1.3 * chi2_target:
-        logger.warning(
-            "the delivered model sits at chi^2/N = %.3g against a target of "
-            "%.3g: it does not reproduce the data, and every product below "
-            "(fluxes, residuals, uncertainties, point sources) should be "
-            "treated as unreliable. Common causes: the field of view (--fov) "
-            "does not cover all the emission, the mesh is too coarse for the "
-            "S/N, or the noise map underestimates the true noise.",
-            mfs_fit.chi_squared / n_data, chi2_target,
-        )
+    if mfs_fit.chi_squared / n_data > fitting.CHI2_UNREACHABLE_FACTOR * chi2_target:
+        logger.warning("the delivered model: %s", fitting.chi2_excess_message(
+            mfs_fit.chi_squared / n_data, chi2_target, fitting.chi2_floor_of(mfs_fit, n_data)))
 
     products: list[ProductSet] = []
     if mode == "mfs":
@@ -915,7 +908,8 @@ def run(
                           oversample, uncertainty, imager=imager)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
-        _report_dynamic_range(products[0], n_data_all, criterion)
+        _report_dynamic_range(products[0], n_data_all, criterion,
+                              region=getattr(geometry.mesh, "region", None))
     else:
         frozen = dict(mfs_fit.prior)
         # Points carried into the cube: the MFS pass decides *where* they
@@ -1233,7 +1227,10 @@ def run_streamed(
     if irregular:
         # a Delaunay mesh: the w-tilde algebra, never the matrix-free solve
         # (which needs the rectangle's grid). Sized by the points it will have.
-        n_pix = int(mesh_points) if mesh_type == "hilbert" and mesh_points else n_pix
+        if mesh_type == "hilbert":
+            from . import adaptive_mesh
+
+            n_pix = int(mesh_points or adaptive_mesh.default_points(geometry))
     matrix_free = n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS and not irregular
     if matrix_free:
         logger.info(
@@ -1383,7 +1380,7 @@ def run_streamed(
             positive_only=positive_only, enforce_positive=enforce_positive,
             criterion=criterion, nu=nu, fixed_scale=beam_scale, envelope=envelope,
             optimise_envelope=optimise_env, chi2_target=chi2_target,
-            warn_on_chi2=not point_sources,   # judged after the points, as in `run`
+            warn_on_chi2=False,   # the delivered model is judged below, once
         )
     scan = mfs_fit.scan.as_dict() if mfs_fit.scan is not None else None
     point_solution = None
@@ -1414,13 +1411,9 @@ def run_streamed(
                 enforce_positive=enforce_positive,
             ),
         )
-    if mfs_fit.chi_squared / n_data > 1.3 * chi2_target:
-        logger.warning(
-            "the delivered model sits at chi^2/N = %.3g against a target of "
-            "%.3g: it does not reproduce the data, and every product below "
-            "should be treated as unreliable.",
-            mfs_fit.chi_squared / n_data, chi2_target,
-        )
+    if mfs_fit.chi_squared / n_data > fitting.CHI2_UNREACHABLE_FACTOR * chi2_target:
+        logger.warning("the delivered model: %s", fitting.chi2_excess_message(
+            mfs_fit.chi_squared / n_data, chi2_target, fitting.chi2_floor_of(mfs_fit, n_data)))
 
     dish = dish_diameter or header.meta.get("dish_diameter_m")
     if pb_correction and not dish:
@@ -1432,7 +1425,8 @@ def run_streamed(
             mfs_fit, stub, geometry, header, header.central_frequency, pb_correction,
             dish, pb_factor, oversample, uncertainty, imager=imager,
         )]
-        _report_dynamic_range(products[0], n_data_all, criterion)
+        _report_dynamic_range(products[0], n_data_all, criterion,
+                              region=getattr(geometry.mesh, "region", None))
         freqs = np.atleast_1d(header.central_frequency)
     else:
         # -- the channels: `run`'s cube loop, each on its own stub ----------
@@ -2164,7 +2158,7 @@ def _source_flux_records(products):
 
 
 def _report_dynamic_range(
-    p, n_data: int | None = None, criterion: str | None = None
+    p, n_data: int | None = None, criterion: str | None = None, region=None
 ) -> None:
     """Put the residual in proportion to how bright the source is.
 
@@ -2206,14 +2200,23 @@ def _report_dynamic_range(
         return
     chi2_per_datum = float(p.chi_squared) / n_data
     expected = np.sqrt(chi2_per_datum)
-    measured = float(np.nanstd(np.asarray(p.residual_sigma, dtype=float)))
+    resid_sigma = np.asarray(p.residual_sigma, dtype=float)
+    measured = float(np.nanstd(resid_sigma))
     if not (np.isfinite(expected) and expected > 0 and np.isfinite(measured)):
         return
+    if region is not None and np.shape(region) == resid_sigma.shape:
+        # a masked fit is judged where it can act; the rest is reported
+        outside = float(np.nanstd(resid_sigma[~np.asarray(region, bool)]))
+        measured = float(np.nanstd(resid_sigma[np.asarray(region, bool)]))
+        logger.info(
+            "residual map outside the mask (+1 beam): rms %.2f sigma -- what "
+            "the mask leaves unmodelled", outside)
     ratio = measured / expected
     logger.info(
-        "residual map rms %.2f sigma against %.2f expected for white noise "
+        "residual map rms %.2f sigma%s against %.2f expected for white noise "
         "at chi2/N = %.3f: structure ratio %.2f",
-        measured, expected, chi2_per_datum, ratio,
+        measured, " inside the mask (+1 beam)" if region is not None else "",
+        expected, chi2_per_datum, ratio,
     )
     if ratio > STRUCTURE_RATIO_WARN:
         logger.warning(

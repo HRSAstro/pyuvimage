@@ -492,14 +492,17 @@ def test_the_adaptive_first_pass_honours_warn_on_chi2(monkeypatch, small, caplog
             dataset, geom, reg_kind="adaptive", positive_only=False,
             fixed_scale=0.5, envelope=dict(envelope), warn_on_chi2=False,
         )
-    assert "should not be trusted" not in caplog.text
+    assert "against a target of" not in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="pyuvimage"):
         fitting.fit_dataset(
             dataset, geom, reg_kind="adaptive", positive_only=False,
             fixed_scale=0.5, envelope=dict(envelope), warn_on_chi2=True,
         )
-    assert caplog.text.count("should not be trusted") == 2
+    # once: the first pass is an intermediate whose chi^2 the second pass's
+    # warning already covers (it used to warn twice for one fit)
+    # (here at the weakest prior's chi^2 too, so it reads as a data floor)
+    assert caplog.text.count("against a target of") == 1
 
 
 def test_the_delivered_fit_is_a_real_framework_fit(small):

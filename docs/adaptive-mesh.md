@@ -54,6 +54,22 @@ residual is white across the galaxy, with a few compact >5σ blobs outside it
 (real emission the mask leaves out: widen it there) and ±3σ broad structure
 (the large-scale emission the data barely constrain).
 
+**Choosing the strength with a mask.** The `structure` criterion asks the
+residual map to look like white noise. Outside a mask it cannot: it holds what
+the model is forbidden to fit, so over the whole field the target was
+unreachable at any strength and the search fell back to the evidence — on NGC
+4274 a weaker prior that overfitted inside the mask (residual 0.82 of white
+there). With a mask the ratio is measured inside it, dilated by one beam; the
+target is then reached (0.99 on NGC 4274), and the run reports the residual
+outside the mask separately.
+
+**χ² above target at every strength.** On NGC 4274 every fit — masked or not,
+constrained or not — sits at χ²/N = 1.355, the same as with the prior switched
+off. That excess is in the data (a noise map ~16% low, or errors no sky model
+reproduces, such as residual phase errors), not in the fit; the warning says
+so when the delivered χ² is within 1% of the weakest prior's, and suggests
+`--chi2-target` at that floor.
+
 **Making a mask.**
 
 - A **CASA region file** (`.crtf`) from the CASA viewer or CARTA — ellipses,

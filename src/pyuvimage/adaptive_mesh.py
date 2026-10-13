@@ -52,6 +52,10 @@ class IrregularMesh:
     points: np.ndarray
     n_zeroed: int = 0
     kind: str = "hilbert"
+    #: where the model can act (a mask dilated by a beam), native image
+    #: grid: the structure ratio is measured here, since the residual outside
+    #: a mask holds what the model is forbidden to fit (`fitting`)
+    region: np.ndarray | None = None
 
     @property
     def pixels(self) -> int:
@@ -158,7 +162,7 @@ def lattice_points(geometry, allowed=None) -> np.ndarray:
 
 def build(geometry, mesh_type: str, *, n_points: int | None = None, adapt=None,
           allowed=None, power: float = HILBERT_POWER,
-          floor: float = HILBERT_FLOOR) -> IrregularMesh | None:
+          floor: float = HILBERT_FLOOR, beam: float | None = None) -> IrregularMesh | None:
     """The irregular mesh for these options, or None for the plain rectangle."""
     if mesh_type not in MESH_TYPES:
         raise ValueError(f"mesh type must be one of {MESH_TYPES}, not {mesh_type!r}")
@@ -168,7 +172,7 @@ def build(geometry, mesh_type: str, *, n_points: int | None = None, adapt=None,
     if mesh_type == "hilbert":
         if adapt is None:
             raise ValueError("a Hilbert mesh needs an adapt image")
-        n = int(n_points or geometry.mesh_shape[0] * geometry.mesh_shape[1] // 4)
+        n = int(n_points or default_points(geometry))
         inner = hilbert_points(adapt, geometry.pixel_scale, n, power, floor, allowed)
         kind = "hilbert"
     else:
@@ -184,7 +188,23 @@ def build(geometry, mesh_type: str, *, n_points: int | None = None, adapt=None,
         _field_ring(geometry.shape_native, geometry.pixel_scale, 4 * spacing),
     ])
     zero = np.unique(np.round(zero, 9), axis=0)
-    return IrregularMesh(np.concatenate([inner, zero]), len(zero), kind)
+    return IrregularMesh(np.concatenate([inner, zero]), len(zero), kind,
+                         region=model_region(allowed, geometry.pixel_scale,
+                                             beam or 2.0 * spacing))
+
+
+def model_region(allowed, pixel_scale: float, beam: float) -> np.ndarray:
+    """The mask dilated by one beam: where a masked model's residual is
+    measured (its sidelobes reach about that far)."""
+    from scipy.ndimage import binary_dilation
+
+    n = max(1, int(round(beam / pixel_scale)))
+    return binary_dilation(np.asarray(allowed, bool), iterations=n)
+
+
+def default_points(geometry) -> int:
+    """`--mesh-points` when not given: a quarter of the nominal mesh."""
+    return int(geometry.mesh_shape[0] * geometry.mesh_shape[1] // 4)
 
 
 def adapt_mesh_shape(geometry) -> tuple[int, int]:
