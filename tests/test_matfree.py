@@ -140,3 +140,25 @@ def test_fourier_preconditioners_agree_with_the_sparse_one(small, kind):
         for dx in range(-2, 3):
             stencil[dy, dx] = col[my // 2 + dy, mx // 2 + dx]
     np.testing.assert_allclose(np.real(np.fft.fft2(stencil)), q, rtol=1e-10, atol=1e-10 * q.max())
+
+
+def test_pb_in_model_reaches_the_matrix_free_prior(small, tmp_path, monkeypatch):
+    """--pb-in-model puts the prior on the true sky: on this path, prior
+    weights times the PB. It used to be dropped silently."""
+    from pyuvimage import api
+
+    monkeypatch.setattr(matfree, "MATRIX_FREE_MIN_MESH_PIXELS", 100)
+    seen = []
+    orig = matfree.SparseMaternPrior.__init__
+
+    def spy(self, order, mesh_shape, pixel_scale, scale, weights=None):
+        seen.append(None if weights is None else np.asarray(weights).copy())
+        orig(self, order, mesh_shape, pixel_scale, scale, weights=weights)
+
+    monkeypatch.setattr(matfree.SparseMaternPrior, "__init__", spy)
+    api.run(small["uvd"], fov=3.0, mesh_shape=(16, 16), out=tmp_path / "pb", reg="matern",
+            streaming=True, pb_correction=False, pb_in_model=True, dish_diameter=12.0,
+            write=False)
+    assert seen and all(w is not None for w in seen)
+    w = seen[-1]
+    assert w.max() == pytest.approx(1.0, abs=0.01) and w.min() < w.max()

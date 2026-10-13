@@ -1318,6 +1318,27 @@ SPARSE_KERNEL_BUILD_ARRAYS = 4
 SPARSE_OPERATOR_BATCH_ARRAYS = 4
 
 
+#: the share of available memory the F-assembly batches may take
+SPARSE_BATCH_MEMORY_SHARE = 0.25
+
+
+def sparse_batch_size_for(n_image_pixels: int, available_gb: float | None = None) -> int:
+    """Columns per batch while F is assembled, sized to memory.
+
+    Each column in flight holds `SPARSE_OPERATOR_BATCH_ARRAYS` padded
+    (2Ny, 2Nx) complex images: 9.4 MB apiece at a 384 x 384 image, so the
+    default 128 columns are ~5 GB -- more than the whole fit needs otherwise,
+    and more than a 7 GB machine has. Shrunk to `SPARSE_BATCH_MEMORY_SHARE` of
+    what is available (never below 8); the batch costs only time.
+    """
+    per_column_gb = SPARSE_OPERATOR_BATCH_ARRAYS * 4.0 * float(n_image_pixels) * 16.0 / 1e9
+    have = available_memory_gb() if available_gb is None else available_gb
+    if have is None:
+        return SPARSE_BATCH_SIZE
+    fits = int(SPARSE_BATCH_MEMORY_SHARE * have / per_column_gb)
+    return int(max(8, min(SPARSE_BATCH_SIZE, fits)))
+
+
 def sparse_kernel_build_gb(n_image_pixels: int, chunk_k: int = SPARSE_CHUNK_K) -> float:
     """Peak GB of the one-off W~ kernel build.
 
@@ -1667,7 +1688,7 @@ def with_sparse_operator(
     geometry=None,
     cache_dir=None,
     chunk_k: int | None = None,
-    batch_size: int = SPARSE_BATCH_SIZE,
+    batch_size: int | None = None,
     reuse_cache: bool = True,
 ):
     """Attach the w-tilde operator, building or reusing its kernel.
@@ -1763,6 +1784,8 @@ def with_sparse_operator(
             except Exception as e:
                 logger.warning("could not cache the kernel at %s (%s)", path, e)
 
+    if batch_size is None:
+        batch_size = sparse_batch_size_for(int(np.prod(kernel.shape)) // 4)
     sparse = dataset.apply_sparse_operator(
         nufft_precision_operator=kernel, batch_size=batch_size
     )
@@ -2149,16 +2172,27 @@ def _base_regularization(
     )
 
 
+def _is_irregular(mesh) -> bool:
+    return hasattr(mesh, "points") and hasattr(mesh, "n_zeroed")
+
+
 def galaxy_for(
-    mesh_shape: tuple[int, int],
+    mesh_shape,
     reg_kind: str,
     coefficient: float,
     reg_scale: float | None = None,
     nu: float = DEFAULT_NU,
     envelope: dict | None = None,
 ) -> ag.Galaxy:
+    if _is_irregular(mesh_shape):
+        # `adaptive_mesh.IrregularMesh`: Delaunay on given points, the last
+        # n_zeroed held at zero (a mask's boundary)
+        mesh = ag.mesh.Delaunay(pixels=mesh_shape.pixels,
+                                zeroed_pixels=int(mesh_shape.n_zeroed))
+    else:
+        mesh = ag.mesh.RectangularUniform(shape=mesh_shape)
     pix = ag.Pixelization(
-        mesh=ag.mesh.RectangularUniform(shape=mesh_shape),
+        mesh=mesh,
         regularization=make_regularization(
             reg_kind, coefficient, reg_scale, nu, envelope
         ),
@@ -2169,7 +2203,7 @@ def galaxy_for(
 
 def fit_at(
     dataset: ag.Interferometer,
-    mesh_shape: tuple[int, int],
+    mesh_shape,
     reg_kind: str,
     coefficient: float,
     positive_only: bool = True,
@@ -2181,9 +2215,13 @@ def fit_at(
     galaxy = galaxy_for(mesh_shape, reg_kind, coefficient, reg_scale, nu, envelope)
     settings = ag.Settings(use_positive_only_solver=positive_only)
     kwargs = {}
-    if adapt_image is not None:
+    irregular = _is_irregular(mesh_shape)
+    if adapt_image is not None or irregular:
         kwargs["adapt_images"] = ag.AdaptImages(
-            galaxy_image_dict={galaxy: adapt_image}
+            galaxy_image_dict={galaxy: adapt_image} if adapt_image is not None else None,
+            galaxy_image_plane_mesh_grid_dict=(
+                {galaxy: ag.Grid2DIrregular(np.asarray(mesh_shape.points))}
+                if irregular else None),
         )
     return ag.FitInterferometer(
         dataset=dataset, galaxies=[galaxy], settings=settings, **kwargs
@@ -2231,6 +2269,107 @@ def fit_at(
 # `operated_mapping_matrix` on it would trigger the dense n_vis x n_mesh build
 # the sparse path exists to avoid; `curvature_matrix` and `data_vector` do not.
 
+
+
+# --------------------------------------------------------------------------
+# The mesh -> image mapping, kept sparse
+# --------------------------------------------------------------------------
+#
+# autoarray's `mapper.mapping_matrix` is a dense (n_image_pixels, n_mesh)
+# array, yet each image pixel takes weights from at most four mesh pixels
+# (three on a Delaunay mesh). At a 48 x 48 mesh on NGC 4274's 384 x 384 image
+# it is 1.3 GB, and the sparse inversion's data vector built it twice over
+# (`np.hstack` copies): 5.4 GB for an inversion whose curvature matrix is
+# 42 MB, which is what killed those fits. At a 192 x 192 mesh it would be
+# 43 GB. Everything here uses the sparse form instead.
+
+
+def sparse_mapping(mapper) -> "sp.csr_matrix":
+    """The mapper's interpolation matrix (image slim x mesh), sparse.
+
+    Built from the per-sub-pixel indexes and weights autoarray keeps, never
+    from `mapping_matrix`. Equal to `mapping_matrix` to the bit.
+    """
+    import scipy.sparse as sp
+
+    idx = np.asarray(mapper.pix_indexes_for_sub_slim_index)
+    wts = np.asarray(mapper.pix_weights_for_sub_slim_index, dtype=float)
+    sizes = np.asarray(mapper.pix_sizes_for_sub_slim_index)
+    sub2slim = np.asarray(mapper.slim_index_for_sub_slim_index)
+    n_slim = int(sub2slim.max()) + 1
+    n_mesh = int(mapper.pixels)
+    counts = np.bincount(sub2slim, minlength=n_slim).astype(float)
+    keep = np.arange(idx.shape[1])[None, :] < sizes[:, None]
+    rows = np.broadcast_to(sub2slim[:, None], idx.shape)[keep]
+    cols = idx[keep]
+    vals = (wts / counts[sub2slim][:, None])[keep]
+    return sp.csr_matrix((vals, (rows, cols)), shape=(n_slim, n_mesh))
+
+
+_SPARSE_MAPPING_ATTR = "_pyuvimage_sparse_mapping"
+
+
+def mesh_mapping(obj):
+    """`obj`'s mapping matrix: sparse (and cached on it) for a mesh mapper,
+    the dense array for anything else (a linear function list)."""
+    cached = obj.__dict__.get(_SPARSE_MAPPING_ATTR)
+    if cached is not None:
+        return cached
+    if not hasattr(obj, "pix_indexes_for_sub_slim_index"):
+        return np.asarray(obj.mapping_matrix)
+    M = sparse_mapping(obj)
+    obj.__dict__[_SPARSE_MAPPING_ATTR] = M
+    return M
+
+
+def diag_quadratic(M, C: np.ndarray) -> np.ndarray:
+    """diag(M C M^T) for a sparse M with a few entries per row, without
+    forming the (n_image, n_mesh) product."""
+    import scipy.sparse as sp
+
+    if not sp.issparse(M):
+        return np.einsum("ij,jk,ik->i", M, C, M, optimize=True)
+    M = M.tocsr()
+    n = M.shape[0]
+    nnz = np.diff(M.indptr)
+    k = int(nnz.max()) if n else 0
+    idx = np.zeros((n, max(k, 1)), dtype=int)
+    wts = np.zeros((n, max(k, 1)))
+    pos = np.arange(M.nnz) - np.repeat(M.indptr[:-1], nnz)
+    rows = np.repeat(np.arange(n), nnz)
+    idx[rows, pos] = M.indices
+    wts[rows, pos] = M.data
+    return np.einsum("na,nb,nab->n", wts, wts, C[idx[:, :, None], idx[:, None, :]])
+
+
+def _patch_sparse_data_vector() -> None:
+    """D = L^T d~ on autoarray's sparse interferometer inversion through the
+    sparse mapping, not its dense `mapping_matrix` (see above). Same numbers;
+    linear-function objects keep autoarray's product."""
+    try:
+        from autoarray.inversion.inversion.interferometer.sparse import (
+            InversionInterferometerSparse as _Sparse,
+        )
+        from autonerves.tools.decorators import cached_property as _cached
+    except ImportError:          # pragma: no cover - older autoarray
+        return
+    if getattr(_Sparse, "_pyuvimage_patched", False):
+        return
+
+    def data_vector(self):
+        dirty = getattr(self.dataset, "sparse_dirty_image", None)
+        if dirty is None:
+            dirty = self.dataset.sparse_operator.dirty_image
+        dirty = np.asarray(dirty)
+        parts = [np.asarray(mesh_mapping(obj).T @ dirty).ravel()
+                 for obj in self.linear_obj_list]
+        return np.concatenate(parts)
+
+    _Sparse.data_vector = _cached(data_vector)
+    _Sparse._pyuvimage_patched = True
+
+
+_patch_sparse_data_vector()
 
 @dataclass
 class Trial:
@@ -2633,8 +2772,8 @@ class LinearSystem:
     # ------------------------------------------------------------------
     @property
     def mapping_matrix(self) -> np.ndarray:
-        """Mesh -> image-pixel mapping, [n_image_pixels, n_mesh]."""
-        return np.asarray(self.linear_obj.mapping_matrix)
+        """Mesh -> image-pixel mapping, [n_image_pixels, n_mesh] (sparse)."""
+        return mesh_mapping(self.linear_obj)
 
     @property
     def operated_mapping_matrix(self):
@@ -2729,9 +2868,7 @@ def _is_dense_inversion(inversion) -> bool:
 _SYSTEM_ATTR = "_pyuvimage_linear_system"
 
 
-def build_linear_system(
-    dataset: ag.Interferometer, mesh_shape: tuple[int, int]
-) -> LinearSystem:
+def build_linear_system(dataset: ag.Interferometer, mesh_shape) -> LinearSystem:
     """F and D for one (dataset, mesh), from one throwaway framework fit.
 
     The regularisation and its coefficient are irrelevant to what is read off
@@ -3119,7 +3256,8 @@ def optimise_prior(
     and D. Nothing in the search depends on the number of visibilities once
     that system exists.
     """
-    mesh_shape = geometry.mesh_shape
+    # the rectangle, or an irregular mesh (`adaptive_mesh`) standing in for it
+    mesh_shape = geometry.mesh if geometry.mesh is not None else geometry.mesh_shape
     if n_data is None:
         n_data = n_data_of(dataset)
     if system is None:
@@ -3663,6 +3801,10 @@ class SingleFit:
         mapper), so the per-mesh-pixel flux carries that factor.
         """
         recon = self.reconstruction
+        if self.geometry.mesh is not None:
+            # an irregular mesh has no grid: its values, one per point
+            # (surface brightness per image pixel, as the inversion solves)
+            return np.asarray(recon)
         k2 = (
             self.geometry.shape_native[0] // self.geometry.mesh_shape[0]
         ) ** 2
@@ -3681,7 +3823,7 @@ class SingleFit:
         inv = self.fit.inversion
         slim = None
         for obj, values in inv.reconstruction_dict.items():
-            contrib = np.asarray(obj.mapping_matrix) @ np.asarray(values)
+            contrib = mesh_mapping(obj) @ np.asarray(values)
             slim = contrib if slim is None else slim + contrib
         return np.asarray(
             ag.Array2D(
@@ -3721,10 +3863,10 @@ class SingleFit:
         """sqrt(diag(M C M^T)) on the image grid, for a parameter covariance."""
         var = None
         for obj, _ in self.fit.inversion.reconstruction_dict.items():
-            M = np.asarray(obj.mapping_matrix)
+            M = mesh_mapping(obj)
             sl = self._parameter_slice(obj)
             block = cov[sl, :][:, sl]
-            contrib = np.einsum("ij,jk,ik->i", M, block, M, optimize=True)
+            contrib = diag_quadratic(M, block)
             var = contrib if var is None else var + contrib
         return np.asarray(
             ag.Array2D(
@@ -3763,7 +3905,7 @@ class SingleFit:
         mask = self.fit.dataset.real_space_mask
         shape = tuple(int(n) for n in self.geometry.shape_native)
         unmasked = np.flatnonzero(~np.asarray(mask).astype(bool).ravel())
-        objs = [(np.asarray(obj.mapping_matrix), self._parameter_slice(obj))
+        objs = [(mesh_mapping(obj), self._parameter_slice(obj))
                 for obj, _ in self.fit.inversion.reconstruction_dict.items()]
         n_mesh = sum(sl.stop - sl.start for _, sl in objs)
         var = np.zeros(shape)
@@ -3847,7 +3989,7 @@ class SingleFit:
         inv = self.fit.inversion
         slim = None
         for obj, _ in inv.reconstruction_dict.items():
-            M = np.asarray(obj.mapping_matrix)
+            M = mesh_mapping(obj)
             sl = self._parameter_slice(obj)
             contrib = M @ values[sl]
             slim = contrib if slim is None else slim + contrib
@@ -4010,7 +4152,7 @@ class SingleFit:
         cov = self.posterior_covariance if cov is None else np.asarray(cov)
         var = 0.0
         for obj, _ in self.fit.inversion.reconstruction_dict.items():
-            M = np.asarray(obj.mapping_matrix)
+            M = mesh_mapping(obj)
             sl = self._parameter_slice(obj)
             v = M.T @ w                      # aperture weights in mesh space
             var += float(v @ cov[sl, :][:, sl] @ v)
@@ -4073,7 +4215,8 @@ def fit_dataset(
     and mesh. Built here when not given; the adaptive first pass hands its own
     to the second so F and D are built once per fit, not once per stage.
     """
-    mesh_shape = geometry.mesh_shape
+    # the rectangle, or an irregular mesh (`adaptive_mesh`) standing in for it
+    mesh_shape = geometry.mesh if geometry.mesh is not None else geometry.mesh_shape
     n_data = n_data_of(dataset)
 
     # F and D once. Everything below -- the probes, the search, the

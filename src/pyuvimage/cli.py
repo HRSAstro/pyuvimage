@@ -369,6 +369,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
     p_fit.add_argument(
+        "--mesh-type", default="rectangular", choices=["rectangular", "hilbert"],
+        help="rectangular (default): an even grid, --mesh per side. hilbert: "
+        "a Delaunay mesh whose points follow the brightness of a quick first "
+        "pass (negatives clipped), so a compact source in a wide field needs "
+        "far fewer of them; --mesh still sets the image grid and the nominal "
+        "resolution. Runs on the w-tilde path at any size. See "
+        "docs/adaptive-mesh.md",
+    )
+    p_fit.add_argument(
+        "--mesh-points", type=int, default=None, metavar="N",
+        help="--mesh-type hilbert: the number of mesh points (default a "
+        "quarter of the nominal mesh's pixels)",
+    )
+    p_fit.add_argument(
+        "--hilbert-power", type=float, default=1.0,
+        help="--mesh-type hilbert: point density goes as (brightness / "
+        "peak)^power; below 1 spreads points from the peaks across fainter "
+        "emission (default 1)",
+    )
+    p_fit.add_argument(
+        "--hilbert-floor", type=float, default=0.02,
+        help="--mesh-type hilbert: the density floor, relative to the peak, "
+        "that keeps some points in faint regions (default 0.02)",
+    )
+    p_fit.add_argument(
+        "--mask", default=None, metavar="FILE",
+        help="an emission mask: a CASA region file (.crtf), a DS9 region file "
+        "(.reg) or a FITS mask (non-zero = emission; e.g. from `pyuvimage "
+        "mask`). The model is held at zero outside it, which keeps the "
+        "large-scale sidelobes of bright extended emission from being "
+        "absorbed as broad flux across the field. Implies positivity. See "
+        "docs/adaptive-mesh.md",
+    )
+    p_fit.add_argument(
         "--image-centre", default="0,0", metavar="x,y|auto",
         help='where to centre the reconstruction, as an offset in arcsec '
         'from the phase centre: "0,0" (the phase centre) is the default and '
@@ -422,6 +456,18 @@ def main(argv: list[str] | None = None) -> int:
         "--max-points", type=int, default=5,
         help="most auto-detected point components to keep (default 5)",
     )
+
+    p_mask = sub.add_parser(
+        "mask", help="paint an emission mask over a FITS image (for --mask)")
+    p_mask.add_argument("image", help="a FITS image to draw over, e.g. a "
+                        "fit's dirty_image.fits or a CASA image")
+    p_mask.add_argument("--out", default="mask.fits", help="the FITS mask to "
+                        "write (default mask.fits)")
+    p_mask.add_argument("--start", default=None, metavar="FILE",
+                        help="start from this mask or region file and refine it")
+    p_mask.add_argument("--backend", default="TkAgg",
+                        help="matplotlib backend for the window (default TkAgg; "
+                        "MacOSX also works on a Mac)")
 
     p_disc = sub.add_parser(
         "disc",
@@ -632,6 +678,11 @@ def main(argv: list[str] | None = None) -> int:
             streaming=args.streaming,
             chunk_k=args.chunk_k,
             workers=args.workers,
+            mesh_type=args.mesh_type,
+            mesh_points=args.mesh_points,
+            hilbert_power=args.hilbert_power,
+            hilbert_floor=args.hilbert_floor,
+            emission_mask=args.mask,
             reload=args.reload,
             pynufft_shift=not args.no_pynufft_shift,
             chi2_target=args.chi2_target,
@@ -651,6 +702,15 @@ def main(argv: list[str] | None = None) -> int:
             # input_parameters.json so the run can be repeated exactly
             input_parameters=config_from_args(p_fit, args),
         )
+        return 0
+
+    if args.command == "mask":
+        from .mask import draw
+
+        print("Paint the emission: '1' add (green), '2' erase (red), '=' / '-' "
+              "brush size, 'z' undo, Esc when done.")
+        out = draw(args.image, args.out, proposal=args.start, backend=args.backend)
+        print(f"mask written to {out}; use it with: pyuvimage fit ... --mask {out}")
         return 0
 
     if args.command == "disc":

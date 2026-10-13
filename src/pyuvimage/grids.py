@@ -6,7 +6,7 @@ immutable geometry object instead of mutating a settings dict).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -30,6 +30,17 @@ class ImageGeometry:
     mesh_shape: tuple[int, int]    # source-reconstruction mesh shape
     mask_radius: float         # circular mask radius [arcsec]
     nyquist_pixel_scale: float
+    #: an irregular mesh (`adaptive_mesh.IrregularMesh`: Hilbert points, or a
+    #: masked lattice) used instead of the ``mesh_shape`` rectangle, which
+    #: then only sets the image grid and the nominal resolution
+    mesh: object = field(default=None, compare=False, repr=False)
+
+    @property
+    def n_mesh_pixels(self) -> int:
+        """Free parameters of the mesh the fit solves for."""
+        if self.mesh is not None:
+            return int(self.mesh.n_free)
+        return int(self.mesh_shape[0] * self.mesh_shape[1])
 
     @property
     def mesh_pixel_scale(self) -> float:

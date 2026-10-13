@@ -77,24 +77,11 @@ def memory_gb(n_mesh: int, n_image: int) -> float:
 # ---------------------------------------------------------------------------
 
 def sparse_mapping(mapper) -> sp.csr_matrix:
-    """The mapper's interpolation matrix M (image slim x mesh), sparse.
+    """The mapper's interpolation matrix M (image slim x mesh), sparse: see
+    `fitting.sparse_mapping`."""
+    from .fitting import sparse_mapping as _sparse_mapping
 
-    Built from the per-sub-pixel indexes and weights autoarray keeps, never
-    from `mapping_matrix`, which is dense (43 GB at a 192 x 192 mesh on its
-    384 x 384 image). Equal to `mapping_matrix` to the bit on the mocks.
-    """
-    idx = np.asarray(mapper.pix_indexes_for_sub_slim_index)
-    wts = np.asarray(mapper.pix_weights_for_sub_slim_index, dtype=float)
-    sizes = np.asarray(mapper.pix_sizes_for_sub_slim_index)
-    sub2slim = np.asarray(mapper.slim_index_for_sub_slim_index)
-    n_slim = int(sub2slim.max()) + 1
-    n_mesh = int(mapper.pixels)
-    counts = np.bincount(sub2slim, minlength=n_slim).astype(float)
-    keep = np.arange(idx.shape[1])[None, :] < sizes[:, None]
-    rows = np.broadcast_to(sub2slim[:, None], idx.shape)[keep]
-    cols = idx[keep]
-    vals = (wts / counts[sub2slim][:, None])[keep]
-    return sp.csr_matrix((vals, (rows, cols)), shape=(n_slim, n_mesh))
+    return _sparse_mapping(mapper)
 
 
 def mesh_grid_order(points: np.ndarray) -> tuple[np.ndarray, tuple[int, int], float]:
@@ -610,6 +597,26 @@ def fit_matrix_free(terms, geometry, mask, stub, imager, *, reg_kind: str, crite
             return fl + (1.0 - fl) * b ** pw
         return None
 
+    # --pb-in-model: the prior on the true sky. On the dense path that is
+    # `envelope.PrimaryBeamPrior` (C^-1 -> P^-1 C^-1 P^-1); here the same
+    # thing is the prior weights times the PB, W -> W P. It used to be
+    # dropped on this path without a word.
+    pb_env = (envelope or {}).get("primary_beam")
+    pb = None
+    if pb_env:
+        from .envelope import SIGMA_TO_FWHM
+
+        sig = float(pb_env["fwhm"]) / SIGMA_TO_FWHM
+        cy, cx = pb_env.get("centre", (0.0, 0.0))
+        r2 = (pts[:, 0] - cy) ** 2 + (pts[:, 1] - cx) ** 2
+        pb = np.clip(np.exp(-0.5 * r2 / sig ** 2),
+                     float(pb_env.get("floor", fitting.PB_PRIOR_FLOOR)), 1.0)
+
+    def with_pb(w):
+        if pb is None:
+            return w
+        return pb if w is None else np.asarray(w, float) * pb
+
     scan = None if coefficient is not None else _Scan(criterion=criterion)
 
     def one_pass(weights, label):
@@ -622,9 +629,11 @@ def fit_matrix_free(terms, geometry, mask, stub, imager, *, reg_kind: str, crite
 
     brightness = (envelope or {}).get("brightness") if reg_kind == "adaptive" else None
     if reg_kind == "adaptive" and brightness is None:
-        _, first = one_pass(None, "adaptive first pass (plain Matern)")
+        _, first = one_pass(with_pb(None), "adaptive first pass (plain Matern)")
         brightness = first.s
-    system, sol = one_pass(weights_for(envelope, brightness),
+    if reg_kind == "adaptive" and pb is not None and brightness is not None:
+        brightness = np.clip(np.asarray(brightness, float), 0.0, None) / pb   # true sky
+    system, sol = one_pass(with_pb(weights_for(envelope, brightness)),
                            "fit" if reg_kind != "adaptive" else "adaptive second pass")
     try:
         lnz = system.log_evidence(sol)

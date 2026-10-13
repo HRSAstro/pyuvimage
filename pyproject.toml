@@ -29,6 +29,8 @@ dependencies = [
 [project.optional-dependencies]
 # Reading CASA measurement sets directly (Linux / macOS):
 ms = ["python-casacore"]
+# --mask with CASA (.crtf) or DS9 (.reg) region files:
+mask = ["regions"]
 # JAX acceleration (strongly recommended for > ~10^4 visibilities):
 jax = ["jax", "nufftax>=0.6.1,<0.7.0"]
 

@@ -242,6 +242,72 @@ def _jsonable_call(call: dict) -> dict:
     return out
 
 
+
+def _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources):
+    from . import adaptive_mesh
+
+    if mesh_type not in adaptive_mesh.MESH_TYPES:
+        raise ValueError(f"mesh_type must be one of {adaptive_mesh.MESH_TYPES}, "
+                         f"not {mesh_type!r}")
+    irregular = mesh_type != "rectangular" or emission_mask is not None
+    if emission_mask is not None and not positive_only:
+        raise ValueError(
+            "--mask holds the model at zero outside the mask through the "
+            "non-negative solver, so it needs positivity: drop --no-positive")
+    if emission_mask is not None:
+        logger.info("--mask: positivity is enforced (the mask's zero boundary "
+                    "is held by the non-negative solver)")
+    if irregular and point_sources:
+        raise NotImplementedError(
+            "point components are not available with --mask or --mesh-type "
+            "hilbert yet")
+    return irregular
+
+
+def _load_emission_mask(emission_mask, geometry, meta):
+    if emission_mask is None:
+        return None
+    from . import mask as mask_mod
+
+    return mask_mod.load(emission_mask, geometry.shape_native, geometry.pixel_scale, meta)
+
+
+def _irregular_geometry(dataset, geometry, *, mesh_type, mesh_points, hilbert_power,
+                        hilbert_floor, allowed, criterion, beam_scale, nu, chi2_target):
+    """``geometry`` with its irregular mesh (`adaptive_mesh`) set, or as it was
+    for a plain rectangle. A Hilbert mesh first fits a coarse rectangle for
+    its adapt image."""
+    import dataclasses
+
+    from . import adaptive_mesh
+
+    if mesh_type == "rectangular" and allowed is None:
+        return geometry
+    adapt = None
+    if mesh_type == "hilbert":
+        shape = adaptive_mesh.adapt_mesh_shape(geometry)
+        logger.info("Hilbert mesh: adapt image from a %dx%d first pass (plain "
+                    "Matern, unconstrained; negatives clipped)", *shape)
+        # a coarse throwaway: its own warnings (a 16x16 mesh rarely reaches
+        # the structure target) are about a fit nobody receives
+        level = logger.level
+        logger.setLevel(max(level, logging.ERROR))
+        try:
+            first = fitting.fit_dataset(
+                dataset, dataclasses.replace(geometry, mesh_shape=shape, mesh=None),
+                reg_kind="matern", criterion=criterion, nu=nu, fixed_scale=beam_scale,
+                positive_only=False, chi2_target=chi2_target, warn_on_chi2=False)
+        finally:
+            logger.setLevel(level)
+        adapt = np.asarray(first.model_image)
+        del first
+    mesh = adaptive_mesh.build(
+        geometry, mesh_type, n_points=mesh_points, adapt=adapt, allowed=allowed,
+        power=hilbert_power, floor=hilbert_floor)
+    logger.info("mesh: %s", mesh.describe())
+    return dataclasses.replace(geometry, mesh=mesh)
+
+
 def run(
     dataset: str | Path | UVData,
     fov: float,
@@ -285,6 +351,11 @@ def run(
     pynufft_shift: bool = True,
     input_parameters: dict | None = None,
     workers: int | str = 1,
+    mesh_type: str = "rectangular",
+    mesh_points: int | None = None,
+    hilbert_power: float = 1.0,
+    hilbert_floor: float = 0.02,
+    emission_mask: str | Path | None = None,
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -415,6 +486,9 @@ def run(
         )
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
+    irregular = _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources)
+    if emission_mask is not None:
+        enforce_positive = True
     uncertainty = resolve_uncertainty_mode(uncertainty, uncertainty_map)
     stream, header = resolve_streaming(
         streaming, dataset, mode=mode, inversion=inversion,
@@ -437,7 +511,9 @@ def run(
             max_points=max_points, point_retune=point_retune,
             chunk_k=chunk_k, reload=reload,
             header=header, cube_prior=cube_prior, transformer=transformer,
-            workers=workers,
+            workers=workers, mesh_type=mesh_type, mesh_points=mesh_points,
+            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
+            emission_mask=emission_mask,
         )
     uvd = (
         dataset
@@ -766,6 +842,12 @@ def run(
             envelope, geometry, uvd.central_frequency, dish, pb_factor,
             uvd.meta.get("image_centre_offset_arcsec"),
         )
+    if irregular:
+        geometry = _irregular_geometry(
+            mfs_dataset, geometry, mesh_type=mesh_type, mesh_points=mesh_points,
+            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
+            allowed=_load_emission_mask(emission_mask, geometry, uvd.meta),
+            criterion=criterion, beam_scale=beam_scale, nu=nu, chi2_target=chi2_target)
     mfs_fit = fitting.fit_dataset(
         mfs_dataset, geometry, reg_kind=reg, prior=fixed_prior,
         positive_only=positive_only, enforce_positive=enforce_positive,
@@ -1011,6 +1093,11 @@ def run_streamed(
     cube_prior: str = "mfs",
     transformer: str = "auto",
     workers: int | str = 1,
+    mesh_type: str = "rectangular",
+    mesh_points: int | None = None,
+    hilbert_power: float = 1.0,
+    hilbert_floor: float = 0.02,
+    emission_mask: str | Path | None = None,
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
 
@@ -1140,7 +1227,14 @@ def run_streamed(
         Path(out).parent if out is not None else None)
     from . import matfree
 
-    matrix_free = n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS
+    irregular = _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources)
+    if emission_mask is not None:
+        enforce_positive = True
+    if irregular:
+        # a Delaunay mesh: the w-tilde algebra, never the matrix-free solve
+        # (which needs the rectangle's grid). Sized by the points it will have.
+        n_pix = int(mesh_points) if mesh_type == "hilbert" and mesh_points else n_pix
+    matrix_free = n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS and not irregular
     if matrix_free:
         logger.info(
             "matrix-free path (%d mesh pixels > %d): roughly %.2f GB -- image-"
@@ -1254,6 +1348,12 @@ def run_streamed(
             header.meta.get("image_centre_offset_arcsec"),
         )
 
+    if irregular:
+        geometry = _irregular_geometry(
+            stub, geometry, mesh_type=mesh_type, mesh_points=mesh_points,
+            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
+            allowed=_load_emission_mask(emission_mask, geometry, header.meta),
+            criterion=criterion, beam_scale=beam_scale, nu=nu, chi2_target=chi2_target)
     logger.info("fitting MFS image (%d visibility samples, none held)...", terms.n_vis)
     if matrix_free:
         if point_sources:

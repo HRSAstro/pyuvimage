@@ -1675,7 +1675,7 @@ def scan_header(source, chunk_k: int = STREAM_CHUNK_K) -> StreamHeader:
 # A dataset object the fit can be handed, holding the operator and no data
 # --------------------------------------------------------------------------
 
-def stub_dataset_from_terms(terms: SparseTerms, geometry, mask, batch_size: int = 128):
+def stub_dataset_from_terms(terms: SparseTerms, geometry, mask, batch_size: int | None = None):
     """An `ag.Interferometer` carrying the w-tilde operator and eight visibilities.
 
     autoarray's inversion factory picks the sparse class whenever
@@ -1700,6 +1700,10 @@ def stub_dataset_from_terms(terms: SparseTerms, geometry, mask, batch_size: int 
     dirty_slim = np.asarray(
         aa.Array2D(values=np.asarray(terms.dirty_image, dtype=float), mask=mask).slim
     )
+    if batch_size is None:
+        from .fitting import sparse_batch_size_for
+
+        batch_size = sparse_batch_size_for(int(np.prod(np.shape(terms.dirty_image))))
     operator = sparse_util.InterferometerSparseOperator.from_nufft_precision_operator(
         nufft_precision_operator=np.asarray(terms.kernel, dtype=float),
         dirty_image=dirty_slim,
