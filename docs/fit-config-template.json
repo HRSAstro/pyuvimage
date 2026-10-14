@@ -51,5 +51,6 @@
   "mesh_points": null,
   "hilbert_power": 1.0,
   "hilbert_floor": 0.02,
-  "mask": null
+  "mask": null,
+  "cube_mesh": "auto"
 }

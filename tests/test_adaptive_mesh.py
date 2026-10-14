@@ -107,8 +107,9 @@ def test_structure_ratio_is_measured_inside_the_mask_region():
     assert whole > 1.5 and masked == pytest.approx(1.0, abs=0.08)
 
 
+@pytest.mark.parametrize("cube_mesh", ["shared", "channel"])
 @pytest.mark.parametrize("streaming", [False, True])
-def test_cube_channels_use_the_shared_hilbert_mesh_and_mask(tmp_path, streaming, caplog):
+def test_cube_channels_use_the_hilbert_mesh_and_mask(tmp_path, streaming, cube_mesh, caplog):
     from pyuvimage.grids import resolve_geometry
 
     fov, m, f0 = 3.0, 16, 230e9
@@ -129,11 +130,57 @@ def test_cube_channels_use_the_shared_hilbert_mesh_and_mask(tmp_path, streaming,
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
         res = api.run(data, fov=fov, out=tmp_path / "o", mode="cube", mesh_shape=(m, m),
                       pb_correction=False, mesh_type="hilbert", mesh_points=120,
-                      emission_mask=str(region), streaming=streaming, write=False)
-    assert "every channel is fitted on the MFS fit's hilbert" in caplog.text
+                      emission_mask=str(region), streaming=streaming, write=False,
+                      cube_mesh=cube_mesh)
+    assert ("every channel is fitted on the MFS fit's hilbert" if cube_mesh == "shared"
+            else "each channel gets its own Hilbert mesh") in caplog.text
     allowed = mask.load(region, res.products[0].model_image.shape, res.geometry.pixel_scale, meta)
     assert len(res.products) == 2
     for p in res.products:
         model = np.asarray(p.model_image)
         assert np.abs(model[~allowed]).max() < 0.01 * model.max()
         assert model.sum() == pytest.approx(0.05, rel=0.05)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_cube_channels_can_have_their_own_hilbert_meshes(tmp_path, streaming, monkeypatch):
+    """--cube-mesh channel: each channel's points follow that channel's
+    emission (here a blob that moves across the field)."""
+    from pyuvimage.grids import resolve_geometry
+    from pyuvimage.uvdata import UVData
+
+    fov, m, f0 = 4.0, 16, 230e9
+    freqs = f0 * (1.0 + 1e-3 * np.arange(3))
+    uvw = mock.random_uv_coverage(1200, m / (2.0 * fov / 206265.0) * 299792458.0 / f0, f0, seed=7)
+    geom = resolve_geometry(fov, float(np.max(np.hypot(uvw[:, 0], uvw[:, 1])) * freqs.max()
+                                       / 299792458.0), mesh_shape=(m, m))
+    parts = []
+    for i, x in enumerate((-1.0, 0.0, 1.0)):
+        t = mock.exponential_image(geom.shape_native, geom.pixel_scale, flux_jy=0.02,
+                                   r_eff_arcsec=0.2, centre_arcsec=(0.0, x))
+        parts.append(mock.simulate(t, geom.pixel_scale, uvw, freqs[i:i + 1], sigma_jy=3e-4,
+                                   seed=10 + i))
+    meta = {"phase_centre_ra_deg": 150.0, "phase_centre_dec_deg": 2.0, "dish_diameter_m": 12.0}
+    uvd = UVData(uvw=uvw, frequencies=freqs, data=np.concatenate([p.data for p in parts]),
+                 noise=np.concatenate([p.noise for p in parts]), meta=meta)
+    built = []
+    orig = adaptive_mesh.build
+
+    def spy(*a, **k):
+        mesh = orig(*a, **k)
+        built.append(mesh)
+        return mesh
+
+    monkeypatch.setattr(adaptive_mesh, "build", spy)
+    data = uvd.write(tmp_path / "ds") if streaming else uvd
+    res = api.run(data, fov=fov, out=tmp_path / "o", mode="cube", mesh_shape=(m, m),
+                  pb_correction=False, reg="matern", coefficient=1e7, mesh_type="hilbert",
+                  mesh_points=60, cube_mesh="channel", streaming=streaming, write=False)
+    assert len(res.products) == 3 and len(built) == 4          # MFS + one per channel
+    xs = [mesh.points[: mesh.n_free, 1].mean() for mesh in built[1:]]
+    assert xs[0] < -0.1 < 0.1 < xs[2] and abs(xs[1]) < 0.15
+    for p in res.products:
+        assert np.asarray(p.model_image).sum() == pytest.approx(0.02, rel=0.1)
+    with pytest.raises(ValueError, match="cube_mesh"):
+        api.run(uvd, fov=fov, out=tmp_path / "x", mode="cube", mesh_shape=(m, m),
+                pb_correction=False, mesh_type="hilbert", cube_mesh="per-plane", write=False)

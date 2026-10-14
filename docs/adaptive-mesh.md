@@ -30,6 +30,30 @@ are 16× smaller. Emission that fills much of the field gains less: NGC 4274
 needed ~4000 points to match its 192² matrix-free model. Below ~1000 points
 faint components are undersampled and show triangular facets.
 
+### Cubes: `--cube-mesh`
+
+A cube shares the MFS fit's prior across its channels. With
+`--cube-mesh channel` — the default (`auto`) for a Hilbert mesh — each channel
+also gets its **own** Hilbert mesh, drawn from a quick first pass on that
+channel's data, so the points follow where that channel is bright: a line that
+moves across the source (a rotating disc) is sampled where it is in each
+channel, not spread over everywhere it is in any. The prior's strength stays
+the MFS fit's, and an adaptive prior's brightness map is the MFS model
+resampled onto each channel's points. The mask, if any, applies to every
+channel. Cost: one coarse first pass per channel (seconds to ~15 s each).
+`--cube-mesh shared` fits every channel on the MFS mesh.
+
+On a mock where a compact source moves across three channels, 60 points per
+channel at a fixed prior: rms error 0.054–0.074 of the peak per channel with
+per-channel meshes, against 0.065–0.095 with the shared one.
+
+**Caution — the shared prior on a moving line.** The prior's strength is
+still chosen on the MFS data, which assumes one sky for every channel. Where
+the emission moves, no single image reproduces all channels (on that mock the
+MFS fit sat at χ²/N ≈ 1400, its chosen prior was far too strong, and the
+channels lost half their flux). For such cubes, fix `--coefficient` from a
+channel fit until the prior can be chosen per channel.
+
 ## `--mask`: emission only where you allow it
 
 A mask says where the sky may hold emission. The mesh's free points are placed

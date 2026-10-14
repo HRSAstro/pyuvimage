@@ -356,6 +356,7 @@ def run(
     hilbert_power: float = 1.0,
     hilbert_floor: float = 0.02,
     emission_mask: str | Path | None = None,
+    cube_mesh: str = "auto",
 ) -> RunResult:
     """Reconstruct an image (mfs) or image cube (cube) from visibilities.
 
@@ -487,6 +488,8 @@ def run(
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
     irregular = _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources)
+    if cube_mesh not in CUBE_MESH_MODES:
+        raise ValueError(f"cube_mesh must be one of {CUBE_MESH_MODES}, not {cube_mesh!r}")
     if emission_mask is not None:
         enforce_positive = True
     uncertainty = resolve_uncertainty_mode(uncertainty, uncertainty_map)
@@ -513,7 +516,7 @@ def run(
             header=header, cube_prior=cube_prior, transformer=transformer,
             workers=workers, mesh_type=mesh_type, mesh_points=mesh_points,
             hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
-            emission_mask=emission_mask,
+            emission_mask=emission_mask, cube_mesh=cube_mesh,
         )
     uvd = (
         dataset
@@ -842,11 +845,12 @@ def run(
             envelope, geometry, uvd.central_frequency, dish, pb_factor,
             uvd.meta.get("image_centre_offset_arcsec"),
         )
+    allowed = None
     if irregular:
+        allowed = _load_emission_mask(emission_mask, geometry, uvd.meta)
         geometry = _irregular_geometry(
             mfs_dataset, geometry, mesh_type=mesh_type, mesh_points=mesh_points,
-            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
-            allowed=_load_emission_mask(emission_mask, geometry, uvd.meta),
+            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor, allowed=allowed,
             criterion=criterion, beam_scale=beam_scale, nu=nu, chi2_target=chi2_target)
     mfs_fit = fitting.fit_dataset(
         mfs_dataset, geometry, reg_kind=reg, prior=fixed_prior,
@@ -957,12 +961,13 @@ def run(
                 "too, so each channel is a single fit rather than its own "
                 "two-pass search"
             )
-        if geometry.mesh is not None:
-            logger.info(
-                "cube mode: every channel is fitted on the MFS fit's %s -- "
-                "the mesh, like the prior, is built once from the MFS data and "
-                "shared, so its point density follows the MFS brightness",
-                geometry.mesh.describe())
+        # the MFS model itself, for per-channel meshes: their frozen
+        # brightness map is this image at each channel's own points
+        mfs_model_native = (np.asarray(mfs_fit.model_image)
+                            if geometry.mesh is not None else None)
+        channel_mesh = _channel_mesh_spec(
+            cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
+            hilbert_floor, allowed, beam_scale, mfs_model_native)
         mfs_fit = _fit_summary(mfs_fit)
         mfs_dataset = None
         gc.collect()
@@ -976,7 +981,7 @@ def run(
             envelope=envelope, chi2_target=chi2_target, cube_points=cube_points,
             beam_size=beam_size, meta=uvd.meta, pb_correction=pb_correction,
             dish=dish, pb_factor=pb_factor, oversample=oversample,
-            uncertainty=uncertainty,
+            uncertainty=uncertainty, channel_mesh=channel_mesh,
         )
 
         def task(c):
@@ -1098,6 +1103,7 @@ def run_streamed(
     hilbert_power: float = 1.0,
     hilbert_floor: float = 0.02,
     emission_mask: str | Path | None = None,
+    cube_mesh: str = "auto",
 ) -> RunResult:
     """`run`, without ever holding the visibilities.
 
@@ -1351,11 +1357,12 @@ def run_streamed(
             header.meta.get("image_centre_offset_arcsec"),
         )
 
+    allowed = None
     if irregular:
+        allowed = _load_emission_mask(emission_mask, geometry, header.meta)
         geometry = _irregular_geometry(
             stub, geometry, mesh_type=mesh_type, mesh_points=mesh_points,
-            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor,
-            allowed=_load_emission_mask(emission_mask, geometry, header.meta),
+            hilbert_power=hilbert_power, hilbert_floor=hilbert_floor, allowed=allowed,
             criterion=criterion, beam_scale=beam_scale, nu=nu, chi2_target=chi2_target)
     logger.info("fitting MFS image (%d visibility samples, none held)...", terms.n_vis)
     if matrix_free:
@@ -1455,12 +1462,13 @@ def run_streamed(
                 "too, so each channel is a single fit rather than its own "
                 "two-pass search"
             )
-        if geometry.mesh is not None:
-            logger.info(
-                "cube mode: every channel is fitted on the MFS fit's %s -- "
-                "the mesh, like the prior, is built once from the MFS data and "
-                "shared, so its point density follows the MFS brightness",
-                geometry.mesh.describe())
+        # the MFS model itself, for per-channel meshes: their frozen
+        # brightness map is this image at each channel's own points
+        mfs_model_native = (np.asarray(mfs_fit.model_image)
+                            if geometry.mesh is not None else None)
+        channel_mesh = _channel_mesh_spec(
+            cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
+            hilbert_floor, allowed, beam_scale, mfs_model_native)
         mfs_summary = _fit_summary(mfs_fit)
         products = []
         freqs = header.frequencies
@@ -1471,6 +1479,7 @@ def run_streamed(
             envelope=envelope, chi2_target=chi2_target, meta=header.meta,
             pb_correction=pb_correction, dish=dish, pb_factor=pb_factor,
             oversample=oversample, uncertainty=uncertainty, matrix_free=matrix_free,
+            channel_mesh=channel_mesh,
         )
 
         def task(c, key):
@@ -2267,6 +2276,82 @@ def _report_dynamic_range(
         )
 
 
+
+CUBE_MESH_MODES = ("auto", "shared", "channel")
+
+
+def _channel_mesh_spec(cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
+                       hilbert_floor, allowed, beam_scale, mfs_model_native):
+    """What a cube channel needs to build its own mesh, or None to share the
+    MFS fit's.
+
+    ``auto`` gives Hilbert meshes per channel -- their point density follows
+    the brightness, and in a line cube the emission moves from channel to
+    channel -- and shares everything else (a rectangle, or a masked lattice,
+    does not depend on the brightness).
+    """
+    if cube_mesh not in CUBE_MESH_MODES:
+        raise ValueError(f"cube_mesh must be one of {CUBE_MESH_MODES}, not {cube_mesh!r}")
+    if geometry.mesh is None:
+        return None
+    per_channel = (cube_mesh == "channel"
+                   or (cube_mesh == "auto" and mesh_type == "hilbert"))
+    if not per_channel or mesh_type != "hilbert":
+        logger.info(
+            "cube mode: every channel is fitted on the MFS fit's %s -- the "
+            "mesh, like the prior, is built once from the MFS data and shared%s",
+            geometry.mesh.describe(),
+            ", so its point density follows the MFS brightness"
+            if mesh_type == "hilbert" else "")
+        return None
+    import dataclasses
+
+    logger.info(
+        "cube mode: each channel gets its own Hilbert mesh (%d points), drawn "
+        "from a quick first pass on that channel's data, so the points follow "
+        "where that channel is bright; the prior's strength (and an adaptive "
+        "prior's brightness map, resampled onto the channel's points) stays "
+        "the MFS fit's", geometry.mesh.n_free)
+    return {
+        "base_geometry": dataclasses.replace(geometry, mesh=None),
+        "mesh_type": mesh_type, "mesh_points": geometry.mesh.n_free,
+        "hilbert_power": hilbert_power, "hilbert_floor": hilbert_floor,
+        "allowed": allowed, "beam_scale": beam_scale,
+        "mfs_model": mfs_model_native,
+    }
+
+
+def _sample_at_points(image_native, points, pixel_scale):
+    """An image (native orientation) at mesh points (y, x) [arcsec], bilinear."""
+    from scipy.ndimage import map_coordinates
+
+    ny, nx = image_native.shape
+    rows = (ny - 1) / 2.0 - np.asarray(points)[:, 0] / pixel_scale
+    cols = np.asarray(points)[:, 1] / pixel_scale + (nx - 1) / 2.0
+    return map_coordinates(np.asarray(image_native, float), [rows, cols], order=1,
+                           mode="nearest")
+
+
+def _channel_geometry(task, dataset, geometry, envelope):
+    """The geometry (and envelope) one cube channel is fitted on: the shared
+    one, or -- under a per-channel mesh -- its own Hilbert mesh, with the
+    frozen MFS brightness map resampled onto the new points."""
+    spec = task.get("channel_mesh")
+    if not spec:
+        return geometry, envelope
+    g = _irregular_geometry(
+        dataset, spec["base_geometry"], mesh_type=spec["mesh_type"],
+        mesh_points=spec["mesh_points"], hilbert_power=spec["hilbert_power"],
+        hilbert_floor=spec["hilbert_floor"], allowed=spec["allowed"],
+        criterion=task["criterion"], beam_scale=spec["beam_scale"], nu=task["nu"],
+        chi2_target=task["chi2_target"])
+    if envelope and envelope.get("brightness") is not None and spec.get("mfs_model") is not None:
+        envelope = dict(envelope)
+        envelope["brightness"] = np.clip(
+            _sample_at_points(spec["mfs_model"], g.mesh.points, g.pixel_scale), 0.0, None)
+    return g, envelope
+
+
 def _fit_cube_channel(task: dict) -> dict:
     """Fit one cube channel at the frozen prior and build its products.
 
@@ -2293,12 +2378,13 @@ def _fit_cube_channel(task: dict) -> dict:
             ds_c, uv_c, n_c, geometry, cache_dir=task["kernel_cache_dir"],
             reuse_cache=not task["reload"],
         )
+    geometry, envelope = _channel_geometry(task, ds_c, geometry, task["envelope"])
     sf = fitting.fit_dataset(
         ds_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
         positive_only=task["positive_only"],
         enforce_positive=task["enforce_positive"],
         criterion=task["criterion"], nu=task["nu"],
-        envelope=task["envelope"],
+        envelope=envelope,
         chi2_target=task["chi2_target"],
         # one summary line per channel from the caller; the per-fit warning
         # against a target the channels never chose was noise
@@ -2349,11 +2435,12 @@ def _fit_streamed_channel(task: dict) -> dict:
             chi2_target=task["chi2_target"],
         )
     else:
+        geometry, envelope = _channel_geometry(task, stub_c, geometry, task["envelope"])
         sf = fitting.fit_dataset(
             stub_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
             positive_only=task["positive_only"],
             enforce_positive=task["enforce_positive"],
-            criterion=task["criterion"], nu=task["nu"], envelope=task["envelope"],
+            criterion=task["criterion"], nu=task["nu"], envelope=envelope,
             chi2_target=task["chi2_target"], warn_on_chi2=False,
         )
     chi2_n = float(sf.chi_squared) / (2 * int(terms_c.n_vis))

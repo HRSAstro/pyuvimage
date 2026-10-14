@@ -394,6 +394,14 @@ def main(argv: list[str] | None = None) -> int:
         "that keeps some points in faint regions (default 0.02)",
     )
     p_fit.add_argument(
+        "--cube-mesh", default="auto", choices=["auto", "shared", "channel"],
+        help="cube mode with --mesh-type hilbert: channel gives every channel "
+        "its own Hilbert mesh, from a quick first pass on that channel, so the "
+        "points follow where each channel is bright (a line moving across the "
+        "source); shared fits every channel on the MFS fit's mesh. auto "
+        "(default) is channel for hilbert, shared otherwise",
+    )
+    p_fit.add_argument(
         "--mask", default=None, metavar="FILE",
         help="an emission mask: a CASA region file (.crtf), a DS9 region file "
         "(.reg) or a FITS mask (non-zero = emission; e.g. from `pyuvimage "
@@ -683,6 +691,7 @@ def main(argv: list[str] | None = None) -> int:
             hilbert_power=args.hilbert_power,
             hilbert_floor=args.hilbert_floor,
             emission_mask=args.mask,
+            cube_mesh=args.cube_mesh,
             reload=args.reload,
             pynufft_shift=not args.no_pynufft_shift,
             chi2_target=args.chi2_target,
