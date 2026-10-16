@@ -742,11 +742,9 @@ def run(
         keep.sort()
         uv, d, n = uv[keep], d[keep], n[keep]
         logger.info(
-            "cube mode: fitting the shared prior on a random 1 visibility in "
-            "%d (%d of %d, drawn across all channels) -- the same amount of "
-            "data each channel fit will have, which is what the prior is "
-            "being chosen for (--cube-prior channel). Costs %.1f GB instead "
-            "of %.1f GB.",
+            "cube mode: fitting one prior for all channels at single-channel "
+            "strength (--cube-prior channel), on a random 1 visibility in %d "
+            "(%d of %d). Costs %.1f GB instead of %.1f GB.",
             prior_thin, len(d), uvd.n_samples,
             fitting.estimate_peak_memory_gb(len(d), n_pix),
             fitting.estimate_peak_memory_gb(uvd.n_samples, n_pix),
@@ -1265,10 +1263,9 @@ def run_streamed(
         )
         if prior_thin > 1:
             logger.info(
-                "cube mode: fitting the shared prior on 1 visibility in %d "
-                "(%d of %d, drawn across all channels) -- the same amount of "
-                "data each channel fit will have, which is what the prior is "
-                "being chosen for (--cube-prior channel).",
+                "cube mode: fitting one prior for all channels at "
+                "single-channel strength (--cube-prior channel), on a random "
+                "1 visibility in %d (%d of %d)",
                 prior_thin, terms.n_vis, header.n_samples,
             )
     else:
