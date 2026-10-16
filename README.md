@@ -15,6 +15,7 @@ prior whose hyperparameters are optimised automatically.
 pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see docs/install.md)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
+pip install -e ".[mask]"    # + regions, to read CASA/DS9 region files for --mask
 ```
 
 Python ≥ 3.12. JAX is optional and the NumPy path is fully supported, but becomes increasingly memory intensive above ~5000 visibilities. JAX is **strongly** recommended for larger data sets. See [docs/install.md](docs/install.md),
@@ -99,6 +100,8 @@ to be left alone. These are the ones worth reaching for:
 | `--criterion structure` | rarely — `auto` already picks this on any well-constrained fit. Force it if the structure ratio the run prints is far from 1 while `chi^2/N` looks fine |
 | `--criterion evidence` | the fit looks over-smoothed at a bright peak *and* you have fewer visibilities than model pixels |
 | `--inversion dense` | you want the long-established path on a big dataset. `auto` (the default) switches to the sparse w-tilde inversion above 5000 visibilities, which is where the dense mapping matrix starts to dominate — see [Run time and memory](#run-time-and-memory). The sparse path is new; force `dense` if you want to compare |
+| `--mask mask.fits` | a bright extended source whose sidelobes the fit absorbs as broad emission across the field — the model is held to zero outside the mask. See [Masks and adaptive meshes](#masks-and-adaptive-meshes) |
+| `--mesh-type hilbert` | a compact source in a wide field: mesh points follow the brightness, so far fewer are needed. See [Masks and adaptive meshes](#masks-and-adaptive-meshes) |
 | `--mode cube` | per-channel images instead of one MFS image. The shared prior is fitted on every channel's data by default (`--cube-prior mfs`; `channel` fits it on a 1-in-`n_chan` subset; `per-channel` lets each channel choose its own strength, for line cubes) — see [docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on) |
 
 Any of them can also be set in a JSON file instead of on the command line:
@@ -197,6 +200,88 @@ chi^2 target, because the residual is then model error rather than sky.
 ![point sources](figures/point_sources.png)
 
 Details: [docs/point-sources.md](docs/point-sources.md).
+
+## Masks and adaptive meshes
+
+Two options change *where* the model can put flux. Both build an irregular
+mesh — a Delaunay triangulation of points, interpolated linearly onto the
+image — in place of the rectangle, and work with either `--mode`.
+
+### `--mask`: emission only where you allow it
+
+```bash
+pyuvimage mask pyuvimage_out/dirty_image.fits --out mask.fits   # paint one
+pyuvimage fit mydata/ --fov 35 --mask mask.fits
+pyuvimage fit mydata/ --fov 35 --mask galaxy.crtf               # or a region file
+```
+
+The mask is a **hard** constraint: mesh points are placed only inside it, and a
+ring of points round it is held at zero, so the model is zero outside. It
+implies positivity (the zeroed points are enforced by the non-negative
+solver).
+
+**Why.** A bright extended source whose integrated flux is far above its peak
+brightness turns the few shortest baselines' sidelobes into strong bands
+across the dirty image. The data cannot tell those from real broad emission,
+so a positive fit absorbs them: on NGC 4274 (0.65 Jy against an 8.7 mJy/beam
+peak) an unmasked fit put about half its flux into bands across the field.
+With a mask round the galaxy the model holds 0.69 Jy, all in the galaxy, and
+the bands are explained as its sidelobes.
+
+**Making one.** A CASA region file (`.crtf`, from the CASA viewer or CARTA) or
+DS9 `.reg` file — needs `pip install -e ".[mask]"`; regions prefixed `-` are
+cut out — or any FITS image with a celestial WCS, non-zero where emission is
+allowed, resampled onto the fit grid. `pyuvimage mask IMAGE` opens
+PyAutoGalaxy's painter over an image (a fit's `dirty_image.fits` or a CASA
+image): brush `1` adds, `2` erases, `=`/`-` resize, `z` undoes, Esc finishes.
+`--start` refines an existing mask or region file. Use `--backend MacOSX` if
+TkAgg is unavailable on a Mac.
+
+**Reading the result.** What the mask excludes shows up in the residual, which
+is the check that it is not too tight: compact blobs outside it are real
+emission it leaves out. The strength criterion measures the residual inside
+the mask (dilated by one beam), since outside it holds what the model is
+forbidden to fit, and the run reports the residual outside the mask
+separately.
+
+### `--mesh-type hilbert`: points that follow the brightness
+
+```bash
+pyuvimage fit mydata/ --fov 8 --mesh-type hilbert
+pyuvimage fit mydata/ --fov 35 --mesh-type hilbert --mask mask.fits --mesh-points 3000
+```
+
+After PyAutoLens: a quick first pass on a coarse rectangle gives a brightness
+map, and points are drawn along a Hilbert space-filling curve with density
+proportional to `max((b⁺/peak)^power, floor)` — negative bowls and sidelobes
+are clipped, so points do not crowd onto them. With `--mask` they are drawn
+inside the mask only.
+
+| flag | default | |
+|---|---|---|
+| `--mesh-points` | ¼ of the nominal mesh (841 for a 58×58 mesh) | number of free points |
+| `--hilbert-power` | 1.0 | how strongly density follows brightness |
+| `--hilbert-floor` | 0.02 | density on faint emission and empty sky, relative to the peak |
+
+**When it pays.** The model has as many parameters as points, and the w-tilde
+solve costs `n_points³`. On a compact source in a wide field it does the work
+of a much larger rectangle: 1064 points matched a 4096-pixel rectangle on a
+compact mock, and on J0209 (9io9, `--fov 8`) the default 841 points at power 1
+absorbed less noise into the background than the 58×58 rectangle or 1500
+points, with residuals that look like noise, in 8–11 s against 78 s. On a source that fills the field it helps less: NGC 4274
+needed ~4000 points to match a 192×192 matrix-free fit, and was slower. Too few
+points undersample faint emission and show triangular facets.
+
+**Cubes.** By default (`--cube-mesh auto`) each channel gets its own Hilbert
+mesh from a first pass on that channel, so the points follow a line as it
+moves; `--cube-mesh shared` keeps the MFS mesh for every channel. The mask
+applies to every channel, and an adaptive prior's brightness map is each
+channel's own. For line cubes, consider `--cube-prior per-channel`, which lets
+each channel choose its own prior strength (see
+[docs/parameters.md](docs/parameters.md#what-the-cubes-shared-prior-is-fitted-on)).
+
+Details, measurements and the χ² floor seen on NGC 4274:
+[docs/adaptive-mesh.md](docs/adaptive-mesh.md).
 
 ## Several spectral windows
 
@@ -366,6 +451,11 @@ gradients): memory and time no longer go as `n_mesh²` and `n_mesh³`. A
 positivity, point components or uncertainty maps yet — see
 [docs/matrix-free.md](docs/matrix-free.md).
 
+**A Hilbert mesh** (`--mesh-type hilbert`) is the other way down: the cost
+goes as the number of points rather than the rectangle's pixels, so a compact
+source in a wide field needs a fraction of the mesh. It always runs on the
+w-tilde path (never matrix-free), and the memory estimate counts its points.
+
 ## Noise
 
 **pyuvimage estimates the noise from the visibilities themselves and does not
@@ -420,6 +510,8 @@ Full discussion: [docs/noise.md](docs/noise.md).
 - Total flux cannot be resolved beyond the maximum recovery scale of the data
   set, which is determined by the baseline length distribution: emission
   resolved out by the array cannot be recovered (same as CLEAN).
+- `--mask` and `--mesh-type hilbert` run on the w-tilde path only, not the
+  matrix-free solve, and a mask implies positivity.
 - Positivity applies to the mesh-only solve. With `--point-sources` the
   bordered system is eliminated by an unconstrained Cholesky solve, so the
   delivered mesh may hold small negative values whatever `--enforce-positive`
