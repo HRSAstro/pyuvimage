@@ -4273,6 +4273,7 @@ def fit_dataset(
     chi2_target: float = 1.0,
     warn_on_chi2: bool = True,
     system: LinearSystem | None = None,
+    first_pass_at_prior: bool = False,
 ) -> SingleFit:
     """Fit one Interferometer dataset (one channel, or the MFS stack).
 
@@ -4288,6 +4289,11 @@ def fit_dataset(
     mesh-only pass sits at chi^2/N ~ 2.9 and told the user three times that
     the products should not be trusted -- before the point fit that brings it
     to 1.000. The caller that knows more is the one that should speak.
+
+    ``first_pass_at_prior``: with a fixed ``prior``, an adaptive prior's
+    first pass is one solve at that prior (plain Matern) rather than its own
+    search. Cube channels use it: each gets a brightness map of its own
+    emission for the cost of one extra solve.
 
     ``system`` is the coefficient-invariant `LinearSystem` for this dataset
     and mesh. Built here when not given; the adaptive first pass hands its own
@@ -4311,7 +4317,8 @@ def fit_dataset(
     if needs_first_pass:
         logger.info("%s prior: first pass (plain Matern)...", reg_kind)
         first = fit_dataset(
-            dataset, geometry, reg_kind="matern", prior=None,
+            dataset, geometry, reg_kind="matern",
+            prior=dict(prior) if (first_pass_at_prior and prior is not None) else None,
             positive_only=positive_only, criterion=criterion, nu=nu,
             fixed_scale=fixed_scale, chi2_target=chi2_target,
             enforce_positive=enforce_positive, warn_on_chi2=False,

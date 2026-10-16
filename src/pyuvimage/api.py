@@ -946,28 +946,10 @@ def run(
         # through the channel loop adds the biggest term to the peak at
         # exactly the point where the channels are trying to allocate.
         if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
-            # Freeze the brightness map as well as the coefficient. Without
-            # this every channel re-runs the adaptive prior's first pass --
-            # and that first pass optimises its own hyperparameters, so an
-            # 8-channel cube costs nine full searches instead of one. It is
-            # also what "the channels share a prior" should mean: the same
-            # brightness weighting everywhere, not one per plane.
-            envelope = dict(envelope)
-            envelope["brightness"] = np.clip(
-                np.asarray(mfs_fit.model_mesh_image).ravel(), 0.0, None
-            )
-            logger.info(
-                "cube mode: the adaptive prior's brightness map is frozen "
-                "too, so each channel is a single fit rather than its own "
-                "two-pass search"
-            )
-        # the MFS model itself, for per-channel meshes: their frozen
-        # brightness map is this image at each channel's own points
-        mfs_model_native = (np.asarray(mfs_fit.model_image)
-                            if geometry.mesh is not None else None)
+            _log_channel_brightness()
         channel_mesh = _channel_mesh_spec(
             cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
-            hilbert_floor, allowed, beam_scale, mfs_model_native)
+            hilbert_floor, allowed, beam_scale)
         mfs_fit = _fit_summary(mfs_fit)
         mfs_dataset = None
         gc.collect()
@@ -1451,24 +1433,10 @@ def run_streamed(
         # what the MFS guard actually ran with, not what was asked for
         positive_only = bool(getattr(mfs_fit, "positive_only", positive_only))
         if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
-            # the brightness map too, so each channel is one fit rather than
-            # its own two-pass search (see `run`)
-            envelope = dict(envelope)
-            envelope["brightness"] = np.clip(
-                np.asarray(mfs_fit.model_mesh_image).ravel(), 0.0, None
-            )
-            logger.info(
-                "cube mode: the adaptive prior's brightness map is frozen "
-                "too, so each channel is a single fit rather than its own "
-                "two-pass search"
-            )
-        # the MFS model itself, for per-channel meshes: their frozen
-        # brightness map is this image at each channel's own points
-        mfs_model_native = (np.asarray(mfs_fit.model_image)
-                            if geometry.mesh is not None else None)
+            _log_channel_brightness()
         channel_mesh = _channel_mesh_spec(
             cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
-            hilbert_floor, allowed, beam_scale, mfs_model_native)
+            hilbert_floor, allowed, beam_scale)
         mfs_summary = _fit_summary(mfs_fit)
         products = []
         freqs = header.frequencies
@@ -2281,7 +2249,7 @@ CUBE_MESH_MODES = ("auto", "shared", "channel")
 
 
 def _channel_mesh_spec(cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
-                       hilbert_floor, allowed, beam_scale, mfs_model_native):
+                       hilbert_floor, allowed, beam_scale):
     """What a cube channel needs to build its own mesh, or None to share the
     MFS fit's.
 
@@ -2309,33 +2277,20 @@ def _channel_mesh_spec(cube_mesh, geometry, mesh_type, mesh_points, hilbert_powe
     logger.info(
         "cube mode: each channel gets its own Hilbert mesh (%d points), drawn "
         "from a quick first pass on that channel's data, so the points follow "
-        "where that channel is bright; the prior's strength (and an adaptive "
-        "prior's brightness map, resampled onto the channel's points) stays "
-        "the MFS fit's", geometry.mesh.n_free)
+        "where that channel is bright; the prior's strength stays the MFS "
+        "fit's", geometry.mesh.n_free)
     return {
         "base_geometry": dataclasses.replace(geometry, mesh=None),
         "mesh_type": mesh_type, "mesh_points": geometry.mesh.n_free,
         "hilbert_power": hilbert_power, "hilbert_floor": hilbert_floor,
         "allowed": allowed, "beam_scale": beam_scale,
-        "mfs_model": mfs_model_native,
     }
 
 
-def _sample_at_points(image_native, points, pixel_scale):
-    """An image (native orientation) at mesh points (y, x) [arcsec], bilinear."""
-    from scipy.ndimage import map_coordinates
-
-    ny, nx = image_native.shape
-    rows = (ny - 1) / 2.0 - np.asarray(points)[:, 0] / pixel_scale
-    cols = np.asarray(points)[:, 1] / pixel_scale + (nx - 1) / 2.0
-    return map_coordinates(np.asarray(image_native, float), [rows, cols], order=1,
-                           mode="nearest")
-
-
 def _channel_geometry(task, dataset, geometry, envelope):
-    """The geometry (and envelope) one cube channel is fitted on: the shared
-    one, or -- under a per-channel mesh -- its own Hilbert mesh, with the
-    frozen MFS brightness map resampled onto the new points."""
+    """The geometry one cube channel is fitted on: the shared one, or --
+    under a per-channel mesh -- its own Hilbert mesh. (An adaptive prior's
+    brightness map is the channel's own: `_log_channel_brightness`.)"""
     spec = task.get("channel_mesh")
     if not spec:
         return geometry, envelope
@@ -2345,11 +2300,27 @@ def _channel_geometry(task, dataset, geometry, envelope):
         hilbert_floor=spec["hilbert_floor"], allowed=spec["allowed"],
         criterion=task["criterion"], beam_scale=spec["beam_scale"], nu=task["nu"],
         chi2_target=task["chi2_target"])
-    if envelope and envelope.get("brightness") is not None and spec.get("mfs_model") is not None:
-        envelope = dict(envelope)
-        envelope["brightness"] = np.clip(
-            _sample_at_points(spec["mfs_model"], g.mesh.points, g.pixel_scale), 0.0, None)
     return g, envelope
+
+
+def _log_channel_brightness():
+    """Cube channels and the adaptive prior's brightness map.
+
+    The map used to be frozen from the MFS fit, like the coefficient. For a
+    line cube that is wrong: the MFS model is the emission summed over
+    velocity, normalised to its brightest knot, and with w = b^2 nearly all
+    of one channel's emission sits at the 1% floor of that map -- a prior
+    ~10^3 times stiffer there than the MFS fit was tuned for. On NGC 4274
+    CO(2-1) that left 20-45 sigma residuals in every line channel; the
+    channel's own map took one channel from 31 to 8 sigma at the same
+    coefficient (docs/adaptive-mesh.md). So each channel now gets a first
+    pass of its own, at the frozen prior: one extra solve, no search.
+    """
+    logger.info(
+        "cube mode: each channel's adaptive brightness map comes from its "
+        "own first pass at the frozen prior (one extra solve per channel, "
+        "no search): an MFS map would pin line emission that moves between "
+        "channels to the prior's floor")
 
 
 def _fit_cube_channel(task: dict) -> dict:
@@ -2384,7 +2355,7 @@ def _fit_cube_channel(task: dict) -> dict:
         positive_only=task["positive_only"],
         enforce_positive=task["enforce_positive"],
         criterion=task["criterion"], nu=task["nu"],
-        envelope=envelope,
+        envelope=envelope, first_pass_at_prior=True,
         chi2_target=task["chi2_target"],
         # one summary line per channel from the caller; the per-fit warning
         # against a target the channels never chose was noise
@@ -2441,6 +2412,7 @@ def _fit_streamed_channel(task: dict) -> dict:
             positive_only=task["positive_only"],
             enforce_positive=task["enforce_positive"],
             criterion=task["criterion"], nu=task["nu"], envelope=envelope,
+            first_pass_at_prior=True,
             chi2_target=task["chi2_target"], warn_on_chi2=False,
         )
     chi2_n = float(sf.chi_squared) / (2 * int(terms_c.n_vis))

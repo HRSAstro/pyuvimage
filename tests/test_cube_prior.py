@@ -116,26 +116,61 @@ def test_mfs_mode_ignores_it_entirely(cube, tmp_path, caplog):
     assert "random 1 visibility in" not in caplog.text
 
 
-def test_the_adaptive_brightness_map_is_frozen_too(cube, tmp_path, caplog):
-    """Without this, every channel re-runs the adaptive prior's first pass --
-    and that first pass optimises its own hyperparameters, so an 8-channel
-    cube costs nine full searches instead of one. It is also what "the
-    channels share a prior" ought to mean."""
+def test_each_channel_gets_its_own_brightness_map_without_a_search(cube, tmp_path, caplog):
+    """The adaptive prior's brightness map used to be frozen from the MFS
+    fit. On a line cube that pins each channel's emission to the floor of a
+    map normalised to the velocity-summed peak (NGC 4274 CO(2-1): 20-45
+    sigma residuals). Each channel now runs its own first pass -- but at the
+    frozen prior, one solve, not the search the MFS first pass ran."""
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
         pyuvimage.run(
             cube, fov=FOV, out=tmp_path, mode="cube", mesh_shape=(MESH, MESH),
             reg="adaptive", criterion="discrepancy", uncertainty_map=False,
             pb_correction=False, mask_shape="square",
         )
-    assert "brightness map is frozen" in caplog.text
-    # one first pass in the whole run, not one per channel
-    assert caplog.text.count("first pass (plain Matern)") == 1
+    assert "own first pass at the frozen prior" in caplog.text
+    # the MFS fit's first pass, then one per channel
+    assert caplog.text.count("first pass (plain Matern)") == 1 + cube.n_chan
+    # only the MFS fit searches: its two passes, nothing per channel
+    searches = caplog.text.count("probing the weakest prior")
+    assert searches <= 2
+
+
+def test_moving_line_emission_keeps_its_flux_under_the_adaptive_prior(tmp_path):
+    """A compact blob that moves across the field from channel to channel:
+    with the MFS brightness map each channel's blob sat where the summed map
+    was faint, and lost flux to the prior."""
+    from pyuvimage.uvdata import UVData
+
+    fov, m, f0 = 4.0, 16, 230e9
+    freqs = f0 * (1.0 + 1e-3 * np.arange(3))
+    uvw = mock.random_uv_coverage(1200, m / (2.0 * fov / 206265.0) * 299792458.0 / f0,
+                                  f0, seed=7)
+    geom = resolve_geometry(fov, float(np.max(np.hypot(uvw[:, 0], uvw[:, 1])) * freqs.max()
+                                       / 299792458.0), mesh_shape=(m, m))
+    parts = []
+    for i, x in enumerate((-1.2, 0.0, 1.2)):
+        t = mock.exponential_image(geom.shape_native, geom.pixel_scale, flux_jy=0.02,
+                                   r_eff_arcsec=0.2, centre_arcsec=(0.0, x))
+        if i == 1:      # a brighter middle channel sets the MFS map's peak
+            t = 4.0 * t
+        parts.append(mock.simulate(t, geom.pixel_scale, uvw, freqs[i:i + 1],
+                                   sigma_jy=3e-4, seed=10 + i))
+    uvd = UVData(uvw=uvw, frequencies=freqs, data=np.concatenate([p.data for p in parts]),
+                 noise=np.concatenate([p.noise for p in parts]), meta={})
+    res = pyuvimage.run(uvd, fov=fov, out=tmp_path, mode="cube", mesh_shape=(m, m),
+                        reg="adaptive", pb_correction=False, uncertainty_map=False,
+                        write=False)
+    fluxes = [float(np.asarray(p.model_image).sum()) for p in res.products]
+    assert fluxes[0] == pytest.approx(0.02, rel=0.1)
+    assert fluxes[2] == pytest.approx(0.02, rel=0.1)
+    assert fluxes[1] == pytest.approx(0.08, rel=0.1)
 
 
 def test_matern_cube_needs_no_brightness_map(cube, tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="pyuvimage"):
         _run(cube, tmp_path)
-    assert "brightness map is frozen" not in caplog.text
+    assert "own first pass at the frozen prior" not in caplog.text
 
 
 def test_the_cube_summary_has_a_row_per_channel(cube, tmp_path):

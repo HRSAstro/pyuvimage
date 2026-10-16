@@ -38,8 +38,8 @@ also gets its **own** Hilbert mesh, drawn from a quick first pass on that
 channel's data, so the points follow where that channel is bright: a line that
 moves across the source (a rotating disc) is sampled where it is in each
 channel, not spread over everywhere it is in any. The prior's strength stays
-the MFS fit's, and an adaptive prior's brightness map is the MFS model
-resampled onto each channel's points. The mask, if any, applies to every
+the MFS fit's; an adaptive prior's brightness map is each channel's own (see
+below). The mask, if any, applies to every
 channel. Cost: one coarse first pass per channel (seconds to ~15 s each).
 `--cube-mesh shared` fits every channel on the MFS mesh.
 
@@ -53,6 +53,21 @@ the emission moves, no single image reproduces all channels (on that mock the
 MFS fit sat at χ²/N ≈ 1400, its chosen prior was far too strong, and the
 channels lost half their flux). For such cubes, fix `--coefficient` from a
 channel fit until the prior can be chosen per channel.
+
+**The adaptive brightness map is per channel.** It used to be frozen from the
+MFS fit along with the coefficient. On a line cube that is badly wrong: the
+MFS model is the emission summed over velocity, normalised to its brightest
+knot, and with weights w = b² nearly all of one channel's emission sits at the
+map's 1% floor — a prior ~10³ times stiffer there than the MFS fit was tuned
+for. On NGC 4274 CO(2–1) (37 channels, mask, Hilbert) every line channel was
+left with 20–45σ residuals tracing the emission. On one channel (3000 points,
+the same coefficient): MFS map 31σ peak residual, structure ratio 3.3; its
+own map 8–11σ, 1.8. Each channel now runs its own first pass (plain Matérn)
+at the frozen prior — one extra solve, no search — and uses that model as its
+map. The rest of that residual is the frozen coefficient: the MFS fit of a
+line cube cannot reach χ²/N = 1 (below), so its strength comes from the
+evidence and is several times too strong for a channel (discrepancy on the
+channel alone: 1.4×10⁶ against 7.4×10⁶, 7σ).
 
 ## `--mask`: emission only where you allow it
 
@@ -87,12 +102,15 @@ there). With a mask the ratio is measured inside it, dilated by one beam; the
 target is then reached (0.99 on NGC 4274), and the run reports the residual
 outside the mask separately.
 
-**χ² above target at every strength.** On NGC 4274 every fit — masked or not,
-constrained or not — sits at χ²/N = 1.355, the same as with the prior switched
-off. That excess is in the data (a noise map ~16% low, or errors no sky model
-reproduces, such as residual phase errors), not in the fit; the warning says
-so when the delivered χ² is within 1% of the weakest prior's, and suggests
-`--chi2-target` at that floor.
+**χ² above target at every strength.** On NGC 4274 every MFS fit — masked or
+not, constrained or not — sits at χ²/N = 1.355, the same as with the prior
+switched off. That excess is in the data, not in the fit; the warning says so
+when the delivered χ² is within 1% of the weakest prior's, and suggests
+`--chi2-target` at that floor. On NGC 4274 it is **the line**: the dataset is
+CO(2–1), one MFS image cannot reproduce emission that changes from channel
+to channel, and the line-free channels of the cube fit sit at χ²/N =
+0.98–1.00 (so the noise map is right). An MFS fit of line data should be read
+as a moment-0 sketch, not a fit to the noise.
 
 **Making a mask.**
 
