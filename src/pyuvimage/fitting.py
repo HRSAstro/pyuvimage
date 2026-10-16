@@ -3850,6 +3850,9 @@ class SingleFit:
     #: it is caught ignoring the prior, and `fit_parameters.json` was
     #: reporting the request rather than what actually ran.
     positive_only: bool = True
+    #: an adaptive prior's first-pass (plain Matern) prior, when there was
+    #: one: cube channels run their own first passes at it
+    first_pass_prior: dict | None = None
 
     @property
     def coefficient(self) -> float:
@@ -4273,7 +4276,7 @@ def fit_dataset(
     chi2_target: float = 1.0,
     warn_on_chi2: bool = True,
     system: LinearSystem | None = None,
-    first_pass_at_prior: bool = False,
+    first_pass_prior: dict | None = None,
 ) -> SingleFit:
     """Fit one Interferometer dataset (one channel, or the MFS stack).
 
@@ -4290,10 +4293,11 @@ def fit_dataset(
     the products should not be trusted -- before the point fit that brings it
     to 1.000. The caller that knows more is the one that should speak.
 
-    ``first_pass_at_prior``: with a fixed ``prior``, an adaptive prior's
-    first pass is one solve at that prior (plain Matern) rather than its own
-    search. Cube channels use it: each gets a brightness map of its own
-    emission for the cost of one extra solve.
+    ``first_pass_prior``: an adaptive prior's first pass is one solve at
+    this prior (plain Matern) rather than its own search. Cube channels pass
+    the MFS fit's first-pass prior: each gets a brightness map of its own emission for
+    the cost of one extra solve, whether or not it then searches its own
+    strength (`--cube-prior per-channel`).
 
     ``system`` is the coefficient-invariant `LinearSystem` for this dataset
     and mesh. Built here when not given; the adaptive first pass hands its own
@@ -4311,6 +4315,7 @@ def fit_dataset(
     needs_first_pass = (
         reg_kind in ADAPTIVE_REGULARIZATIONS and envelope.get("brightness") is None
     )
+    used_first_prior = None
     if system is None and (needs_search or needs_first_pass):
         system = build_linear_system(dataset, mesh_shape)
 
@@ -4318,13 +4323,14 @@ def fit_dataset(
         logger.info("%s prior: first pass (plain Matern)...", reg_kind)
         first = fit_dataset(
             dataset, geometry, reg_kind="matern",
-            prior=dict(prior) if (first_pass_at_prior and prior is not None) else None,
+            prior=dict(first_pass_prior) if first_pass_prior is not None else None,
             positive_only=positive_only, criterion=criterion, nu=nu,
             fixed_scale=fixed_scale, chi2_target=chi2_target,
             enforce_positive=enforce_positive, warn_on_chi2=False,
             system=system,
         )
         envelope["brightness"] = np.clip(first.model_mesh_image.ravel(), 0.0, None)
+        used_first_prior = dict(first.prior)
         # Drop the first-pass fit before the second one allocates. It holds an
         # `ag.FitInterferometer`, and so the transformed mapping matrix --
         # n_vis x n_mesh complex, several GB on a real dataset -- while all
@@ -4726,5 +4732,5 @@ def fit_dataset(
 
     return SingleFit(
         fit=fit, geometry=geometry, prior=prior, scan=scan,
-        positive_only=bool(positive_only),
+        positive_only=bool(positive_only), first_pass_prior=used_first_prior,
     )

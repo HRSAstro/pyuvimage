@@ -184,6 +184,13 @@ def add_points(image, points, pixel_scale: float, flux_attr: str = "flux") -> np
     return img
 
 
+def _coefficient_label(rows) -> str:
+    c = [float(r.coefficient) for r in rows]
+    if max(c) <= 1.0001 * min(c):
+        return f"prior coefficient {c[0]:.3g}"
+    return f"prior coefficient {min(c):.3g}-{max(c):.3g} (per channel)"
+
+
 def write_products(
     products: list[ProductSet],
     geometry: ImageGeometry,
@@ -489,8 +496,7 @@ def _summary_png_cube(rows, geometry, path, freqs, ext, n_panels, note):
     fig.suptitle(
         f"{n} channels, colour scales shared down each column  |  "
         f"beam {b.bmaj_arcsec:.3g}\" x {b.bmin_arcsec:.3g}\" "
-        f"pa {b.bpa_deg:.0f} deg  |  prior coefficient "
-        f"{rows[0].coefficient:.3g}{note}",
+        f"pa {b.bpa_deg:.0f} deg  |  {_coefficient_label(rows)}{note}",
         fontsize=11,
     )
     fig.savefig(path, dpi=120)

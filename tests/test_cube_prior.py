@@ -291,3 +291,54 @@ def test_points_are_carried_into_every_channel(cube_with_point, tmp_path):
     assert len(rec["channels"]) == n_chan
     assert rec["channels"][1]["points"][0]["flux_jy"] == pytest.approx(
         res.products[1].points[0].flux)
+
+
+def _moving_line(tmp_path, streaming=False):
+    """Three channels, a compact blob moving across the field, bright in the
+    middle channel: one image cannot follow it, so the MFS strength is wrong
+    for every channel."""
+    from pyuvimage.uvdata import UVData
+
+    fov, m, f0 = 4.0, 16, 230e9
+    freqs = f0 * (1.0 + 1e-3 * np.arange(3))
+    uvw = mock.random_uv_coverage(1200, m / (2.0 * fov / 206265.0) * 299792458.0 / f0,
+                                  f0, seed=7)
+    geom = resolve_geometry(fov, float(np.max(np.hypot(uvw[:, 0], uvw[:, 1])) * freqs.max()
+                                       / 299792458.0), mesh_shape=(m, m))
+    parts = []
+    for i, (x, f) in enumerate(((-1.2, 0.02), (0.0, 0.08), (1.2, 0.02))):
+        t = mock.exponential_image(geom.shape_native, geom.pixel_scale, flux_jy=f,
+                                   r_eff_arcsec=0.3, centre_arcsec=(0.0, x))
+        parts.append(mock.simulate(t, geom.pixel_scale, uvw, freqs[i:i + 1],
+                                   sigma_jy=3e-4, seed=10 + i))
+    uvd = UVData(uvw=uvw, frequencies=freqs, data=np.concatenate([p.data for p in parts]),
+                 noise=np.concatenate([p.noise for p in parts]), meta={})
+    data = uvd.write(tmp_path / "ds") if streaming else uvd
+    return data, fov, m
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_per_channel_prior_chooses_each_channels_strength(tmp_path, caplog, streaming):
+    data, fov, m = _moving_line(tmp_path, streaming)
+    kw = dict(fov=fov, mode="cube", mesh_shape=(m, m), reg="matern",
+              criterion="discrepancy", pb_correction=False, uncertainty_map=False,
+              write=False, streaming=streaming)
+    shared = pyuvimage.run(data, out=tmp_path / "s", **kw)
+    with caplog.at_level(logging.INFO, logger="pyuvimage"):
+        own = pyuvimage.run(data, out=tmp_path / "p", cube_prior="per-channel", **kw)
+    assert "each channel chooses its own prior strength" in caplog.text
+    assert caplog.text.count(", prior coefficient ") == 3
+    coefs = own.parameters["source_prior"]["channel_coefficients"]
+    assert len(coefs) == 3 and max(coefs) > 1.5 * min(coefs)
+    c_shared = shared.parameters["fit_quality"]["channel_chi2_per_datum"]
+    c_own = own.parameters["fit_quality"]["channel_chi2_per_datum"]
+    # the shared strength (from an MFS fit that cannot follow the blob) left
+    # the faint channels at chi^2/N ~ 3.7; their own strengths bring them to
+    # the target (the bright one sits at the 16^2 mesh's floor either way)
+    assert max(c_shared) > 2.0
+    assert max(c_own) < 1.1
+
+
+def test_per_channel_prior_refuses_a_fixed_coefficient(cube, tmp_path):
+    with pytest.raises(ValueError, match="per-channel"):
+        _run(cube, tmp_path, cube_prior="per-channel", coefficient=1e4)

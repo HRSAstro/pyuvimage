@@ -359,13 +359,13 @@ def main(argv: list[str] | None = None) -> int:
              "are shared out between the workers",
     )
     p_fit.add_argument(
-        "--cube-prior", default="mfs", choices=["mfs", "channel"],
-        help="cube mode only: what the shared prior is fitted on. mfs "
-        "(default) uses every channel's visibilities at once -- free on the "
-        "streamed path, where the MFS terms are the channels' sum; channel "
-        "uses a random 1-in-n_chan subset, the same amount of data each "
-        "channel fit will have, which was what kept the in-memory MFS pass "
-        "affordable",
+        "--cube-prior", default="mfs", choices=["mfs", "channel", "per-channel"],
+        help="cube mode only: the channels' prior strength. mfs (default) "
+        "shares one, fitted on every channel's visibilities at once; channel "
+        "shares one fitted on a random 1-in-n_chan subset, the amount of data "
+        "one channel has; per-channel lets each channel choose its own (a "
+        "search per channel, with the MFS fit's correlation length) -- for "
+        "line cubes, where no single strength suits every channel",
     )
     p_fit.add_argument("--mesh", type=int, default=None, help="mesh pixels per side")
     p_fit.add_argument(

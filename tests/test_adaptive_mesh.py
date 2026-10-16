@@ -184,3 +184,15 @@ def test_cube_channels_can_have_their_own_hilbert_meshes(tmp_path, streaming, mo
     with pytest.raises(ValueError, match="cube_mesh"):
         api.run(uvd, fov=fov, out=tmp_path / "x", mode="cube", mesh_shape=(m, m),
                 pb_correction=False, mesh_type="hilbert", cube_mesh="per-plane", write=False)
+
+
+def test_a_hilbert_run_is_sized_by_its_points():
+    """The memory estimate and the criterion's data per pixel count the mesh
+    points, not the rectangle they replace (a 3000-point NGC 4274 fit was
+    estimated at 36 GB from the 192^2 rectangle)."""
+    from pyuvimage.grids import resolve_geometry
+
+    geom = resolve_geometry(3.0, 2e5, mesh_shape=(40, 40))
+    assert api._model_pixels(geom, "rectangular", None) == 1600
+    assert api._model_pixels(geom, "hilbert", None) == 400
+    assert api._model_pixels(geom, "hilbert", 150) == 150

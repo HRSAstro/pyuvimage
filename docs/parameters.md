@@ -74,7 +74,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 | `--reload` | off | Read the visibilities again even when the streamed terms (or the w-tilde kernel) for this file and geometry are cached, and replace the cache. The cache is keyed on the file's path, size and modification time, so this is for a file rewritten in place with both unchanged, or for ruling the cache out. |
 | `--chunk-k` | 4096 | streaming only: visibilities per chunk. Larger is faster and costs more per chunk (the per-chunk DFT is `n_image × N` complex). |
 | `--mode` | **mfs** | `mfs` fits all channels jointly to one image; `cube` fits each channel with a shared prior — see `--cube-prior`. |
-| `--cube-prior` | **mfs** | Cube mode only: what the shared prior is fitted on. `mfs` uses every channel's visibilities at once — on the streamed path that is the sum of the per-channel terms and costs nothing extra. `channel` uses a random 1-in-`n_chan` subset — the same amount of data each channel fit will have — which was the default while the in-memory MFS pass was the single step that made a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass); streaming removed that cost. See below. |
+| `--cube-prior` | **mfs** | Cube mode only: what the shared prior is fitted on. `mfs` uses every channel's visibilities at once — on the streamed path that is the sum of the per-channel terms and costs nothing extra. `channel` uses a random 1-in-`n_chan` subset — the same amount of data each channel fit will have — which was the default while the in-memory MFS pass was the single step that made a cube run out of memory (Ruby CO(7-6): 2.9 GB per channel against 20.1 GB for that one pass); streaming removed that cost. Both share **one** strength across the channels. `per-channel` lets each channel choose its own strength by the run's criterion, with the MFS fit's correlation length held — for line cubes, where no one strength suits every channel (a search per channel, so several times slower). See below. |
 | `--workers` | **1** | Cube mode only: how many channels to fit at once, each in its own process (spawned, so safe on macOS and with JAX/numba). `0` or `auto` = one per core. Capped by the number of channels and by memory: each worker needs one channel fit's peak (the per-channel figure `check_memory` reports) plus ~0.6 GB for its own interpreter and imports, and the count is reduced until that fits in what is available. BLAS threads are divided between the workers (cores ÷ workers each) so they do not oversubscribe the machine. Works on the in-memory and streamed paths; the shared-prior pass before the channels is unchanged. |
 | `--spw` (on `pyuvimage import`) | **0** | Spectral window(s): one DATA_DESC_ID, a comma-separated list or range (`0,2`, `0-3`), or `all`. Several are imaged together by MFS. |
 | `--noise` (on `pyuvimage import` and `convert`) | **difference** | How the per-visibility noise is set. MS weights are relative, not absolute, so the scale is always recomputed from the data. `difference`: from the visibilities alone. `hybrid`: adds the weight column's time profile. `scaled`: whole shape from the weights. `sigma`: trust `SIGMA` as absolute, and warn. On `convert`, `keep` (the default there) leaves the stored map alone. Full discussion in [noise.md](noise.md). |
@@ -224,6 +224,18 @@ in-memory MFS pass held every channel's mapping matrix at once. On the
 streamed path the MFS terms are the sum of the per-channel terms already in
 hand, so that pass costs nothing, and a prior fitted on all the data is the
 better-constrained one.
+
+`--cube-prior per-channel` keeps the MFS pass (on the 1-in-`n_chan` subset)
+for the correlation length, the adaptive prior's first pass and any shared
+mesh, and then searches each channel's strength on that channel's own data.
+A shared strength assumes one sky in every channel. A line cube breaks that:
+the MFS fit cannot reach χ²/N = 1 (one image cannot follow emission that
+moves between channels), its strength falls back to the evidence, and that
+strength is several times too stiff for any one channel — NGC 4274 CO(2-1)
+kept 7–10σ residuals on the line at the shared strength
+(docs/adaptive-mesh.md). Each channel's strength is logged and recorded as
+`source_prior.channel_coefficients` in `fit_parameters.json`. It cannot be
+combined with a fixed `--lambda`.
 
 **Costs**, on Ruby CO(7-6) at `--fov 3` (613,512 samples, 8 channels, 27x27
 mesh): 2.9 GB for the prior pass and each channel fit, against 20.1 GB for the

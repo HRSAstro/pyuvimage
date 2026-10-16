@@ -272,6 +272,17 @@ def _load_emission_mask(emission_mask, geometry, meta):
     return mask_mod.load(emission_mask, geometry.shape_native, geometry.pixel_scale, meta)
 
 
+def _model_pixels(geometry, mesh_type, mesh_points) -> int:
+    """How many pixels the model will have: the rectangle's, or a Hilbert
+    mesh's points. Sizes the memory estimate and the criterion's data per
+    pixel, which used to count the 192^2 rectangle for a 3000-point mesh."""
+    if mesh_type == "hilbert":
+        from . import adaptive_mesh
+
+        return int(mesh_points or adaptive_mesh.default_points(geometry))
+    return int(geometry.mesh_shape[0] * geometry.mesh_shape[1])
+
+
 def _irregular_geometry(dataset, geometry, *, mesh_type, mesh_points, hilbert_power,
                         hilbert_floor, allowed, criterion, beam_scale, nu, chi2_target):
     """``geometry`` with its irregular mesh (`adaptive_mesh`) set, or as it was
@@ -579,11 +590,11 @@ def run(
             ),
             advice,
         )
-    n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
+    n_pix = _model_pixels(geometry, mesh_type, mesh_points)
     n_image_pixels = int(np.prod(geometry.shape_native))
     from . import matfree
 
-    if n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS:
+    if n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS and mesh_type != "hilbert":
         logger.warning(
             "a %dx%d mesh (%d pixels) is above the %d where the matrix-free "
             "solve takes over, but that solve runs on the streamed path only "
@@ -681,13 +692,16 @@ def run(
             raise RuntimeError(reason)
 
     prior_thin = 1
-    if mode == "cube" and uvd.n_chan > 1:
-        if cube_prior == "channel":
-            prior_thin = int(uvd.n_chan)
-        elif cube_prior != "mfs":
-            raise ValueError(
-                f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'"
-            )
+    if cube_prior not in CUBE_PRIOR_MODES:
+        raise ValueError(f"unknown cube_prior {cube_prior!r}: one of {CUBE_PRIOR_MODES}")
+    if cube_prior == "per-channel" and coefficient != "auto":
+        raise ValueError("a fixed coefficient (--lambda) and --cube-prior per-channel "
+                         "contradict each other: the second chooses the strength per "
+                         "channel")
+    if mode == "cube" and uvd.n_chan > 1 and cube_prior != "mfs":
+        # both judged, and the per-channel first pass sized, on one
+        # channel's worth of data
+        prior_thin = int(uvd.n_chan)
     fitting.check_memory(
         uvd.n_samples, n_pix, transformer_cls,
         n_chan=uvd.n_chan if mode == "cube" else None,
@@ -742,10 +756,9 @@ def run(
         keep.sort()
         uv, d, n = uv[keep], d[keep], n[keep]
         logger.info(
-            "cube mode: fitting one prior for all channels at single-channel "
-            "strength (--cube-prior channel), on a random 1 visibility in %d "
-            "(%d of %d). Costs %.1f GB instead of %.1f GB.",
-            prior_thin, len(d), uvd.n_samples,
+            "cube mode: %s, on a random 1 visibility in %d (%d of %d). Costs "
+            "%.1f GB instead of %.1f GB.",
+            _thin_purpose(cube_prior), prior_thin, len(d), uvd.n_samples,
             fitting.estimate_peak_memory_gb(len(d), n_pix),
             fitting.estimate_peak_memory_gb(uvd.n_samples, n_pix),
         )
@@ -914,6 +927,10 @@ def run(
                               region=getattr(geometry.mesh, "region", None))
     else:
         frozen = dict(mfs_fit.prior)
+        # the MFS fit's own first-pass (plain Matern) prior: the channels'
+        # first passes run at it -- the adaptive coefficient is the wrong
+        # strength for a plain Matern prior (w <= 1 makes it the stiffer one)
+        first_prior = getattr(mfs_fit, "first_pass_prior", None)
         # Points carried into the cube: the MFS pass decides *where* they
         # are, each channel fits its own amplitude at those fixed positions.
         # Until 1 Sep 2026 the channels were fitted with no point components
@@ -930,10 +947,7 @@ def run(
                 "the MFS positions; amplitudes are fitted per channel",
                 len(cube_points),
             )
-        logger.info(
-            "cube mode: source prior frozen from the MFS fit (%s)",
-            ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
-        )
+        _log_cube_prior(cube_prior, frozen, criterion)
         # What the MFS guard actually ran with, not what was asked for: the
         # non-negative solver can be disabled mid-fit, and the channels must
         # follow that decision or `fit_parameters.json` misdescribes them.
@@ -962,6 +976,8 @@ def run(
             beam_size=beam_size, meta=uvd.meta, pb_correction=pb_correction,
             dish=dish, pb_factor=pb_factor, oversample=oversample,
             uncertainty=uncertainty, channel_mesh=channel_mesh,
+            per_channel_prior=cube_prior == "per-channel",
+            first_prior=first_prior,
         )
 
         def task(c):
@@ -981,9 +997,10 @@ def run(
             channel_chi2.append(chi2_n)
             logger.log(
                 logging.WARNING if chi2_n > 1.3 * chi2_target else logging.INFO,
-                "channel %d/%d: chi2/N = %.3f%s", c + 1, uvd.n_chan, chi2_n,
+                "channel %d/%d: chi2/N = %.3f%s%s", c + 1, uvd.n_chan, chi2_n,
                 "" if res["point_flux"] is None else
                 f", point flux {res['point_flux']:.4g} Jy",
+                _coefficient_note(res, cube_prior),
             )
             products.append(res["products"])
 
@@ -1017,6 +1034,10 @@ def run(
         channel_chi2_per_datum=channel_chi2 if mode == "cube" else None,
         transformer_requested=transformer,
     )
+    if mode == "cube" and cube_prior == "per-channel":
+        parameters["source_prior"]["cube_prior"] = cube_prior
+        parameters["source_prior"]["channel_coefficients"] = [
+            float(p.coefficient) for p in products]
     parameters["source_flux"] = _source_flux_records(products)
     parameters["uncertainty"] = _uncertainty_records(products, uncertainty)
     # the record says which path ran; `run_streamed` writes a dict here
@@ -1123,8 +1144,12 @@ def run_streamed(
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
     uncertainty = resolve_uncertainty_mode(uncertainty, uncertainty_map)
-    if cube_prior not in ("channel", "mfs"):
-        raise ValueError(f"unknown cube_prior {cube_prior!r}: 'channel' or 'mfs'")
+    if cube_prior not in CUBE_PRIOR_MODES:
+        raise ValueError(f"unknown cube_prior {cube_prior!r}: one of {CUBE_PRIOR_MODES}")
+    if cube_prior == "per-channel" and coefficient != "auto":
+        raise ValueError("a fixed coefficient (--lambda) and --cube-prior per-channel "
+                         "contradict each other: the second chooses the strength per "
+                         "channel")
     point_sources = normalise_point_sources(point_sources)
     if point_sources and mode == "cube":
         raise NotImplementedError(
@@ -1163,7 +1188,7 @@ def run_streamed(
         )
     _warn_wide_band(header, mode)
     cube = mode == "cube" and header.n_chan > 1
-    prior_thin = int(header.n_chan) if cube and cube_prior == "channel" else 1
+    prior_thin = int(header.n_chan) if cube and cube_prior != "mfs" else 1
 
     b_max = header.max_baseline_wavelengths
     b_eff = header.baseline_percentile_wavelengths(BASELINE_PERCENTILE)
@@ -1183,7 +1208,7 @@ def run_streamed(
             "%.0f klambda but the longest is %.0f klambda",
             BASELINE_PERCENTILE, b_eff / 1e3, b_max / 1e3,
         )
-    n_pix = geometry.mesh_shape[0] * geometry.mesh_shape[1]
+    n_pix = _model_pixels(geometry, mesh_type, mesh_points)
     n_image_pixels = int(np.prod(geometry.shape_native))
     n_data_all = 2 * header.n_samples
     # judged on the data each *fit* sees: one channel's worth in cube mode
@@ -1216,13 +1241,8 @@ def run_streamed(
     irregular = _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources)
     if emission_mask is not None:
         enforce_positive = True
-    if irregular:
-        # a Delaunay mesh: the w-tilde algebra, never the matrix-free solve
-        # (which needs the rectangle's grid). Sized by the points it will have.
-        if mesh_type == "hilbert":
-            from . import adaptive_mesh
-
-            n_pix = int(mesh_points or adaptive_mesh.default_points(geometry))
+    # a Delaunay mesh: the w-tilde algebra, never the matrix-free solve
+    # (which needs the rectangle's grid)
     matrix_free = n_pix > matfree.MATRIX_FREE_MIN_MESH_PIXELS and not irregular
     if matrix_free:
         logger.info(
@@ -1263,10 +1283,8 @@ def run_streamed(
         )
         if prior_thin > 1:
             logger.info(
-                "cube mode: fitting one prior for all channels at "
-                "single-channel strength (--cube-prior channel), on a random "
-                "1 visibility in %d (%d of %d)",
-                prior_thin, terms.n_vis, header.n_samples,
+                "cube mode: %s, on a random 1 visibility in %d (%d of %d)",
+                _thin_purpose(cube_prior), prior_thin, terms.n_vis, header.n_samples,
             )
     else:
         per_channel = None
@@ -1423,10 +1441,11 @@ def run_streamed(
     else:
         # -- the channels: `run`'s cube loop, each on its own stub ----------
         frozen = dict(mfs_fit.prior)
-        logger.info(
-            "cube mode: source prior frozen from the MFS fit (%s)",
-            ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()),
-        )
+        # the MFS fit's own first-pass (plain Matern) prior: the channels'
+        # first passes run at it -- the adaptive coefficient is the wrong
+        # strength for a plain Matern prior (w <= 1 makes it the stiffer one)
+        first_prior = getattr(mfs_fit, "first_pass_prior", None)
+        _log_cube_prior(cube_prior, frozen, criterion)
         # what the MFS guard actually ran with, not what was asked for
         positive_only = bool(getattr(mfs_fit, "positive_only", positive_only))
         if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
@@ -1444,7 +1463,8 @@ def run_streamed(
             envelope=envelope, chi2_target=chi2_target, meta=header.meta,
             pb_correction=pb_correction, dish=dish, pb_factor=pb_factor,
             oversample=oversample, uncertainty=uncertainty, matrix_free=matrix_free,
-            channel_mesh=channel_mesh,
+            channel_mesh=channel_mesh, per_channel_prior=cube_prior == "per-channel",
+            first_prior=first_prior,
         )
 
         def task(c, key):
@@ -1461,8 +1481,8 @@ def run_streamed(
             channel_chi2.append(chi2_n)
             logger.log(
                 logging.WARNING if chi2_n > 1.3 * chi2_target else logging.INFO,
-                "channel %d/%d (%.6g GHz): chi2/N = %.3f", c + 1, len(channels),
-                float(freqs[c]) / 1e9, chi2_n,
+                "channel %d/%d (%.6g GHz): chi2/N = %.3f%s", c + 1, len(channels),
+                float(freqs[c]) / 1e9, chi2_n, _coefficient_note(res, cube_prior),
             )
             products.append(res["products"])
 
@@ -1486,6 +1506,10 @@ def run_streamed(
         prior_thin=prior_thin,
         channel_chi2_per_datum=channel_chi2 if cube else None,
     )
+    if mode == "cube" and cube_prior == "per-channel":
+        parameters["source_prior"]["cube_prior"] = cube_prior
+        parameters["source_prior"]["channel_coefficients"] = [
+            float(p.coefficient) for p in products]
     parameters["source_flux"] = _source_flux_records(products)
     parameters["uncertainty"] = _uncertainty_records(products, uncertainty)
     parameters["streaming"] = {
@@ -2243,6 +2267,10 @@ def _report_dynamic_range(
 
 
 CUBE_MESH_MODES = ("auto", "shared", "channel")
+#: `--cube-prior`: mfs and channel share one prior across the channels (fitted
+#: on every visibility, or on one channel's worth); per-channel lets each
+#: channel choose its own strength
+CUBE_PRIOR_MODES = ("mfs", "channel", "per-channel")
 
 
 def _channel_mesh_spec(cube_mesh, geometry, mesh_type, mesh_points, hilbert_power,
@@ -2300,6 +2328,44 @@ def _channel_geometry(task, dataset, geometry, envelope):
     return g, envelope
 
 
+def _thin_purpose(cube_prior: str) -> str:
+    if cube_prior == "per-channel":
+        return ("fitting the MFS prior that gives every channel its "
+                "correlation length and first-pass map (--cube-prior "
+                "per-channel: each channel then chooses its own strength)")
+    return ("fitting one prior for all channels at single-channel strength "
+            "(--cube-prior channel)")
+
+
+def _log_cube_prior(cube_prior: str, frozen: dict, criterion: str) -> None:
+    if cube_prior == "per-channel":
+        shared = {k: v for k, v in frozen.items() if k != "coefficient"}
+        logger.info(
+            "cube mode: each channel chooses its own prior strength (%s)%s",
+            criterion,
+            "; from the MFS fit: " + ", ".join(f"{k}={v:.4g}" for k, v in shared.items())
+            if shared else "")
+    else:
+        logger.info("cube mode: source prior frozen from the MFS fit (%s)",
+                    ", ".join(f"{k}={v:.4g}" for k, v in frozen.items()))
+
+
+def _channel_prior(task: dict) -> dict:
+    """`fit_dataset` keywords for a channel's prior: the frozen one, or --
+    `--cube-prior per-channel` -- its strength searched with the MFS fit's
+    correlation length held."""
+    frozen = task["frozen"]
+    if task.get("per_channel_prior"):
+        return {"prior": None, "fixed_scale": frozen.get("scale")}
+    return {"prior": frozen}
+
+
+def _coefficient_note(res: dict, cube_prior: str) -> str:
+    if cube_prior != "per-channel" or res.get("coefficient") is None:
+        return ""
+    return f", prior coefficient {res['coefficient']:.3g}"
+
+
 def _log_channel_brightness():
     """Cube channels and the adaptive prior's brightness map.
 
@@ -2348,11 +2414,11 @@ def _fit_cube_channel(task: dict) -> dict:
         )
     geometry, envelope = _channel_geometry(task, ds_c, geometry, task["envelope"])
     sf = fitting.fit_dataset(
-        ds_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
+        ds_c, geometry, reg_kind=task["reg"], **_channel_prior(task),
         positive_only=task["positive_only"],
         enforce_positive=task["enforce_positive"],
         criterion=task["criterion"], nu=task["nu"],
-        envelope=envelope, first_pass_at_prior=True,
+        envelope=envelope, first_pass_prior=task.get("first_prior") or task["frozen"],
         chi2_target=task["chi2_target"],
         # one summary line per channel from the caller; the per-fit warning
         # against a target the channels never chose was noise
@@ -2377,7 +2443,7 @@ def _fit_cube_channel(task: dict) -> dict:
         task["oversample"], task["uncertainty"],
     )
     return {"index": c, "products": products, "chi2_per_datum": chi2_n,
-            "point_flux": point_flux}
+            "point_flux": point_flux, "coefficient": float(products.coefficient)}
 
 
 def _fit_streamed_channel(task: dict) -> dict:
@@ -2399,17 +2465,18 @@ def _fit_streamed_channel(task: dict) -> dict:
         sf = matfree.fit_matrix_free(
             terms_c, geometry, task["mask"], stub_c, imager_c, reg_kind=task["reg"],
             criterion=task["criterion"], scale=frozen["scale"], nu=task["nu"],
-            envelope=task["envelope"], coefficient=frozen["coefficient"],
+            envelope=task["envelope"],
+            coefficient=None if task.get("per_channel_prior") else frozen["coefficient"],
             chi2_target=task["chi2_target"],
         )
     else:
         geometry, envelope = _channel_geometry(task, stub_c, geometry, task["envelope"])
         sf = fitting.fit_dataset(
-            stub_c, geometry, reg_kind=task["reg"], prior=task["frozen"],
+            stub_c, geometry, reg_kind=task["reg"], **_channel_prior(task),
             positive_only=task["positive_only"],
             enforce_positive=task["enforce_positive"],
             criterion=task["criterion"], nu=task["nu"], envelope=envelope,
-            first_pass_at_prior=True,
+            first_pass_prior=task.get("first_prior") or task["frozen"],
             chi2_target=task["chi2_target"], warn_on_chi2=False,
         )
     chi2_n = float(sf.chi_squared) / (2 * int(terms_c.n_vis))
@@ -2419,7 +2486,8 @@ def _fit_streamed_channel(task: dict) -> dict:
         task["pb_factor"], task["oversample"], task["uncertainty"],
         imager=imager_c,
     )
-    return {"index": c, "products": products, "chi2_per_datum": chi2_n}
+    return {"index": c, "products": products, "chi2_per_datum": chi2_n,
+            "coefficient": float(products.coefficient)}
 
 
 def _products_for(

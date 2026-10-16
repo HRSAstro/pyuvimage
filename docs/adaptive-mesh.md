@@ -69,6 +69,16 @@ line cube cannot reach χ²/N = 1 (below), so its strength comes from the
 evidence and is several times too strong for a channel (discrepancy on the
 channel alone: 1.4×10⁶ against 7.4×10⁶, 7σ).
 
+`--cube-prior per-channel` lets each channel choose its own strength. On three
+NGC 4274 line channels (3000 points, mask) with the default criterion
+(structure, now that `auto` counts the Hilbert points: 47 data per point):
+strengths 1.5–4×10⁴, residual rms 1.01σ inside the mask, peaks 4–5σ, against
+1.8–1.9σ and 7–10σ at the shared 7.4×10⁶. The weaker prior also puts some
+faint emission across the mask (model flux 1.5 Jy against 1.0; flux in the
+region above 3σ 1.1–1.16 Jy against 0.9). `--criterion discrepancy` is erratic
+per channel here (133 to 1.4×10⁶): under positivity the χ² floor sits within
+1% of the target, so χ² barely constrains the strength.
+
 ## `--mask`: emission only where you allow it
 
 A mask says where the sky may hold emission. The mesh's free points are placed
