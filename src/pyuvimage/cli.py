@@ -436,6 +436,13 @@ def main(argv: list[str] | None = None) -> int:
              "for how far each can be trusted.",
     )
     p_fit.add_argument(
+        "--posterior-samples", type=int, default=0, metavar="N",
+        help="write N draws from the posterior to posterior_samples.npz (default "
+             "0: none), from the covariance --uncertainty names (statistical if "
+             "none). Read them with pyuvimage.posterior.PosteriorSamples, or let "
+             "scripts/moment_maps.py turn them into error maps for the moments",
+    )
+    p_fit.add_argument(
         "--point-sources", action="store_true",
         help="fit analytic point components; auto-detect their positions",
     )
@@ -703,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
             dish_diameter=args.dish_diameter,
             pb_in_model=args.pb_in_model,
             uncertainty=args.uncertainty,
+            posterior_samples=args.posterior_samples,
             point_sources=point_sources,
             point_significance=args.point_significance,
             max_points=args.max_points,

@@ -153,6 +153,7 @@ class ProductSet:
     source_flux: dict | None = None         # `api._source_flux`: flux and its significance
     snr: np.ndarray | None = None           # S/N at the restoring beam's resolution (`beam_snr`)
     model_bayesian: np.ndarray | None = None   # marginal posterior mean (uncertainty="bayesian"), Jy/pixel
+    posterior: dict | None = None   # posterior draws (`SingleFit.posterior_deltas`), --posterior-samples
 
 
 
@@ -189,6 +190,32 @@ def _coefficient_label(rows) -> str:
     if max(c) <= 1.0001 * min(c):
         return f"prior coefficient {c[0]:.3g}"
     return f"prior coefficient {min(c):.3g}-{max(c):.3g} (per channel)"
+
+
+def write_posterior_samples(path: Path, products, n_img: int) -> Path:
+    """`posterior_samples.npz`: per plane, the draws as offsets from the
+    model (`SingleFit.posterior_deltas`) and the sparse map from parameters
+    to pixels of `model.fits` (FITS orientation, flattened). A plane without
+    draws has none. Read with `pyuvimage.posterior.PosteriorSamples`."""
+    arrays = {"n_planes": np.int64(len(products)),
+              "shape": np.array([n_img, n_img], dtype=np.int64)}
+    modes = set()
+    for i, p in enumerate(products):
+        post = getattr(p, "posterior", None)
+        if not post:
+            continue
+        coo = post["mapping"].tocoo()
+        native = np.asarray(post["unmasked"])[coo.row]
+        r, c = np.divmod(native, n_img)
+        arrays[f"p{i}_delta"] = np.asarray(post["delta"], dtype=np.float32)
+        arrays[f"p{i}_pixel"] = ((n_img - 1 - r) * n_img + c).astype(np.int32)
+        arrays[f"p{i}_param"] = coo.col.astype(np.int32)
+        arrays[f"p{i}_weight"] = coo.data.astype(np.float32)
+        modes.add(post.get("mode", "statistical"))
+    arrays["mode"] = np.array(",".join(sorted(modes)))
+    np.savez(path, **arrays)
+    logger.info("posterior samples written to %s", path)
+    return Path(path)
 
 
 def write_products(
@@ -342,6 +369,9 @@ def write_products(
         }
         w("snr.fits", snr_stack, hdr(n_img, geometry.pixel_scale, "",
                                      beam=products[0].beam, extra=snr_extra))
+    if any(getattr(p, "posterior", None) for p in products):
+        written["posterior_samples.npz"] = write_posterior_samples(
+            out / "posterior_samples.npz", products, n_img)
     if products[0].pb is not None:
         w("pb.fits", stack("pb"),
           hdr(n_img, geometry.pixel_scale, ""))

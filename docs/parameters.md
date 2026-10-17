@@ -60,6 +60,7 @@ In `--mode cube` the MFS pass decides *where* the points are and every channel t
 | Parameter | Default | Meaning |
 |---|---|---|
 | `--uncertainty` | `none` | What the uncertainty products contain. `none`: no `uncertainty.fits` or `snr.fits` (fastest). `statistical`: the posterior width at the fitted prior strength. `bayesian`: the posterior marginalised over the prior strength, weighted by the evidence (also `model_bayesian.fits`, the posterior mean those errors belong to). See [uncertainty.md](uncertainty.md) for how far each can be trusted. Replaces `--no-uncertainty`; old config files with `"no-uncertainty": false` run as `statistical` (the statistical + prior-systematic map they made was removed in Oct 2026). |
+| `--posterior-samples` | `0` | Write N draws from the posterior to `posterior_samples.npz`, from the covariance `--uncertainty` names (`statistical` if `none`). Each draw is the model plus a correlated offset; compute anything from each and the scatter is its error, correlations included. `scripts/moment_maps.py` turns them into moment-map errors. Not for fits with point components or the matrix-free solve. See [uncertainty.md](uncertainty.md#posterior-samples). |
 
 **Solver / data**
 

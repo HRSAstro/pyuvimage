@@ -92,6 +92,58 @@ weaker than `structure` (a sharper, lumpier map); on REBELS-25, 0.5 dex
 stronger. On bright sources the two agree (REBELS-25 source flux 1.20 vs
 1.17 mJy).
 
+## Posterior samples
+
+`--posterior-samples N` writes `posterior_samples.npz`: N draws from the
+posterior of every channel, from the same covariance as `uncertainty.fits`
+(the marginal one under `--uncertainty bayesian`, the fitted-strength one
+otherwise). Each draw is the delivered model plus a correlated offset
+`M delta`, `delta ~ N(0, C)`, so the draws' mean is `model.fits` and their
+scatter per pixel is the undeblocked `uncertainty.fits`. Under `bayesian`
+they are still centred on `model.fits` (the positive, delivered model, which
+the moments are taken of), with the marginal covariance, which includes the
+spread between the means at different strengths.
+
+Anything computed from the model can be computed from each draw, and the
+scatter over draws is its error, with every correlation in `C` carried
+through: between neighbouring pixels (anticorrelated across the
+interpolation), and over the prior's correlation length. A sum over a region
+reproduces `aperture_uncertainty` (to 5% with 4000 draws on the mocks),
+where the per-pixel errors in quadrature do not.
+
+This is what says how much structure finer than the beam the data support.
+A forward model is not limited to the beam the way a CLEAN image is: where
+the S/N is high the data constrain the model on smaller scales, and the
+draws agree on that structure; where it is low they spread as far as the
+prior allows. `snr.fits` answers the question at the beam's resolution; the
+draws answer it at any resolution, for any derived quantity.
+
+```python
+from astropy.io import fits
+from pyuvimage.posterior import PosteriorSamples
+
+post = PosteriorSamples("pyuvimage_out/posterior_samples.npz")
+model = fits.getdata("pyuvimage_out/model.fits")
+values = [my_statistic(post.draw(k, model)) for k in range(post.n_samples)]
+```
+
+`scripts/moment_maps.py` uses them for moment-map errors: every draw goes
+through the same mask and the same moments, and half the 16-84% range over
+draws is written as `<out>_mom0_err.fits`, `_mom1_err.fits` and
+`_mom2_err.fits`, with `<out>_mom0_snr.fits`.
+
+**Caveats.** The draws are Gaussian, so positivity is not imposed: where the
+model sits at zero they scatter either side of it, and a moment 1 or 2 whose
+weights nearly cancel is unstable (hence the percentile range rather than the
+standard deviation). Errors from a fixed mask are conditional on it. Analytic
+point components are not sampled (the draws are skipped for fits with
+points), and the matrix-free solve has no covariance to draw from.
+
+**Size.** Per channel, `N x n_mesh x 4` bytes of draws plus ~12 bytes per
+image pixel per mesh neighbour for the map onto the image grid: for a
+37-channel cube with 9216-point meshes on a 384² image and N = 100, about
+330 MB. Drawing them costs one Cholesky factorisation of `C` per channel.
+
 ## Point sources
 
 Point components are solved together with the mesh, with no prior on their

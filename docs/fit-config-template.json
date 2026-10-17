@@ -39,6 +39,7 @@
   "workers": 1,
   "_products": "what is written alongside the model image.",
   "uncertainty": "none",
+  "posterior-samples": 0,
   "no-pb": false,
   "dish-diameter": null,
   "_points": "analytic point components. \"point\" takes a list of [x, y] positions in arcsec, image axes, and implies point-sources with auto-detection off.",

@@ -64,6 +64,7 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `uncertainty.fits` | Jy/pixel | 1σ per pixel, of the kind `--uncertainty` asked for (`ERRTYPE`) — see below; not written by default |
 | `model_bayesian.fits` | Jy/pixel | `--uncertainty bayesian`: the posterior mean marginalised over the prior strength, which `uncertainty.fits` is then the 1σ of |
 | `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (from the full covariance), points included |
+| `posterior_samples.npz` | Jy/pixel | `--posterior-samples N`: N draws from the posterior per channel, as offsets from `model.fits` — read with `pyuvimage.posterior.PosteriorSamples` |
 | `dirty_image.fits` | Jy/beam | naturally weighted dirty image of the data |
 | `dirty_model.fits` | Jy/beam | dirty image of the model visibilities |
 | `pb.fits` | — | primary beam (Gaussian, FWHM ≈ 1.13 λ/D), centred on the phase centre — not on the image centre when `--image-centre` is used |
@@ -174,6 +175,14 @@ wrong, nor calibration errors.
 prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
 evaluates `w^T (M C M^T) w` properly — quadrature overstated a compact
 aperture's error by ~1.4× on our mocks.
+
+**Posterior samples** (`--posterior-samples N`) are draws from the same
+posterior: compute any quantity — a moment map, a line ratio, a flux — on
+each, and the scatter over draws is its error with every correlation carried
+through. This is how to tell what the data say on scales smaller than the
+beam: at high S/N the draws agree on that structure, at low S/N they spread
+as the prior allows. `scripts/moment_maps.py` turns them into moment-map
+error maps.
 
 Details, and the mesh/image checkerboard removal recorded as `ERRDEBL`:
 [docs/uncertainty.md](docs/uncertainty.md).

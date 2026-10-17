@@ -351,6 +351,7 @@ def run(
     pb_in_model: bool = False,
     uncertainty: str | None = None,
     uncertainty_map: bool | None = None,
+    posterior_samples: int = 0,
     point_sources: bool | str | tuple | list | None = None,
     point_significance: float = 5.0,
     max_points: int = 5,
@@ -519,7 +520,7 @@ def run(
             kernel_cache=kernel_cache, mask_shape=mask_shape, oversample=oversample,
             pb_correction=pb_correction, dish_diameter=dish_diameter,
             pb_factor=pb_factor, pb_in_model=pb_in_model,
-            uncertainty=uncertainty, write=write,
+            uncertainty=uncertainty, posterior_samples=posterior_samples, write=write,
             mode=mode, inversion=inversion, image_centre=image_centre,
             point_sources=point_sources, point_significance=point_significance,
             max_points=max_points, point_retune=point_retune,
@@ -920,7 +921,8 @@ def run(
         products.append(
             _products_for(mfs_fit, mfs_dataset, geometry, uvd,
                           uvd.central_frequency, pb_correction, dish, pb_factor,
-                          oversample, uncertainty, imager=imager)
+                          oversample, uncertainty, imager=imager,
+                          posterior_samples=posterior_samples)
         )
         freqs = np.atleast_1d(uvd.central_frequency)
         _report_dynamic_range(products[0], n_data_all, criterion,
@@ -976,6 +978,7 @@ def run(
             beam_size=beam_size, meta=uvd.meta, pb_correction=pb_correction,
             dish=dish, pb_factor=pb_factor, oversample=oversample,
             uncertainty=uncertainty, channel_mesh=channel_mesh,
+            posterior_samples=posterior_samples,
             per_channel_prior=cube_prior == "per-channel",
             first_prior=first_prior,
         )
@@ -1084,6 +1087,7 @@ def run_streamed(
     pb_in_model: bool = False,
     uncertainty: str | None = None,
     uncertainty_map: bool | None = None,
+    posterior_samples: int = 0,
     write: bool = True,
     mode: str = "mfs",
     inversion: str = "auto",
@@ -1434,6 +1438,7 @@ def run_streamed(
         products = [_products_for(
             mfs_fit, stub, geometry, header, header.central_frequency, pb_correction,
             dish, pb_factor, oversample, uncertainty, imager=imager,
+            posterior_samples=posterior_samples,
         )]
         _report_dynamic_range(products[0], n_data_all, criterion,
                               region=getattr(geometry.mesh, "region", None))
@@ -1463,6 +1468,7 @@ def run_streamed(
             envelope=envelope, chi2_target=chi2_target, meta=header.meta,
             pb_correction=pb_correction, dish=dish, pb_factor=pb_factor,
             oversample=oversample, uncertainty=uncertainty, matrix_free=matrix_free,
+            posterior_samples=posterior_samples,
             channel_mesh=channel_mesh, per_channel_prior=cube_prior == "per-channel",
             first_prior=first_prior,
         )
@@ -2441,6 +2447,7 @@ def _fit_cube_channel(task: dict) -> dict:
         sf, ds_c, geometry, SimpleNamespace(meta=task["meta"]), task["frequency"],
         task["pb_correction"], task["dish"], task["pb_factor"],
         task["oversample"], task["uncertainty"],
+        posterior_samples=task.get("posterior_samples", 0),
     )
     return {"index": c, "products": products, "chi2_per_datum": chi2_n,
             "point_flux": point_flux, "coefficient": float(products.coefficient)}
@@ -2484,10 +2491,33 @@ def _fit_streamed_channel(task: dict) -> dict:
         sf, stub_c, geometry, SimpleNamespace(meta=task["meta"]),
         task["frequency"], task["pb_correction"], task["dish"],
         task["pb_factor"], task["oversample"], task["uncertainty"],
-        imager=imager_c,
+        imager=imager_c, posterior_samples=task.get("posterior_samples", 0),
     )
     return {"index": c, "products": products, "chi2_per_datum": chi2_n,
             "coefficient": float(products.coefficient)}
+
+
+def _posterior_draws(sf, n: int, uncertainty_mode: str) -> dict | None:
+    """`--posterior-samples`: n draws from the posterior (`posterior_deltas`)
+    for `posterior_samples.npz`, or None."""
+    if not n:
+        return None
+    if getattr(sf, "points", None) or not hasattr(sf, "posterior_deltas"):
+        logger.warning(
+            "posterior samples are not available for this fit (%s): skipped",
+            "point components" if getattr(sf, "points", None) else "matrix-free solve")
+        return None
+    mode = "bayesian" if uncertainty_mode == "bayesian" else "statistical"
+    started = time.time()
+    try:
+        out = sf.posterior_deltas(int(n), mode=mode)
+    except Exception as e:              # never let the draws kill a fit
+        logger.warning("posterior samples failed: %s: %s", type(e).__name__, e)
+        return None
+    out["mode"] = mode
+    logger.info("posterior samples: %d draws (%s covariance), %.0f s", int(n), mode,
+                time.time() - started)
+    return out
 
 
 def _products_for(
@@ -2502,6 +2532,7 @@ def _products_for(
     oversample: int,
     uncertainty_mode: str = "statistical",
     imager: "beam_mod.DirtyImager | None" = None,
+    posterior_samples: int = 0,
 ) -> ProductSet:
     if imager is None or imager.dataset is not dataset:
         imager = fitting.imager_for(dataset)
@@ -2593,7 +2624,9 @@ def _products_for(
             logger.warning("S/N map failed: %s: %s", type(e).__name__, e)
         if uncertainty_terms is not None:
             uncertainty_terms["seconds_snr"] = time.time() - started
+    posterior = _posterior_draws(sf, posterior_samples, uncertainty_mode)
     return ProductSet(
+        posterior=posterior,
         snr=snr,
         source_flux=source_flux,
         model_mesh=model_mesh,

@@ -4185,6 +4185,52 @@ class SingleFit:
         }
         return out, terms
 
+    def posterior_deltas(self, n: int, mode: str = "statistical",
+                         seed: int = 0) -> dict:
+        """``n`` draws from the posterior, as offsets from the delivered fit.
+
+        A draw is the delivered model plus ``M delta`` with delta ~ N(0, C):
+        C = (F+H)^-1 at the fitted strength ("statistical"), or the posterior
+        marginalised over the strength ("bayesian", `bayesian_posterior`).
+        Anything derived from the model -- moment maps, line ratios, a flux
+        in a region -- can be computed on each draw and its scatter read off,
+        with every correlation in C carried through. That is what tells you
+        which structure finer than the beam the data support: at high S/N the
+        draws agree on it, at low S/N they scatter as the prior allows.
+
+        Gaussian, so positivity is not imposed: where the delivered model sits
+        on zero the draws scatter either side of it.
+
+        Returns {"delta": (n, n_params) float32, "mapping": (n_slim, n_params)
+        sparse, "unmasked": the native flat index of each slim pixel}; the
+        image of draw k is ``mapping @ delta[k]`` scattered into those pixels.
+        """
+        import scipy.sparse as sp
+
+        cov = (self.bayesian_posterior["cov"] if mode == "bayesian"
+               else self.posterior_covariance)
+        cov = np.asarray(cov)
+        try:
+            L = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            w, V = np.linalg.eigh(0.5 * (cov + cov.T))
+            L = V * np.sqrt(np.clip(w, 0.0, None))
+        rng = np.random.default_rng(seed)
+        delta = (L @ rng.standard_normal((L.shape[1], int(n)))).T.astype(np.float32)
+        n_params = cov.shape[0]
+        blocks = []
+        for obj, _ in self.fit.inversion.reconstruction_dict.items():
+            sl = self._parameter_slice(obj)
+            M = sp.csr_matrix(mesh_mapping(obj))
+            pad = sp.csr_matrix((M.shape[0], n_params))
+            blocks.append(sp.hstack([pad[:, :sl.start], M, pad[:, sl.stop:]]))
+        mapping = blocks[0]
+        for b in blocks[1:]:
+            mapping = mapping + b
+        mask = np.asarray(self.fit.dataset.real_space_mask).astype(bool)
+        return {"delta": delta, "mapping": sp.csr_matrix(mapping),
+                "unmasked": np.flatnonzero(~mask.ravel())}
+
     def aperture_bayesian(self, region: np.ndarray) -> tuple[float, float]:
         """(flux, 1-sigma) inside a region from the marginal posterior [Jy]."""
         region = np.asarray(region, dtype=bool)
