@@ -3772,6 +3772,26 @@ def _deblock(image: np.ndarray, oversample: int) -> np.ndarray:
     return np.where(finite, smoothed, np.nan)
 
 
+def _factor(cov: np.ndarray) -> np.ndarray:
+    """L with L L^T = cov, for a covariance that may have zero rows and
+    columns (pinned parameters, `SingleFit.free`): Cholesky of the non-zero
+    block, zeros elsewhere; eigen-decomposition if that block is not
+    positive definite."""
+    cov = np.asarray(cov)
+    live = np.flatnonzero(np.diag(cov) > 0)
+    block = cov[np.ix_(live, live)]
+    try:
+        Lb = np.linalg.cholesky(block)
+    except np.linalg.LinAlgError:
+        w, V = np.linalg.eigh(0.5 * (block + block.T))
+        Lb = V * np.sqrt(np.clip(w, 0.0, None))
+    if live.size == cov.shape[0]:
+        return Lb
+    L = np.zeros((cov.shape[0], live.size))
+    L[live] = Lb
+    return L
+
+
 def evidence_grid(at) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The grid in log10 lambda (dex about the fitted strength) that
     `SingleFit.bayesian_posterior` marginalises over, and its weights.
@@ -3796,12 +3816,22 @@ def evidence_grid(at) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             coarse.insert(0, coarse[0] - step); at(coarse[0])
         else:
             break
-    fine = best + np.arange(-BAYES_FINE_HALF_WIDTH_DEX,
-                            BAYES_FINE_HALF_WIDTH_DEX + 1e-9, BAYES_FINE_STEP_DEX)
-    z = np.array([at(d) for d in fine])
-    w = np.exp(z - np.nanmax(z))
-    w = np.where(np.isfinite(w), w, 0.0)
-    w /= w.sum()
+    lo = best - BAYES_FINE_HALF_WIDTH_DEX
+    hi = best + BAYES_FINE_HALF_WIDTH_DEX
+    while True:
+        fine = np.arange(lo, hi + 1e-9, BAYES_FINE_STEP_DEX)
+        z = np.array([at(d) for d in fine])
+        w = np.exp(z - np.nanmax(z))
+        w = np.where(np.isfinite(w), w, 0.0)
+        w /= w.sum()
+        # a posterior wider than the fine window would be truncated: widen it
+        # while either edge still carries weight
+        grow_lo = w[0] > 1e-3 and lo > -MAX_LOG_COEFFICIENT
+        grow_hi = w[-1] > 1e-3 and hi < MAX_LOG_COEFFICIENT
+        if not (grow_lo or grow_hi):
+            break
+        lo -= BAYES_FINE_HALF_WIDTH_DEX if grow_lo else 0.0
+        hi += BAYES_FINE_HALF_WIDTH_DEX if grow_hi else 0.0
     return fine, w, w >= BAYES_MIN_WEIGHT
 
 
@@ -3913,19 +3943,73 @@ class SingleFit:
         )
 
     @functools.cached_property
+    def free(self) -> np.ndarray:
+        """Which parameters the posterior is over: those not held at zero.
+
+        A mask's ring of ``zeroed_pixels`` (`adaptive_mesh`) and, under
+        positivity, the pixels the non-negative solver pinned at zero are
+        constraints, not parameters. (F+H)^-1 over everything gave them full
+        variance and let it interpolate into the image: on a masked mock the
+        error *outside* the mask read larger than inside, where the model is
+        exactly zero. The covariance is conditioned on them instead -- the
+        Laplace approximation on the active set, the standard NNLS error.
+        A pinned pixel therefore reports zero error: at the delivered
+        strength the data and positivity exclude flux there; the one-sided
+        allowance it could have is of the order of its free neighbours'.
+        """
+        n = int(self.system.F.shape[0])
+        free = np.ones(n, dtype=bool)
+        mesh = getattr(self.geometry, "mesh", None)
+        n_zeroed = int(getattr(mesh, "n_zeroed", 0) or 0)
+        if n_zeroed:
+            free[n - n_zeroed:] = False
+        if self.positive_only:
+            free &= self.reconstruction > 0
+        if not free.any():                        # an empty model: nothing to condition on
+            free[:] = True
+        return free
+
+    @functools.cached_property
+    def chi2_inflation(self) -> float:
+        """max(1, chi^2/N) of the delivered fit: everything below is
+        conditional on the noise map, and where the fit cannot reach
+        chi^2 = N at any strength (phase errors, a line the model cannot
+        follow) the noise map is too small by about this factor. Scales the
+        covariance (`ERRCHI2`); never deflates."""
+        n = self.system.n_data
+        c = float(self.chi_squared) / n if n else 1.0
+        return float(max(1.0, c)) if np.isfinite(c) else 1.0
+
+    def _embed(self, block: np.ndarray) -> np.ndarray:
+        """A covariance over the free parameters, as a full-size matrix with
+        zero rows and columns for the pinned ones."""
+        free = self.free
+        if free.all():
+            return block
+        out = np.zeros((free.size, free.size))
+        idx = np.flatnonzero(free)
+        out[np.ix_(idx, idx)] = block
+        return out
+
+    @functools.cached_property
     def posterior_covariance(self) -> np.ndarray:
-        """Posterior covariance of the reconstruction, (F + H)^-1.
+        """Posterior covariance of the reconstruction: (F + H)^-1 over the
+        free parameters (`free`), zero for the pinned ones, times
+        `chi2_inflation`.
 
         For a linear inversion with Gaussian noise and a Gaussian (GP) prior
         the posterior is Gaussian with this covariance, where F is the
         curvature A^T C_d^-1 A and H the regularisation matrix.
 
         NOTE this is conditional on the prior *and its fitted
-        hyperparameters*, and on the noise map being correct.  It does not
-        include the error from the prior's strength itself being uncertain
-        (see `bayesian_posterior`), nor from the prior family being wrong.
+        hyperparameters*.  It does not include the error from the prior's
+        strength itself being uncertain (see `bayesian_posterior`), nor from
+        the prior family being wrong.
         """
-        return np.linalg.inv(np.add(self.system.F, self.regularization_matrix))
+        A = np.add(self.system.F, self.regularization_matrix)
+        idx = np.flatnonzero(self.free)
+        block = np.linalg.inv(A[np.ix_(idx, idx)])
+        return self._embed(block) * self.chi2_inflation
 
     @functools.cached_property
     def sampling_covariance(self) -> np.ndarray:
@@ -3937,8 +4021,8 @@ class SingleFit:
         shrinks the solution.  Verified against a 30-realisation Monte Carlo
         to 0.4%.
         """
-        cov = self.posterior_covariance
-        return cov @ self.system.F @ cov
+        cov = self.posterior_covariance / self.chi2_inflation
+        return cov @ self.system.F @ cov * self.chi2_inflation
 
     def _propagate(self, cov: np.ndarray) -> np.ndarray:
         """sqrt(diag(M C M^T)) on the image grid, for a parameter covariance."""
@@ -3978,11 +4062,7 @@ class SingleFit:
         from scipy.signal import fftconvolve
 
         cov = self.posterior_covariance if cov is None else np.asarray(cov)
-        try:
-            L = np.linalg.cholesky(cov)
-        except np.linalg.LinAlgError:
-            w, V = np.linalg.eigh(0.5 * (cov + cov.T))
-            L = V * np.sqrt(np.clip(w, 0.0, None))
+        L = _factor(cov)
         mask = self.fit.dataset.real_space_mask
         shape = tuple(int(n) for n in self.geometry.shape_native)
         unmasked = np.flatnonzero(~np.asarray(mask).astype(bool).ravel())
@@ -4096,6 +4176,7 @@ class SingleFit:
         upper envelope (see `_deblock`), which is the conservative choice:
         an over-stated error never manufactures a detection."""
         stat = np.asarray(self.model_uncertainty)
+        deblock = deblock and getattr(self.geometry, "mesh", None) is None   # no blocks on a Delaunay mesh
         out = _deblock(stat, self.geometry.oversample) if deblock else stat
         terms = {
             "type": "statistical",
@@ -4104,6 +4185,8 @@ class SingleFit:
             "checkerboard_amplitude": float(_block_contrast(
                 stat, self.geometry.oversample)),
             "deblocked": bool(deblock),
+            "chi2_inflation": self.chi2_inflation,
+            "pinned_fraction": float(1.0 - self.free.mean()),
         }
         return out, terms
 
@@ -4135,15 +4218,35 @@ class SingleFit:
         structure-chosen strength (`scripts/marginal_lambda_mock.py`).
         """
         system, H0 = self.system, np.asarray(self.regularization_matrix)
+        # over the parameters a mask leaves free (its zeroed ring is a
+        # constraint on every solve, not a parameter); positivity's active
+        # set is not imposed here -- the mixture is unconstrained by design
+        mesh = getattr(self.geometry, "mesh", None)
+        n_zeroed = int(getattr(mesh, "n_zeroed", 0) or 0)
+        n = H0.shape[0]
+        idx = np.arange(n - n_zeroed)
+        F = np.asarray(system.F)[np.ix_(idx, idx)]
+        D = np.asarray(system.D)[idx]
+        Hf = H0[np.ix_(idx, idx)]
+        ldH = _log_det_cholesky(Hf)
         cache: dict[float, tuple[np.ndarray | None, float]] = {}
+
+        def full(v):
+            out = np.zeros(n)
+            out[idx] = v
+            return out
 
         def at(dex):
             key = round(float(dex), 6)
             if key not in cache:
-                H = 10.0 ** key * H0
+                H = 10.0 ** key * Hf
                 try:
-                    v = system.solve(H, positive=False)
-                    z = float(system.log_evidence(v, H))
+                    A = F + H
+                    v = np.linalg.solve(A, D)
+                    z = -0.5 * (system.chi_squared(full(v)) + v @ H @ v
+                                + _log_det_cholesky(A) - (ldH + idx.size * key * np.log(10.0))
+                                + system.noise_normalization)
+                    z = float(z)
                 except Exception:                 # singular: no weight
                     v, z = None, -np.inf
                 cache[key] = (v, z)
@@ -4152,19 +4255,21 @@ class SingleFit:
         started = time.perf_counter()
         fine, w, keep = evidence_grid(at)
         w_k = w[keep] / w[keep].sum()
-        F = np.asarray(system.F)
         mean = None
         second = None
         for wk, d in zip(w_k, fine[keep]):
             v = cache[round(float(d), 6)][0]
-            C = np.linalg.inv(F + 10.0 ** d * H0)
+            C = np.linalg.inv(F + 10.0 ** d * Hf)
             outer = np.outer(v, v)
             mean = wk * v if mean is None else mean + wk * v
             second = wk * (C + outer) if second is None else second + wk * (C + outer)
         cov = second - np.outer(mean, mean)
         cov = 0.5 * (cov + cov.T)
+        cov_full = np.zeros((n, n))
+        cov_full[np.ix_(idx, idx)] = cov * self.chi2_inflation
         info = lambda_posterior_info(self.coefficient, fine, w, keep, len(cache), started)
-        return {"mean": mean, "cov": cov, "info": info}
+        info["chi2_inflation"] = self.chi2_inflation
+        return {"mean": full(mean), "cov": cov_full, "info": info}
 
     @functools.cached_property
     def bayesian_mean_image(self) -> np.ndarray:
@@ -4175,12 +4280,14 @@ class SingleFit:
         """The marginal posterior 1-sigma, `uncertainty="bayesian"` [Jy/pixel]."""
         post = self.bayesian_posterior
         sd = self._propagate(post["cov"])
+        deblock = deblock and getattr(self.geometry, "mesh", None) is None
         out = _deblock(sd, self.geometry.oversample) if deblock else sd
         terms = {
             "type": "bayesian",
             "statistical_median": float(np.nanmedian(sd)),
             "total_median": float(np.nanmedian(out)),
             "deblocked": bool(deblock),
+            "chi2_inflation": self.chi2_inflation,
             "lambda_posterior": dict(post["info"]),
         }
         return out, terms
@@ -4189,17 +4296,19 @@ class SingleFit:
                          seed: int = 0) -> dict:
         """``n`` draws from the posterior, as offsets from the delivered fit.
 
-        A draw is the delivered model plus ``M delta`` with delta ~ N(0, C):
-        C = (F+H)^-1 at the fitted strength ("statistical"), or the posterior
-        marginalised over the strength ("bayesian", `bayesian_posterior`).
+        A draw is the delivered model plus ``M delta``: delta ~ N(0, C) with
+        C = `posterior_covariance` ("statistical"), or, for "bayesian", a
+        draw from the marginal posterior (`bayesian_posterior`) -- centred on
+        its own mean, so the delta carries the shift from the delivered
+        model to `model_bayesian.fits` as well as the scatter about it.
         Anything derived from the model -- moment maps, line ratios, a flux
         in a region -- can be computed on each draw and its scatter read off,
         with every correlation in C carried through. That is what tells you
         which structure finer than the beam the data support: at high S/N the
         draws agree on it, at low S/N they scatter as the prior allows.
 
-        Gaussian, so positivity is not imposed: where the delivered model sits
-        on zero the draws scatter either side of it.
+        Gaussian over the free parameters (`free`): pixels held at zero -- a
+        mask's ring, positivity's active set -- do not move.
 
         Returns {"delta": (n, n_params) float32, "mapping": (n_slim, n_params)
         sparse, "unmasked": the native flat index of each slim pixel}; the
@@ -4207,16 +4316,20 @@ class SingleFit:
         """
         import scipy.sparse as sp
 
-        cov = (self.bayesian_posterior["cov"] if mode == "bayesian"
-               else self.posterior_covariance)
-        cov = np.asarray(cov)
-        try:
-            L = np.linalg.cholesky(cov)
-        except np.linalg.LinAlgError:
-            w, V = np.linalg.eigh(0.5 * (cov + cov.T))
-            L = V * np.sqrt(np.clip(w, 0.0, None))
+        if mode == "bayesian":
+            post = self.bayesian_posterior
+            cov = np.asarray(post["cov"])
+            # centred on the marginal mean, whose spread this covariance is;
+            # as an offset from the delivered model
+            shift = np.asarray(post["mean"]) - self.reconstruction
+        else:
+            cov = np.asarray(self.posterior_covariance)
+            shift = 0.0
+        L = _factor(cov)
         rng = np.random.default_rng(seed)
-        delta = (L @ rng.standard_normal((L.shape[1], int(n)))).T.astype(np.float32)
+        delta = (shift[:, None] if np.ndim(shift) else shift) + \
+            L @ rng.standard_normal((L.shape[1], int(n)))
+        delta = delta.T.astype(np.float32)
         n_params = cov.shape[0]
         blocks = []
         for obj, _ in self.fit.inversion.reconstruction_dict.items():

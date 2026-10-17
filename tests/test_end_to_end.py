@@ -392,8 +392,9 @@ def test_uncertainty_is_data_independent_and_prior_shaped():
     """Two properties of the posterior covariance that are easy to get wrong.
 
     (1) C = (F+H)^-1 contains no data, so with the prior held fixed the
-        uncertainty map must be *identical* for completely different data.
-        It therefore cannot respond to how bright the source is.
+        uncertainty map must be *identical* for completely different data,
+        up to the scalar chi^2/N inflation (`SingleFit.chi2_inflation`). It
+        therefore cannot respond to how bright the source is.
     (2) Its spatial structure comes from the prior: a stationary kernel gives
         a flat map (F and H are both translation-invariant), a non-stationary
         one varies. A flat matern map is correct, not a bug.
@@ -406,15 +407,16 @@ def test_uncertainty_is_data_independent_and_prior_shaped():
     prior = {"coefficient": 1e7, "scale": 0.3, "nu": 1.5}
 
     def unc(data, kind="matern", env=None):
-        return fitting.fit_dataset(
+        sf = fitting.fit_dataset(
             fitting.make_dataset(uv, data, nz, geom), geom, reg_kind=kind,
             prior=prior, positive_only=False, envelope=env,
-        ).model_uncertainty
+        )
+        return np.asarray(sf.model_uncertainty) / np.sqrt(sf.chi2_inflation)
 
     rng = np.random.default_rng(2)
     other = d + rng.normal(0, nz.real) + 1j * rng.normal(0, nz.imag)
     u1, u2 = unc(d), unc(other)
-    assert np.allclose(u1, u2, rtol=0, atol=0), "posterior depends on the data"
+    assert np.allclose(u1, u2, rtol=1e-10, atol=0), "posterior depends on the data"
 
     # a stationary prior is flat in the interior (sample mesh nodes only, to
     # skip the node/interpolated checkerboard)

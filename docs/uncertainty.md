@@ -50,7 +50,40 @@ In `bayesian` mode the record adds `flux_bayesian_jy` and
 | `ERRTYPE` | `statistical` or `bayesian` |
 | `ERRSTAT` | median 1σ [Jy/pixel] |
 | `ERRDEBL` | `T`: the mesh/image checkerboard was replaced by its envelope |
+| `ERRCHI2` | the covariance was scaled by max(1, χ²/N) of the delivered fit (see "Two corrections") |
 | `BAYLAM`, `BAYLSD` | `bayesian` only: posterior mean and sd of log₁₀ λ |
+
+`uncertainty_pbcor.fits` is the same map divided by the primary beam, beside
+`model_pbcor.fits`.
+
+## Two corrections to the covariance
+
+Both modes start from `(F + H)⁻¹`, and two things are done to it before
+anything is propagated (`SingleFit.posterior_covariance`):
+
+**Constraints are not parameters.** A mask's ring of zeroed points and,
+under positivity, the pixels the non-negative solver pins at zero are held
+there; they are not free. Inverting `F + H` over everything gave them full
+variance, which the mapper interpolated into the image: on a masked mock the
+error *outside* the mask read larger than inside, where the model is exactly
+zero, and the draws put flux there. The covariance is now that of the free
+parameters alone, `((F+H)_FF)⁻¹`, with zero rows and columns for the pinned
+ones — the Laplace approximation on the active set, the standard NNLS error
+(`SingleFit.free`; `pinned_fraction` in `fit_parameters.json`). A pinned
+pixel therefore reports zero error: at the delivered strength the data and
+positivity exclude flux there, and the one-sided allowance it could have is
+of the order of its free neighbours'. The Bayesian mixture drops the zeroed
+ring from every solve, so `model_bayesian.fits` stays inside the mask; it
+does not impose positivity (it is unconstrained by design), so its pixels
+near zero keep a two-sided error.
+
+**The noise map's scale.** Everything is conditional on the noise map, and
+where no strength brings χ²/N to 1 — phase errors, a line that one image
+cannot follow (NGC 4274's MFS fit sat at 1.355 at every strength) — the
+noise is under-stated by about that factor. The covariance is scaled by
+max(1, χ²/N) of the delivered fit, recorded as `ERRCHI2` and
+`chi2_inflation`. It never deflates: χ²/N below 1 is the prior at work, not
+a noise map that is too large.
 
 ## Statistical
 
@@ -95,14 +128,13 @@ stronger. On bright sources the two agree (REBELS-25 source flux 1.20 vs
 ## Posterior samples
 
 `--posterior-samples N` writes `posterior_samples.npz`: N draws from the
-posterior of every channel, from the same covariance as `uncertainty.fits`
-(the marginal one under `--uncertainty bayesian`, the fitted-strength one
-otherwise). Each draw is the delivered model plus a correlated offset
-`M delta`, `delta ~ N(0, C)`, so the draws' mean is `model.fits` and their
-scatter per pixel is the undeblocked `uncertainty.fits`. Under `bayesian`
-they are still centred on `model.fits` (the positive, delivered model, which
-the moments are taken of), with the marginal covariance, which includes the
-spread between the means at different strengths.
+posterior of every channel, from the same covariance as `uncertainty.fits`.
+Each draw is the delivered model plus a correlated offset `M delta`. Under
+`statistical`, `delta ~ N(0, C)`: the draws' mean is `model.fits` and their
+scatter per pixel the undeblocked `uncertainty.fits`. Under `bayesian` they
+are draws from the marginal posterior, centred on `model_bayesian.fits`
+(the offset carries the shift from the delivered model as well as the
+scatter), since that covariance is the spread about *that* mean.
 
 Anything computed from the model can be computed from each draw, and the
 scatter over draws is its error, with every correlation in `C` carried
@@ -132,12 +164,20 @@ through the same mask and the same moments, and half the 16-84% range over
 draws is written as `<out>_mom0_err.fits`, `_mom1_err.fits` and
 `_mom2_err.fits`, with `<out>_mom0_snr.fits`.
 
-**Caveats.** The draws are Gaussian, so positivity is not imposed: where the
-model sits at zero they scatter either side of it, and a moment 1 or 2 whose
-weights nearly cancel is unstable (hence the percentile range rather than the
+**Caveats.** The draws are Gaussian over the free parameters: a pixel the
+solver pinned at zero does not move (`statistical`), and under `bayesian`
+pixels near zero scatter either side of it, so a moment 1 or 2 whose weights
+nearly cancel is unstable (hence the percentile range rather than the
 standard deviation). Errors from a fixed mask are conditional on it. Analytic
 point components are not sampled (the draws are skipped for fits with
 points), and the matrix-free solve has no covariance to draw from.
+
+With draws in hand the reported source flux is also redrawn: on each draw
+the region (model ⊗ beam > 3 rms) is found afresh and its flux summed, and
+`source_flux` gains `flux_draws_jy` and `flux_error_draws_jy`. A region
+thresholded on the estimate itself keeps its positive noise excursions, so
+the fixed-region flux is biased high and its error leaves out the region's
+own uncertainty; the draws' version has neither problem.
 
 **Size.** Per channel, `N x n_mesh x 4` bytes of draws plus ~12 bytes per
 image pixel per mesh neighbour for the map onto the image grid: for a
@@ -187,7 +227,18 @@ evidence puts λ, not from the spread over λ (the posterior on log₁₀ λ is 
 source-flux S/N 15.0 statistical, 15.2 Bayesian.
 
 Neither covers the prior *family* being wrong, nor calibration or
-deconvolution error.
+deconvolution error. Only the strength λ is marginalised: the correlation
+length (`--scale`) and, for `adaptive`, the brightness map are held at their
+fitted values, and for structure finer than the beam the correlation length
+matters as much as the strength. A two-dimensional grid would cost roughly
+ten times the one-dimensional one and has not been done.
+
+**Cubes.** Under `--cube-prior mfs` or `channel` every channel's statistical
+error is the posterior width at the strength the MFS fit chose, which on a
+line cube can be several times too strong for any one channel (~5× on NGC
+4274 CO(2-1)); those errors are then optimistic, and the run says so. The
+Bayesian mode re-centres on each channel's own evidence and is the one to
+use for cubes.
 
 ## The checkerboard is removed
 
@@ -200,7 +251,8 @@ measured at **55%** peak-to-peak within a block on the test mock. The
 delivered map replaces it with its upper envelope (a block maximum, then a
 block mean), bringing it to **11%**. This is deliberately the conservative
 direction: an over-stated error never manufactures a detection. `ERRDEBL`
-records that it was done.
+records that it was done. A Delaunay mesh (`--mesh-type hilbert`, `--mask`)
+has no such blocks, and the map is left as it is.
 
 ## Why the map looks the way it does
 

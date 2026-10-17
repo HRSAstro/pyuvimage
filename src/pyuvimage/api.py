@@ -949,7 +949,7 @@ def run(
                 "the MFS positions; amplitudes are fitted per channel",
                 len(cube_points),
             )
-        _log_cube_prior(cube_prior, frozen, criterion)
+        _log_cube_prior(cube_prior, frozen, criterion, uncertainty)
         # What the MFS guard actually ran with, not what was asked for: the
         # non-negative solver can be disabled mid-fit, and the channels must
         # follow that decision or `fit_parameters.json` misdescribes them.
@@ -1450,7 +1450,7 @@ def run_streamed(
         # first passes run at it -- the adaptive coefficient is the wrong
         # strength for a plain Matern prior (w <= 1 makes it the stiffer one)
         first_prior = getattr(mfs_fit, "first_pass_prior", None)
-        _log_cube_prior(cube_prior, frozen, criterion)
+        _log_cube_prior(cube_prior, frozen, criterion, uncertainty)
         # what the MFS guard actually ran with, not what was asked for
         positive_only = bool(getattr(mfs_fit, "positive_only", positive_only))
         if reg in fitting.ADAPTIVE_REGULARIZATIONS and envelope is not None:
@@ -2093,7 +2093,8 @@ STRUCTURE_RATIO_SUGGEST = 1.25
 SOURCE_REGION_SIGMA = 3.0
 
 
-def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistical") -> dict | None:
+def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistical",
+                 posterior: dict | None = None) -> dict | None:
     """The model's flux in the source region, with its significance.
 
     Per-pixel S/N (`snr.fits`) reads low on any model sampled finer than the
@@ -2109,6 +2110,12 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistic
     brightest pixel. It is computed from the model, not from the restored
     image, so residual noise does not add islands. Point-augmented fits are
     skipped: their mesh covariance is not the delivered model's.
+
+    With posterior draws (`posterior`, `--posterior-samples`) the region is
+    redrawn on every draw: thresholding the estimate itself keeps its
+    positive noise excursions, so a fixed region biases the flux up and its
+    error leaves out the region's own uncertainty. The draws' flux and its
+    scatter are recorded as ``flux_draws_jy`` and ``flux_error_draws_jy``.
     """
     from scipy import ndimage
 
@@ -2147,6 +2154,17 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistic
         record["flux_bayesian_jy"] = bayes[0]
         record["flux_error_bayesian_jy"] = bayes[1]
         record["snr"] = bayes[0] / bayes[1] if bayes[1] > 0 else None
+    if posterior:
+        try:
+            draws = _flux_over_draws(sf, model_image, posterior, beam, rms, pixel_scale)
+        except Exception as e:                     # pragma: no cover - diagnostic
+            logger.debug("flux over draws failed: %s", e)
+            draws = None
+        if draws is not None:
+            lo, mid, hi = np.percentile(draws, [16, 50, 84])
+            record["flux_draws_jy"] = float(mid)
+            record["flux_error_draws_jy"] = float(0.5 * (hi - lo))
+            record["n_draws"] = int(len(draws))
     logger.info(
         "source flux %.4g Jy in %.3g arcsec^2 (%s): +- %.2g statistical = "
         "%.1f sigma. Per-pixel S/N (snr.fits) is far lower on a model "
@@ -2156,6 +2174,30 @@ def _source_flux(sf, model_image, beam, rms, pixel_scale, mode: str = "statistic
         record["snr_stat"] or float("nan"),
     )
     return record
+
+
+def _flux_over_draws(sf, model_image, posterior, beam, rms, pixel_scale) -> np.ndarray:
+    """The source flux of every posterior draw, each in its own region
+    (model (x) beam > SOURCE_REGION_SIGMA x rms, connected to the peak)."""
+    from scipy import ndimage
+
+    delta, mapping, unmasked = posterior["delta"], posterior["mapping"], posterior["unmasked"]
+    shape = model_image.shape
+    base = np.asarray(model_image, float)
+    flux = np.empty(delta.shape[0])
+    for k in range(delta.shape[0]):
+        img = np.zeros(shape[0] * shape[1])
+        img[unmasked] = mapping @ delta[k].astype(float)
+        draw = base + img.reshape(shape)
+        smooth = beam_mod.restore(draw, np.zeros_like(draw), beam, pixel_scale)
+        above = smooth > SOURCE_REGION_SIGMA * rms
+        if not above.any():
+            flux[k] = 0.0
+            continue
+        labels, _ = ndimage.label(above)
+        peak = np.unravel_index(np.nanargmax(np.where(above, smooth, -np.inf)), shape)
+        flux[k] = float(draw[labels == labels[peak]].sum())
+    return flux
 
 
 def _uncertainty_records(products, mode):
@@ -2343,7 +2385,15 @@ def _thin_purpose(cube_prior: str) -> str:
             "(--cube-prior channel)")
 
 
-def _log_cube_prior(cube_prior: str, frozen: dict, criterion: str) -> None:
+def _log_cube_prior(cube_prior: str, frozen: dict, criterion: str,
+                    uncertainty: str = "none") -> None:
+    if uncertainty == "statistical" and cube_prior != "per-channel":
+        logger.warning(
+            "cube mode with --uncertainty statistical: each channel's error is "
+            "the posterior width at the strength the MFS fit chose, which on a "
+            "line cube can be several times too strong for one channel (NGC "
+            "4274: ~5x) -- those errors are then optimistic. --uncertainty "
+            "bayesian re-centres the posterior on each channel's own evidence.")
     if cube_prior == "per-channel":
         shared = {k: v for k, v in frozen.items() if k != "coefficient"}
         logger.info(
@@ -2610,8 +2660,10 @@ def _products_for(
         model_pbcor = primary_beam.pb_correct(model_image, pb)
         reconvolved_pbcor = primary_beam.pb_correct(reconvolved, pb)
 
+    posterior = _posterior_draws(sf, posterior_samples, uncertainty_mode)
     source_flux = _source_flux(sf, model_image, bf, rms, geometry.pixel_scale,
-                               mode=uncertainty_mode if uncertainty is not None else "none")
+                               mode=uncertainty_mode if uncertainty is not None else "none",
+                               posterior=posterior)
     snr = None
     if uncertainty is not None and hasattr(sf, "beam_snr"):
         started = time.time()
@@ -2624,7 +2676,6 @@ def _products_for(
             logger.warning("S/N map failed: %s: %s", type(e).__name__, e)
         if uncertainty_terms is not None:
             uncertainty_terms["seconds_snr"] = time.time() - started
-    posterior = _posterior_draws(sf, posterior_samples, uncertainty_mode)
     return ProductSet(
         posterior=posterior,
         snr=snr,

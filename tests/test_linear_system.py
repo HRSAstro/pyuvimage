@@ -290,12 +290,14 @@ def test_single_fit_products_are_computed_once(small):
     dataset, geom = small
     sf = fitting.fit_dataset(
         dataset, geom, reg_kind="matern", prior={"coefficient": 10.0, "scale": 0.5},
+        positive_only=False,
     )
     assert sf.posterior_covariance is sf.posterior_covariance
     assert sf.model_uncertainty is sf.model_uncertainty
     assert sf.model_image is sf.model_image
+    # unconstrained: every parameter free, so (F+H)^-1 up to the chi^2 scale
     np.testing.assert_allclose(
-        sf.posterior_covariance,
+        sf.posterior_covariance / sf.chi2_inflation,
         np.linalg.inv(np.asarray(fit_curv := sf.fit.inversion.curvature_reg_matrix)),
     )
     assert fit_curv.shape == (100, 100)

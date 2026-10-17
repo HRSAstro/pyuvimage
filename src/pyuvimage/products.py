@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
+from . import primary_beam
 from .beam import BeamFit
 from .grids import ImageGeometry
 
@@ -332,6 +333,8 @@ def write_products(
                         "median 1-sigma [Jy/pixel]"),
             "ERRDEBL": (bool(terms.get("deblocked", False)),
                         "checkerboard replaced by its envelope"),
+            "ERRCHI2": (float(terms.get("chi2_inflation", 1.0)),
+                        "covariance scaled by max(1, chi2/N)"),
         }
         lam = terms.get("lambda_posterior")
         if lam:
@@ -377,6 +380,16 @@ def write_products(
           hdr(n_img, geometry.pixel_scale, ""))
         w("model_pbcor.fits", stack("model_pbcor"),
           hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra=extra_common))
+        if any(p.uncertainty is not None for p in products):
+            unc_pbcor = [
+                primary_beam.pb_correct(p.uncertainty, p.pb)
+                if p.uncertainty is not None and p.pb is not None
+                else np.full(np.shape(p.model_image), np.nan)
+                for p in products]
+            w("uncertainty_pbcor.fits",
+              np.stack([to_fits_orientation(u) for u in unc_pbcor]) if is_cube
+              else to_fits_orientation(unc_pbcor[0]),
+              hdr(n_img, geometry.pixel_scale, "Jy/pixel", extra=unc_extra))
         if products[0].reconvolved_pbcor is not None:
             w("model_reconvolved_pbcor.fits", stack("reconvolved_pbcor"),
               hdr(n_img, geometry.pixel_scale, "Jy/beam", beam=med_beam,

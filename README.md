@@ -61,7 +61,7 @@ All FITS, all on one grid at one pixel scale, WCS from the MS phase centre.
 | `model_reconvolved.fits` | Jy/beam | model ⊗ fitted Gaussian beam + residuals — the CLEAN-image analogue |
 | `model_reconvolved_pbcor.fits` | Jy/beam | primary-beam-corrected version of it |
 | `residual.fits` | σ | (data − model) dirty image / rms (rms in header `RMS`) |
-| `uncertainty.fits` | Jy/pixel | 1σ per pixel, of the kind `--uncertainty` asked for (`ERRTYPE`) — see below; not written by default |
+| `uncertainty.fits` | Jy/pixel | 1σ per pixel, of the kind `--uncertainty` asked for (`ERRTYPE`) — see below; not written by default. `uncertainty_pbcor.fits` is the PB-corrected version |
 | `model_bayesian.fits` | Jy/pixel | `--uncertainty bayesian`: the posterior mean marginalised over the prior strength, which `uncertainty.fits` is then the 1σ of |
 | `snr.fits` | — | S/N at the restoring beam's resolution: the model convolved with the beam over its own 1σ (from the full covariance), points included |
 | `posterior_samples.npz` | Jy/pixel | `--posterior-samples N`: N draws from the posterior per channel, as offsets from `model.fits` — read with `pyuvimage.posterior.PosteriorSamples` |
