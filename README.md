@@ -154,37 +154,47 @@ Off by default; `--uncertainty` chooses what it contains:
 | `statistical` | posterior width at the fitted prior strength | — | one inverse |
 | `bayesian` | posterior marginalised over the prior strength (evidence-weighted) | `model_bayesian.fits` | ~25 unconstrained solves + a few inverses |
 
-On mocks the statistical width alone covers the truth on 0–58% of source
-pixels (falling with S/N) and the Bayesian posterior on 65–85% (68% is
-calibrated); on REBELS-25 both give a source flux S/N of ~15. See
-[docs/uncertainty.md](docs/uncertainty.md), which also explains why the
-earlier statistical + prior-systematic mode was removed.
+**How they are computed, in brief.** The fit is linear with a Gaussian
+prior, so the posterior on the model is Gaussian and its covariance is
+known in closed form, `C = (F + H)⁻¹`: `F` is how well the data constrain
+each pixel, `H` how strongly the prior ties it to its neighbours. Every
+error product is this covariance propagated to a quantity:
 
-`uncertainty.fits` is the 1σ per pixel. Do not divide the model by it
-for a significance map: on a model sampled finer than the beam, neighbouring
-pixels are strongly anticorrelated and the per-pixel ratio reads far too low.
-`snr.fits` is the significance map, at the restoring beam's resolution.
+- `uncertainty.fits`: the 1σ of each image pixel, `sqrt(diag(M C Mᵀ))`.
+- `snr.fits`: the model smoothed to the restoring beam, over the 1σ of that
+  smoothed model from the same covariance. This is the significance map.
+- `source_flux`: the flux in a region, with its error from the covariance.
+- `posterior_samples.npz` (`--posterior-samples N`): N draws from the
+  posterior, for any other quantity.
 
-The statistical term is the closed-form posterior width `sqrt(diag(M C M^T))`
-with `C = (F+H)^-1`, conditional on the fitted prior strength; it is
-optimistic, increasingly so at low S/N. The Bayesian mode averages over the
-strength with the evidence as weight. Neither covers the prior *family* being
-wrong, nor calibration errors.
+Two corrections first: pixels held at zero (a mask's edge, positivity) are
+constraints, not parameters, and get no variance; and the covariance is
+scaled by χ²/N when the fit cannot reach χ²/N = 1, since the noise map is
+then too small. The `bayesian` mode goes one step further: the prior's
+strength is itself uncertain, so it averages the posterior over the
+strength, weighting each by the evidence. On mocks that brings the fraction
+of pixels within 1σ of the truth from 0–58% (`statistical`) to 65–85%
+(68% is calibrated). Use `bayesian` whenever the error bars matter, and
+always for cubes.
 
-**Do not add per-pixel errors in quadrature**: they are correlated over the
-prior's correlation length. Use `SingleFit.aperture_uncertainty(region)`, which
-evaluates `w^T (M C M^T) w` properly — quadrature overstated a compact
-aperture's error by ~1.4× on our mocks.
+**Three things to avoid.** Do not divide the model by `uncertainty.fits`
+for a significance map: on a model sampled finer than the beam neighbouring
+pixels are strongly anticorrelated and the ratio reads far too low — use
+`snr.fits`. Do not add per-pixel errors in quadrature: they are correlated
+over the prior's correlation length — use the region's error
+(`source_flux`, or `SingleFit.aperture_uncertainty`). Do not expect either
+mode to cover the prior *family* being wrong, or calibration errors.
 
-**Posterior samples** (`--posterior-samples N`) are draws from the same
-posterior: compute any quantity — a moment map, a line ratio, a flux — on
-each, and the scatter over draws is its error with every correlation carried
+**Posterior samples** (`--posterior-samples N`) are the general tool:
+compute any quantity — a moment map, a line ratio, a flux — on each draw,
+and the scatter over draws is its error with every correlation carried
 through. This is how to tell what the data say on scales smaller than the
 beam: at high S/N the draws agree on that structure, at low S/N they spread
 as the prior allows. `scripts/moment_maps.py` turns them into moment-map
 error maps.
 
-Details, and the mesh/image checkerboard removal recorded as `ERRDEBL`:
+Details, the checkerboard removal (`ERRDEBL`), and why the earlier
+statistical + prior-systematic mode was removed:
 [docs/uncertainty.md](docs/uncertainty.md).
 
 ## True point sources

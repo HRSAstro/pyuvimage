@@ -2,6 +2,41 @@
 
 [← back to the README](../README.md)
 
+## In brief
+
+The fit is a linear inversion under a Gaussian prior, so the posterior on
+the model is Gaussian with a closed-form covariance, `C = (F + H)⁻¹`, where
+`F` is the data's curvature (how well the visibilities constrain each model
+pixel) and `H` the prior's (how strongly each pixel is tied to its
+neighbours). Everything below is that covariance propagated to a quantity:
+
+| product | what it is | how |
+|---|---|---|
+| `uncertainty.fits` | 1σ per image pixel | `sqrt(diag(M C Mᵀ))`, `M` the mesh→image interpolation |
+| `snr.fits` | significance at the beam's resolution | model ⊗ beam, over `sqrt(diag(K M C Mᵀ Kᵀ))` |
+| `source_flux` | flux in a region ± error | `wᵀ M C Mᵀ w`, `w` the region |
+| `posterior_samples.npz` | N draws from the posterior | model + `M L z`, `L Lᵀ = C`, `z ~ N(0, 1)` |
+
+Before any of that, two corrections: parameters held at zero (a mask's
+ring, positivity's active set) are constraints, not parameters, and get no
+variance; and `C` is scaled by max(1, χ²/N) of the delivered fit, since a
+fit that cannot reach χ²/N = 1 at any strength has a noise map that is too
+small by that factor.
+
+Two modes. `statistical` takes the prior's strength λ as known, at the
+value the criterion chose; it under-states the error, more so at low S/N,
+because a stronger prior shrinks `C` while adding smoothing bias.
+`bayesian` treats λ as unknown: the evidence `Z(λ)` is the posterior on λ,
+and the model's posterior is the evidence-weighted mixture over a grid in
+λ — a mean (`model_bayesian.fits`) and a covariance that adds the spread of
+the means to the average `C`. On mocks it brings the fraction of pixels
+within 1σ of the truth from 0–58% to 65–85%.
+
+What none of it covers: the prior family being wrong, the correlation
+length being wrong (only λ is marginalised), calibration or phase errors
+beyond their effect on χ², and the model's own smoothing bias except
+through the Bayesian spread over λ.
+
 **Choosing what is computed (`--uncertainty`).** Off by default (`none`).
 
 | mode | `uncertainty.fits` is | extra product | cost on REBELS-25 (fit ~90 s) |
