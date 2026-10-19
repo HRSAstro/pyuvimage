@@ -19,6 +19,12 @@ see git history.)
 Writes figures/priors_mock_gallery.{pdf,png} (one realisation, model and
 residual per prior, as priors_comparison.pdf) and
 figures/priors_mock_metrics.{pdf,png} (all realisations), plus the JSON.
+
+    python scripts/mock_priors.py --mesh-type hilbert [--mesh-points N]
+
+runs the same comparison on a Hilbert-Delaunay mesh (no mask; N defaults to
+a quarter of the rectangle's pixels, as `--mesh-type hilbert` does) and
+writes figures/priors_mock_hilbert_*.
 """
 from __future__ import annotations
 
@@ -49,6 +55,9 @@ CACHE = Path("/tmp/pyuvimage_mock_priors_structure")
 COMPONENTS = ["smooth blob", "exponential disc", "knot arc"]
 #: added to every font size in the gallery figure
 TEXT_BUMP_PT = 2.0
+MESH_TYPE = "rectangular"
+MESH_POINTS = None
+TAG = ""
 
 
 def large_aperture(truth_smoothed, beam_px):
@@ -91,7 +100,8 @@ def fit_all(seeds):
                     t0 = time.time()
                     res = api.run(uvd, fov=mn.FOV, mesh_shape=(mn.MESH, mn.MESH), reg=reg,
                                   criterion=crit, write=False, uncertainty_map=False,
-                                  pb_correction=False, kernel_cache=str(CACHE / "kernels"))
+                                  pb_correction=False, kernel_cache=str(CACHE / "kernels"),
+                                  mesh_type=MESH_TYPE, mesh_points=MESH_POINTS)
                     p = res.products[0]
                     n_d = 2 * uvd.n_samples
                     chi2n = float(p.chi_squared / n_d)
@@ -109,6 +119,9 @@ def fit_all(seeds):
                         "flux_aperture": float(m[aperture].sum() / truth[aperture].sum()),
                         "flux_field": float(m.sum() / truth.sum()),
                         "seconds": time.time() - t0,
+                        "log_evidence": float(p.log_evidence),
+                        "mesh_type": MESH_TYPE,
+                        "n_mesh": int(res.geometry.n_mesh_pixels),
                     })
                     fits_here[reg] = (m, r, chi2n, float(p.coefficient), p.beam, p.rms,
                                       np.asarray(p.dirty_image))
@@ -201,7 +214,7 @@ def plot_gallery(gallery):
     for t in fig.findobj(mtext.Text):
         if t.get_text():
             t.set_fontsize(t.get_fontsize() + TEXT_BUMP_PT)
-    for p in fs.save(fig, "priors_mock_gallery"):
+    for p in fs.save(fig, f"priors_mock{TAG}_gallery"):
         print("wrote", p)
 
 
@@ -241,7 +254,7 @@ def plot_metrics(records):
         ax.set_xticklabels(names, rotation=40, ha="right", fontsize=6)
     axes[0].legend(fontsize=6)
     fig.tight_layout()
-    for p in fs.save(fig, "priors_mock_metrics"):
+    for p in fs.save(fig, f"priors_mock{TAG}_metrics"):
         print("wrote", p)
 
 
@@ -249,7 +262,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
     ap.add_argument("--plot", action="store_true", help="re-plot from the cache")
+    ap.add_argument("--mesh-type", default="rectangular", choices=["rectangular", "hilbert"])
+    ap.add_argument("--mesh-points", type=int, default=None,
+                    help="Hilbert mesh points (default: a quarter of the rectangle's)")
     a = ap.parse_args(argv)
+    global MESH_TYPE, MESH_POINTS, TAG, CACHE
+    MESH_TYPE, MESH_POINTS = a.mesh_type, a.mesh_points
+    if MESH_TYPE == "hilbert":
+        TAG = "_hilbert" + (f"{MESH_POINTS}" if MESH_POINTS else "")
+        CACHE = CACHE.with_name(CACHE.name + TAG)
     logging.basicConfig(level=logging.WARNING, format="%(message)s", stream=sys.stdout)
     if a.plot:
         records = json.loads((CACHE / "records.json").read_text())
@@ -259,7 +280,7 @@ def main(argv=None):
         records, gallery = fit_all(a.seeds)
     summarise(records)
     Path("figures").mkdir(exist_ok=True)
-    Path("figures/priors_mock.json").write_text(json.dumps(records, indent=2))
+    Path(f"figures/priors_mock{TAG}.json").write_text(json.dumps(records, indent=2))
     plot_gallery(gallery)
     plot_metrics(records)
 
