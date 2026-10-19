@@ -50,6 +50,8 @@ UNCERTAINTY = "statistical"
 TOP_ROW = "restored"
 #: the model mesh; set from the command line
 MESH_TYPE = "rectangular"
+#: only the three trend panels, no image rows (`--lines-only`, `_lines` suffix)
+LINES_ONLY = False
 
 
 def _tag() -> str:
@@ -209,13 +211,18 @@ def plot() -> None:
     umin = min(float(np.nanpercentile(u, 50.0)) for u in uncs)
     norm_u = fs.asinh_norm(umax, linear_width=0.5 * umin)
 
-    fig = plt.figure(figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 0.80))
-    gs_img = fig.add_gridspec(3, n, left=0.075, right=0.995, top=0.955,
-                              bottom=0.475, wspace=0.04, hspace=0.04)
-    gs_tr = fig.add_gridspec(1, 3, left=0.065, right=0.995, top=0.365,
-                             bottom=0.065, wspace=0.34)
+    if LINES_ONLY:
+        fig = plt.figure(figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 0.30))
+        gs_tr = fig.add_gridspec(1, 3, left=0.065, right=0.995, top=0.95,
+                                 bottom=0.17, wspace=0.34)
+    else:
+        fig = plt.figure(figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 0.80))
+        gs_img = fig.add_gridspec(3, n, left=0.075, right=0.995, top=0.955,
+                                  bottom=0.475, wspace=0.04, hspace=0.04)
+        gs_tr = fig.add_gridspec(1, 3, left=0.065, right=0.995, top=0.365,
+                                 bottom=0.065, wspace=0.34)
 
-    for col, (i, r) in enumerate(runs):
+    for col, (i, r) in enumerate([] if LINES_ONLY else runs):
         ax_m = fig.add_subplot(gs_img[0, col])
         ax_r = fig.add_subplot(gs_img[1, col])
         ax_u = fig.add_subplot(gs_img[2, col])
@@ -237,14 +244,15 @@ def plot() -> None:
         else:
             fs.panel_label(ax_m, "no point", loc="lower right", size=5.2)
 
-    fs.hcolorbar(fig, im_i, [gs_img[2, 0], gs_img[2, 1]],
-                 f"{top_label} [Jy/beam]", 0.013, pad=0.055,
-                 shrink=0.86, ticks=None if TOP_ROW == "dirty" else [0.0, 1e-4, 1e-3])
-    fs.hcolorbar(fig, im_r, [gs_img[2, 2], gs_img[2, 3]],
-                 "residual [$\\sigma$]", 0.013, pad=0.055, shrink=0.86)
-    fs.hcolorbar(fig, im_u, [gs_img[2, 4], gs_img[2, n - 1]],
-                 "uncertainty [Jy arcsec$^{-2}$]", 0.013, pad=0.055,
-                 shrink=0.86, ticks=[0.0, 1e-4, 1e-3, 1e-2])
+    if not LINES_ONLY:
+        fs.hcolorbar(fig, im_i, [gs_img[2, 0], gs_img[2, 1]],
+                     f"{top_label} [Jy/beam]", 0.013, pad=0.055,
+                     shrink=0.86, ticks=None if TOP_ROW == "dirty" else [0.0, 1e-4, 1e-3])
+        fs.hcolorbar(fig, im_r, [gs_img[2, 2], gs_img[2, 3]],
+                     "residual [$\\sigma$]", 0.013, pad=0.055, shrink=0.86)
+        fs.hcolorbar(fig, im_u, [gs_img[2, 4], gs_img[2, n - 1]],
+                     "uncertainty [Jy arcsec$^{-2}$]", 0.013, pad=0.055,
+                     shrink=0.86, ticks=[0.0, 1e-4, 1e-3, 1e-2])
 
     # ---- what the panels cannot show: numbers, with error bars ----------
     snr = np.array([r["peak_snr"] for _, r in runs])
@@ -349,6 +357,8 @@ def plot() -> None:
                                                          # matching the panels
 
     stem = "snr_series" if _tag() == "structure_statistical" else f"snr_series_{_tag()}"
+    if LINES_ONLY:
+        stem += "_lines"
     for p in fs.save(fig, stem):
         print("wrote", p)
 
@@ -370,6 +380,8 @@ if __name__ == "__main__":
                     choices=["structure", "discrepancy", "evidence"])
     ap.add_argument("--uncertainty", default="statistical", choices=["statistical", "bayesian"])
     ap.add_argument("--mesh-type", default="rectangular", choices=["rectangular", "hilbert"])
+    ap.add_argument("--lines-only", action="store_true",
+                    help="only the three trend panels (writes *_lines.*)")
     ap.add_argument("--top-row", choices=["restored", "dirty"], default=None,
                     help="top row: model (x) beam or the dirty image "
                          "(default: dirty for bayesian, restored otherwise)")
@@ -377,6 +389,7 @@ if __name__ == "__main__":
     CRITERION = args.criterion
     UNCERTAINTY = args.uncertainty
     MESH_TYPE = args.mesh_type
+    LINES_ONLY = args.lines_only
     TOP_ROW = args.top_row or ("dirty" if UNCERTAINTY == "bayesian" else "restored")
     if not args.plot:
         fit_all()
