@@ -28,6 +28,13 @@ fit's model, its statistical 1-sigma and (model - truth)/sigma on the source,
 then the same for the Bayesian mean and 1-sigma; and the calibration
 (fraction within 1 sigma, median sigma / rms error, flux) against S/N for
 statistical only, statistical + prior systematic, and Bayesian.
+
+    python scripts/marginal_lambda_mock.py --mesh-type hilbert [--mesh-points N]
+
+runs it on a Hilbert-Delaunay mesh (no mask; N defaults to a quarter of the
+rectangle's pixels) and writes figures/bayesian_vs_statistical_hilbert.*. A
+Delaunay mesh has no mesh/image checkerboard, so its maps are not deblocked
+(as `uncertainty.fits` is not).
 """
 from __future__ import annotations
 
@@ -50,6 +57,9 @@ from pyuvimage.fitting import _deblock
 
 sys.path.insert(0, str(Path(__file__).parent))
 CACHE = Path("/tmp/pyuvimage_marginal_lambda.pkl")
+MESH_TYPE = "rectangular"
+MESH_POINTS = None
+TAG = ""
 
 SIGMAS = [1.56e-3, 3.55e-3, 8.07e-3, 1.80e-2, 4.25e-2, 9.36e-2]
 DEX = np.arange(-4.0, 2.01, 0.25)          # relative to the structure fit's lambda
@@ -91,6 +101,12 @@ def fit_all():
             imager.dirty_image(np.asarray(ds.data)), pixel_scale=geom.pixel_scale,
             rms=imager.rms, beam_fwhm=bs, max_fwhm=geom.fov_arcsec / 2.0)
         env = {"fwhm": fwhm, "floor": 1e-2, "centre": centre}
+        if MESH_TYPE == "hilbert":
+            from pyuvimage import api
+            geom = api._irregular_geometry(
+                ds, geom, mesh_type="hilbert", mesh_points=MESH_POINTS, hilbert_power=1.0,
+                hilbert_floor=0.02, allowed=None, criterion="structure", beam_scale=bs,
+                nu=fitting.DEFAULT_NU, chi2_target=1.0)
         fit = fitting.fit_dataset(ds, geom, reg_kind="gaussian", criterion="structure",
                                   fixed_scale=bs, envelope=env, warn_on_chi2=False)
         fit.imager = imager
@@ -101,7 +117,8 @@ def fit_all():
         src = t_img > 0.02 * t_img.max()
         peak = float(np.max(imager.dirty_image(np.asarray(ds.data))) / imager.rms)
 
-        ovs = geom.oversample
+        # no checkerboard to remove on a Delaunay mesh (as uncertainty.fits)
+        ovs = geom.oversample if MESH_TYPE == "rectangular" else 1
         # statistical + the window-walk prior systematic: a mode removed in
         # Oct 2026 on the strength of this comparison. Scored only when the
         # code still has it (the cached figure was made with it).
@@ -153,7 +170,7 @@ def fit_all():
             print(f"    {name:<9} rms {r['rms']:.2e}  coverage {r['cover']:.2f}  "
                   f"within-1sigma {r['within']:.2f}  flux {r['flux']:.2f}", flush=True)
     Path("figures").mkdir(exist_ok=True)
-    Path("figures/marginal_lambda_mock.json").write_text(json.dumps(rows, indent=2))
+    Path(f"figures/marginal_lambda_mock{TAG}.json").write_text(json.dumps(rows, indent=2))
     CACHE.write_bytes(pickle.dumps((rows, maps)))
     return rows, maps
 
@@ -251,14 +268,21 @@ def plot(rows, maps):
     for t in fig.findobj(mtext.Text):
         if t.get_text():
             t.set_fontsize(t.get_fontsize() + 1.0)
-    for q in fs.save(fig, "bayesian_vs_statistical"):
+    for q in fs.save(fig, f"bayesian_vs_statistical{TAG}"):
         print("wrote", q)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--plot", action="store_true")
+    ap.add_argument("--mesh-type", default="rectangular", choices=["rectangular", "hilbert"])
+    ap.add_argument("--mesh-points", type=int, default=None)
     a = ap.parse_args()
+    global MESH_TYPE, MESH_POINTS, TAG, CACHE
+    MESH_TYPE, MESH_POINTS = a.mesh_type, a.mesh_points
+    if MESH_TYPE == "hilbert":
+        TAG = "_hilbert" + (f"{MESH_POINTS}" if MESH_POINTS else "")
+        CACHE = CACHE.with_name(CACHE.stem + TAG + CACHE.suffix)
     rows, maps = pickle.loads(CACHE.read_bytes()) if a.plot else fit_all()
     plot(rows, maps)
 
