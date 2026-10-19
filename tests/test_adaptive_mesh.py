@@ -196,3 +196,26 @@ def test_a_hilbert_run_is_sized_by_its_points():
     assert api._model_pixels(geom, "rectangular", None) == 1600
     assert api._model_pixels(geom, "hilbert", None) == 400
     assert api._model_pixels(geom, "hilbert", 150) == 150
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_point_components_on_a_hilbert_mesh(tmp_path, streaming):
+    """A point beside a disc, on a Hilbert-Delaunay mesh: found at its
+    position, with its flux; refused with a mask."""
+    import json
+
+    uvd, truth, geom, comps = mock.make_demo_dataset(
+        n_vis=4000, mesh_n=32, fov_arcsec=3.0, sigma_jy=1.56e-3, point_flux_jy=0.004,
+        point_centre=(0.85, -0.65), seed=0)
+    data = uvd.write(tmp_path / "ds") if streaming else uvd
+    api.run(data, fov=3.0, out=tmp_path / "o", mesh_shape=(32, 32), reg="gaussian",
+            criterion="structure", point_sources=True, pb_correction=False,
+            mesh_type="hilbert", streaming=streaming)
+    pts = json.loads((tmp_path / "o" / "point_sources.json").read_text())["points"]
+    assert len(pts) == 1
+    p = pts[0]
+    assert abs(p["d_ra_arcsec"] - 0.85) < 0.05 and abs(p["d_dec_arcsec"] + 0.65) < 0.05
+    assert p["flux_jy"] == pytest.approx(0.004, rel=0.05)
+    with pytest.raises(NotImplementedError, match="--mask"):
+        api.run(uvd, fov=3.0, out=tmp_path / "x", mesh_shape=(32, 32), point_sources=True,
+                pb_correction=False, emission_mask=str(tmp_path / "none.crtf"), write=False)

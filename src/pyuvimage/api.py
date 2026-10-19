@@ -257,10 +257,13 @@ def _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources):
     if emission_mask is not None:
         logger.info("--mask: positivity is enforced (the mask's zero boundary "
                     "is held by the non-negative solver)")
-    if irregular and point_sources:
+    if emission_mask is not None and point_sources:
+        # the bordered point system is solved without positivity, and the
+        # mask's zero ring is held only by the non-negative solver
         raise NotImplementedError(
-            "point components are not available with --mask or --mesh-type "
-            "hilbert yet")
+            "point components are not available with --mask yet: the point "
+            "solve is unconstrained, and the mask's zero boundary is held by "
+            "the non-negative solver")
     return irregular
 
 

@@ -1484,6 +1484,9 @@ class PointAugmentedFit:
     @property
     def model_mesh_image(self) -> np.ndarray:
         geom = self._sf.geometry
+        if getattr(geom, "mesh", None) is not None:
+            # an irregular mesh has no grid: its values, one per point
+            return np.asarray(self.solution.mesh_values)
         k2 = (geom.shape_native[0] // geom.mesh_shape[0]) ** 2
         return self.solution.mesh_values.reshape(geom.mesh_shape) * k2
 

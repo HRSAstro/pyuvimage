@@ -20,6 +20,8 @@ Writes figures/snr_series.{pdf,png} (criterion `structure`, uncertainty
 `statistical`), or figures/snr_series_<criterion>_<uncertainty>.{pdf,png} for
 any other pair. Point error bars are the statistical `flux_error_jy`, or the
 Bayesian `flux_error_bayesian_jy` (and flux) with `--uncertainty bayesian`.
+`--mesh-type hilbert` runs it on a Hilbert-Delaunay mesh (no mask; a
+quarter of the rectangle's pixels) and appends `_hilbert` to the name.
 The Bayesian comparison of the extended model is `marginal_lambda_mock.py`.
 """
 
@@ -46,10 +48,12 @@ UNCERTAINTY = "statistical"
 #: the top row: the restored model ("restored") or the dirty image ("dirty");
 #: set from the command line (default: dirty for bayesian, restored otherwise)
 TOP_ROW = "restored"
+#: the model mesh; set from the command line
+MESH_TYPE = "rectangular"
 
 
 def _tag() -> str:
-    return f"{CRITERION}_{UNCERTAINTY}"
+    return f"{CRITERION}_{UNCERTAINTY}" + ("_hilbert" if MESH_TYPE == "hilbert" else "")
 
 
 def cache() -> Path:
@@ -111,7 +115,7 @@ def fit_all() -> None:
                 uvd, fov=FOV, out=out, mesh_shape=(MESH_N, MESH_N),
                 reg=REG, criterion=CRITERION, point_sources=True,
                 uncertainty=UNCERTAINTY, pb_correction=False,
-                mask_shape="square",
+                mask_shape="square", mesh_type=MESH_TYPE,
             )
             failed = ""
         except Exception as e:                    # a fit may legitimately fail
@@ -365,12 +369,14 @@ if __name__ == "__main__":
     ap.add_argument("--criterion", default="structure",
                     choices=["structure", "discrepancy", "evidence"])
     ap.add_argument("--uncertainty", default="statistical", choices=["statistical", "bayesian"])
+    ap.add_argument("--mesh-type", default="rectangular", choices=["rectangular", "hilbert"])
     ap.add_argument("--top-row", choices=["restored", "dirty"], default=None,
                     help="top row: model (x) beam or the dirty image "
                          "(default: dirty for bayesian, restored otherwise)")
     args = ap.parse_args()
     CRITERION = args.criterion
     UNCERTAINTY = args.uncertainty
+    MESH_TYPE = args.mesh_type
     TOP_ROW = args.top_row or ("dirty" if UNCERTAINTY == "bayesian" else "restored")
     if not args.plot:
         fit_all()
