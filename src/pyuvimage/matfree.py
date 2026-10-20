@@ -26,9 +26,18 @@ instead, and nothing N_mesh x N_mesh is ever formed:
 * **Evidence.** ln det H exactly (sparse); ln det(F + H) = ln det P (exact)
   + ln det(P^-1 A) by stochastic Lanczos quadrature with fixed probes.
 
-Not available on this path (yet): positivity (the solve is unconstrained),
-point components, and the uncertainty products, which need
-diag((F + H)^-1).
+* **Positivity** (`positive_only`): the same quadratic with s >= 0, by a
+  primal-dual interior point (Mehrotra predictor-corrector), each step a CG
+  solve preconditioned by the sparse P plus the barrier's diagonal, then
+  the support it finds solved exactly. Matrix-vector products only, as the
+  unconstrained solve; on the real datasets a fit costs 1.3-4.4x the
+  unconstrained one (docs/matrix-free.md). The strength search follows
+  the dense path: constrained throughout under `structure` (positivity
+  changes the residual map), unconstrained under the other criteria with
+  the delivered fit made non-negative at the chosen strength.
+
+Not available on this path (yet): point components, and the uncertainty
+products, which need diag((F + H)^-1).
 """
 from __future__ import annotations
 
@@ -48,6 +57,24 @@ MATRIX_FREE_MIN_MESH_PIXELS = 100 * 100
 CG_RTOL = 1e-8
 CG_MAXITER = 5000
 
+#: positivity (`MatrixFreeSystem.solve_positive`, an interior point):
+#: relative duality gap and KKT residual at which it stops; the looser pair
+#: at which it starts trying to read off the support and solve it exactly,
+#: the active-set corrections that may take, the fraction of pixels whose
+#: predicted state may still change step to step for it to be tried, and the
+#: KKT tolerance it must meet; the tightest CG
+#: tolerance per step (it follows the gap down from 1e-2); steps; the fraction of the way to the boundary a step
+#: may go; and the start's shift into the interior (relative to max |s|)
+POSITIVE_RTOL = 1e-9
+POSITIVE_POLISH_GAP = 1e-3
+POSITIVE_POLISH_STEPS = 3
+POSITIVE_POLISH_SETTLED = 1e-3
+POSITIVE_KKT_RTOL = 1e-7
+POSITIVE_CG_RTOL = 1e-8
+POSITIVE_MAXITER = 60
+POSITIVE_STEP_FRACTION = 0.99
+POSITIVE_START_SHIFT = 1e-2
+
 #: stochastic Lanczos quadrature: probe vectors and Lanczos steps per probe
 SLQ_PROBES = 10
 SLQ_STEPS = 40
@@ -61,6 +88,17 @@ UNWEIGHTED_PRECONDITIONER = "density"
 #: smoothing of the uv density for the "density" preconditioner, in cells
 #: of the padded mesh's uv grid
 DENSITY_SMOOTHING_CELLS = 1.0
+
+
+def _splu(A):
+    """Sparse LU of a symmetric positive definite matrix: minimum degree on
+    A + A^T, no pivoting (symmetric mode). Against SuperLU's default (COLAMD
+    with partial pivoting) ~40% less fill and ~30% faster solves on the
+    preconditioner P at 192^2."""
+    from scipy.sparse.linalg import splu
+
+    return splu(sp.csc_matrix(A), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0,
+                options=dict(SymmetricMode=True))
 
 
 def memory_gb(n_mesh: int, n_image: int) -> float:
@@ -170,8 +208,7 @@ class SparseMaternPrior:
     nu_effective = 1.0
 
     def __init__(self, order, mesh_shape, pixel_scale, scale, weights=None):
-        from scipy.sparse.linalg import splu
-
+        
         self.order = np.asarray(order)
         self.mesh_shape = tuple(mesh_shape)
         my, mx = self.mesh_shape
@@ -190,7 +227,7 @@ class SparseMaternPrior:
         lap = (adj - sp.diags(degree)) / h ** 2
         L_grid = (kappa ** 2 * sp.identity(n) - lap).tocsc()
         # unit variance at the centre: c = e_c^T L^-2 e_c
-        lu = splu(L_grid)
+        lu = _splu(L_grid)
         e = np.zeros(n)
         e[(my // 2) * mx + mx // 2] = 1.0
         x = lu.solve(e)
@@ -258,6 +295,7 @@ class MatrixFreeSystem:
         self.MtM = (data.MT @ data.M).tocsc()
         self._factor = {}
         self._last = None
+        self._last_positive = None
         if preconditioner is None:
             preconditioner = "sparse" if prior.weighted else UNWEIGHTED_PRECONDITIONER
         if preconditioner not in ("density", "radial", "sparse"):
@@ -266,12 +304,10 @@ class MatrixFreeSystem:
         self._rho = None
 
     def _P(self, lam):
-        from scipy.sparse.linalg import splu
-
         key = float(lam)
         if key not in self._factor:
             P = (self.kappa0 * self.MtM + lam * self.prior.Qw).tocsc()
-            self._factor = {key: (P, splu(P))}            # keep one: they are large
+            self._factor = {key: (P, _splu(P))}            # keep one: they are large
         return self._factor[key]
 
     # -- the Fourier (uv density) preconditioners -----------------------
@@ -341,7 +377,9 @@ class MatrixFreeSystem:
         n = self.data.n_mesh
         return LinearOperator((n, n), matvec=apply, dtype=float)
 
-    def solve(self, coefficient: float, x0=None) -> Solution:
+    def solve(self, coefficient: float, x0=None, positive: bool = False) -> Solution:
+        if positive:
+            return self.solve_positive(coefficient, x0=x0)
         from scipy.sparse.linalg import LinearOperator, cg
 
         lam = float(coefficient)
@@ -367,6 +405,171 @@ class MatrixFreeSystem:
         self._last = s
         return Solution(lam, s, self.data.chi_squared(s), lam * float(s @ (Qw @ s)),
                         count[0])
+
+    def _polish(self, A, lam, s, z, tol):
+        """The exact solution on the support the interior point found.
+
+        Hold the pixels whose multiplier outweighs their value
+        (z_i > d_i s_i) at zero and solve the free block by CG, warm-started;
+        then a few primal-dual active-set corrections (Hintermueller, Ito &
+        Kunisch 2002): free pixels that came out negative are held, held
+        pixels whose gradient points down are freed, and the block solved
+        again. Near the solution the interior point has the support all but
+        right, so this takes one or two solves. Returns s with exact zeros,
+        or None if it does not reach a KKT point.
+        """
+        from scipy.sparse.linalg import LinearOperator, cg
+
+        n = s.size
+        b = self.data.D
+        diag = self._diag(lam)
+        free = z <= diag * s
+        P, _ = self._P(lam)
+        x = np.where(free, s, 0.0)
+        seen = set()
+        for _ in range(POSITIVE_POLISH_STEPS):
+            idx = np.flatnonzero(free)
+            if idx.size == 0:
+                return None
+            lu = _splu(P[idx][:, idx].tocsc())
+
+            def mv(v, idx=idx):
+                full = np.zeros(n)
+                full[idx] = v
+                return A(full)[idx]
+
+            op = LinearOperator((idx.size, idx.size), matvec=mv, dtype=float)
+            sI, _ = cg(op, b[idx], x0=x[idx], rtol=CG_RTOL, maxiter=CG_MAXITER,
+                       M=LinearOperator((idx.size, idx.size), matvec=lu.solve, dtype=float))
+            x = np.zeros(n)
+            x[idx] = sI
+            g = A(np.clip(x, 0.0, None)) - b
+            small = POSITIVE_KKT_RTOL * max(float(sI.max()), 1e-300)
+            neg = free & (x < -small)
+            down = ~free & (g < 0)
+            if not neg.any() and np.linalg.norm(g[down]) <= tol:
+                return np.clip(x, 0.0, None)
+            logger.debug("  polish: %d free values negative, %d held pixels pulled up; "
+                         "correcting the support", int(neg.sum()), int(down.sum()))
+            free = (free & ~neg) | down
+            key = free.tobytes()
+            if key in seen:
+                return None
+            seen.add(key)
+        return None
+
+    def _diag(self, lam):
+        return np.maximum(self.kappa0 * self.MtM.diagonal()
+                          + lam * self.prior.Qw.diagonal(), 1e-300)
+
+    def solve_positive(self, coefficient: float, x0=None) -> Solution:
+        """min 1/2 s^T A s - D^T s subject to s >= 0, A = F + lambda C^-1.
+
+        A primal-dual interior point (Mehrotra's predictor-corrector) on the
+        KKT conditions A s - D = z, s z = 0, s, z >= 0. Each step solves
+
+            (A + Z S^-1) ds = r
+
+        by CG, preconditioned by the sparse P + Z S^-1 (factorised once per
+        step), which holds the barrier's diagonal exactly -- the part that
+        grows without bound as the iterates approach the constraints. The
+        number of steps hardly depends on how many pixels end at zero (an
+        active-set method's cost grows with it: at weak priors, where a
+        third of the mesh is held, it thrashes). Once the duality gap is
+        small the support is read off (z_i > d_i s_i: held at zero) and the
+        free block solved exactly (`_polish`), which gives exact zeros; if
+        that is not a KKT point the interior point runs on to full accuracy.
+
+        Started from ``x0`` (the last constrained solution by default, else
+        one Jacobi step D / diag(A) clipped at zero) shifted into the
+        interior.
+        """
+        import scipy.sparse as sp
+        from scipy.sparse.linalg import LinearOperator, cg
+
+        lam = float(coefficient)
+        n = self.data.n_mesh
+        Qw = self.prior.Qw
+        b = self.data.D
+        count = [0]
+
+        def A(v):
+            count[0] += 1
+            return self.data.F(v) + lam * (Qw @ v)
+
+        if x0 is None:
+            x0 = self._last_positive
+        if x0 is None:
+            # one Jacobi step: the unconstrained solution is no better a start
+            # (it is far outside s >= 0 at weak priors) and costs a full solve
+            x0 = np.clip(b / self._diag(lam), 0.0, None)
+        x0 = np.asarray(x0, dtype=float)
+        bnorm = float(np.linalg.norm(b)) or 1.0
+        frac = POSITIVE_START_SHIFT
+        x = np.maximum(x0, 0.0) + frac * max(float(np.abs(x0).max()), 1e-300)
+        g = A(x) - b
+        z = np.maximum(g, 0.0) + frac * max(float(np.abs(g).max()), 1e-300)
+        P, _ = self._P(lam)
+
+        def step_length(v, dv):
+            neg = dv < 0
+            return min(1.0, float(np.min(-v[neg] / dv[neg]))) if neg.any() else 1.0
+
+        diag = self._diag(lam)
+        s_out, polished, it = None, False, 0
+        support, tried = None, set()
+        for it in range(POSITIVE_MAXITER):
+            rd = g - z                                      # A x - D - z
+            mu = float(x @ z) / n
+            gap = n * mu / max(abs(float(x @ b)), 1e-300)
+            res = float(np.linalg.norm(rd)) / bnorm
+            # the support the iterates predict (held: z_i > d_i s_i); try the
+            # exact solve once it has settled, and once per support
+            pred = z <= diag * x
+            moved = n if support is None else int((pred != support).sum())
+            support = pred
+            if (gap < POSITIVE_POLISH_GAP and res < POSITIVE_POLISH_GAP
+                    and moved <= max(5, POSITIVE_POLISH_SETTLED * n)
+                    and pred.tobytes() not in tried):
+                tried.add(pred.tobytes())
+                s_out = self._polish(A, lam, x, z, POSITIVE_KKT_RTOL * bnorm)
+                if s_out is not None:
+                    polished = True
+                    break
+            if gap < POSITIVE_RTOL and res < POSITIVE_RTOL:
+                break
+            dg = z / x
+            lu = _splu((P + sp.diags(dg)).tocsc())
+            Mi = LinearOperator((n, n), matvec=lu.solve, dtype=float)
+            op = LinearOperator((n, n), matvec=lambda v: A(v) + dg * v, dtype=float)
+            # inexact steps: CG to a tolerance that follows the gap down
+            rtol = float(np.clip(0.1 * min(gap, res + gap), POSITIVE_CG_RTOL, 1e-2))
+            # predictor (affine scaling), then Mehrotra's centring + corrector
+            dx, _ = cg(op, -rd - z, rtol=rtol, maxiter=CG_MAXITER, M=Mi)
+            dz = -z - dg * dx
+            ap, ad = step_length(x, dx), step_length(z, dz)
+            sigma = (float((x + ap * dx) @ (z + ad * dz)) / n / mu) ** 3
+            corr = (sigma * mu - dx * dz) / x
+            dx, _ = cg(op, -rd - z + corr, x0=dx, rtol=rtol, maxiter=CG_MAXITER, M=Mi)
+            dz = -z + corr - dg * dx
+            ap = POSITIVE_STEP_FRACTION * step_length(x, dx)
+            ad = POSITIVE_STEP_FRACTION * step_length(z, dz)
+            x, z = x + ap * dx, z + ad * dz
+            g = A(x) - b
+            logger.debug("  interior point %d: gap %.2e, |A s - D - z|/|D| %.2e, steps "
+                         "%.2f/%.2f, %d matvecs", it, gap, res, ap, ad, count[0])
+        else:
+            logger.warning("non-negative matrix-free solve stopped after %d interior-"
+                           "point steps at coefficient %.4g (gap %.2g)", it + 1, lam, gap)
+        if s_out is None:
+            s_out = x
+        logger.debug("  non-negative solve at %.4g: %d steps, %s, %d matvecs, %d of %d "
+                     "pixels at zero", lam, it, "polished" if polished else "interior",
+                     count[0], int((s_out == 0).sum()), n)
+        self._last_positive = s_out
+        Fs = self.data.F(s_out)
+        chi2 = float(self.data.data_term - 2.0 * s_out @ b + s_out @ Fs)
+        return Solution(lam, s_out, chi2, lam * float(s_out @ (Qw @ s_out)), count[0])
 
     # -- evidence -------------------------------------------------------
     def log_det_A(self, lam: float) -> float:
@@ -481,10 +684,11 @@ def _structure_ratio(data: DataOperator, imager, s, chi2):
 
 
 def _search(system: MatrixFreeSystem, criterion: str, imager, chi2_target: float,
-            scan: _Scan, label: str) -> Solution:
+            scan: _Scan, label: str, positive: bool = False) -> Solution:
     """The strength by `criterion`: a coarse pass in whole decades from the
     strong end (warm starts run downhill in lambda), then bisection to 0.1 dex
-    (structure, discrepancy) or a golden refinement of the evidence."""
+    (structure, discrepancy) or a golden refinement of the evidence.
+    ``positive``: every trial solve non-negative."""
     data = system.data
 
     def metric(sol):
@@ -499,7 +703,7 @@ def _search(system: MatrixFreeSystem, criterion: str, imager, chi2_target: float
     def at(logc):
         key = round(float(logc), 4)
         if key not in cache:
-            sol = system.solve(10.0 ** key)
+            sol = system.solve(10.0 ** key, positive=positive)
             m = metric(sol)
             cache[key] = (sol, m)
             scan.trials.append({"pass": label, "coefficient": float(10.0 ** key),
@@ -554,13 +758,16 @@ def _search(system: MatrixFreeSystem, criterion: str, imager, chi2_target: float
 
 def fit_matrix_free(terms, geometry, mask, stub, imager, *, reg_kind: str, criterion: str,
                     scale: float, nu: float, envelope: dict | None,
-                    coefficient: float | None = None, chi2_target: float = 1.0) -> MatrixFreeFit:
+                    coefficient: float | None = None, chi2_target: float = 1.0,
+                    positive_only: bool = False) -> MatrixFreeFit:
     """The matrix-free counterpart of `fitting.fit_dataset` on streamed terms.
 
     ``coefficient`` fixes the strength (a cube channel's frozen prior);
     otherwise it is chosen by ``criterion``. ``reg_kind`` "matern", "gaussian"
     (envelope) or "adaptive" (two passes: plain Matern, then weights from
-    that model, as `fitting.fit_dataset` does).
+    that model, as `fitting.fit_dataset` does). ``positive_only``: both
+    passes non-negative (`MatrixFreeSystem.solve_positive`); the search runs
+    on the constrained solve under `structure` only, as on the dense path.
     """
     from . import fitting
 
@@ -623,9 +830,15 @@ def fit_matrix_free(terms, geometry, mask, stub, imager, *, reg_kind: str, crite
         prior = SparseMaternPrior(order, mshape, mpix, scale, weights=weights)
         system = MatrixFreeSystem(data, prior)
         if coefficient is not None:
-            return system, system.solve(float(coefficient))
-        logger.info("matrix-free %s (%s)...", label, criterion)
-        return system, _search(system, criterion, imager, chi2_target, scan, label)
+            return system, system.solve(float(coefficient), positive=positive_only)
+        logger.info("matrix-free %s (%s%s)...", label, criterion,
+                    ", non-negative" if positive_only else "")
+        search_positive = positive_only and criterion == "structure"
+        sol = _search(system, criterion, imager, chi2_target, scan, label,
+                      positive=search_positive)
+        if positive_only and not search_positive:
+            sol = system.solve(sol.coefficient, positive=True)
+        return system, sol
 
     brightness = (envelope or {}).get("brightness") if reg_kind == "adaptive" else None
     if reg_kind == "adaptive" and brightness is None:
@@ -647,5 +860,5 @@ def fit_matrix_free(terms, geometry, mask, stub, imager, *, reg_kind: str, crite
     prior = {"coefficient": float(sol.coefficient), "scale": float(scale), "nu": float(nu)}
     out = MatrixFreeFit(geometry=geometry, prior=prior, scan=scan, model_image=model,
                         model_mesh_values=sol.s, chi_squared=sol.chi_squared,
-                        log_evidence=lnz)
+                        log_evidence=lnz, positive_only=bool(positive_only))
     return out

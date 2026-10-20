@@ -2,6 +2,7 @@
 
     python scripts/bench_real_solvers.py                 # every dataset, every path
     python scripts/bench_real_solvers.py --only ruby 9io9
+    python scripts/bench_real_solvers.py --paths matfree_pos   # one solver, rest kept
     python scripts/bench_real_solvers.py --plot          # re-plot from the JSON
 
 Each dataset is fitted on the streamed path, with the default prior
@@ -11,7 +12,9 @@ Each dataset is fitted on the streamed path, with the default prior
   wtilde_free  the same, unconstrained (--no-positive): like for like with
                the matrix-free solve, which has no positivity
   matfree      the matrix-free CG solve with the sparse SPDE Matern prior
-               (nu = 1 against the dense path's 1.5)
+               (nu = 1 against the dense path's 1.5), unconstrained
+  matfree_pos  the same with positivity (an interior point): like for like
+               with `wtilde`
 
 The switch between the two paths is forced by setting
 `matfree.MATRIX_FREE_MIN_MESH_PIXELS` in a fresh process per fit, so each
@@ -58,8 +61,10 @@ DATASETS = {
     "9io9": (DATA / "J0209_135GHz/9io9_135GHz_cont.npz", 8.0, None, None),
     "rebels25": (WORK / "REBELS_25/Rebels25.concat.CII.npz", 3.5, None, None),
     "ngc4274_64": (WORK / "NGC4274/NGC4274.split.npz", 35.0, None, 64),
+    # the default mesh: matrix-free only (w-tilde's n_mesh^2 matrices do not fit)
+    "ngc4274": (WORK / "NGC4274/NGC4274.split.npz", 35.0, None, None),
 }
-PATHS = ["wtilde", "wtilde_free", "matfree"]
+PATHS = ["wtilde", "wtilde_free", "matfree", "matfree_pos"]
 
 
 def worker(name: str, path: str, out: Path) -> None:
@@ -70,11 +75,13 @@ def worker(name: str, path: str, out: Path) -> None:
     from pyuvimage import api, matfree
 
     dataset, fov, centre, mesh = DATASETS[name]
-    matfree.MATRIX_FREE_MIN_MESH_PIXELS = 0 if path in ("matfree", "prime") else 10 ** 9
+    matfree.MATRIX_FREE_MIN_MESH_PIXELS = (0 if path in ("matfree", "matfree_pos", "prime")
+                                           else 10 ** 9)
     t0 = time.time()
     res = api.run(str(dataset), fov=fov, out=out, mode="mfs",
                   mesh_shape=None if mesh is None else (mesh, mesh),
-                  image_centre=centre, streaming=True, positive_only=path == "wtilde",
+                  image_centre=centre, streaming=True,
+                  positive_only=path in ("wtilde", "matfree_pos"),
                   kernel_cache=str(OUT / name / "cache"), uncertainty="none",
                   pb_correction=False)
     wall = time.time() - t0
@@ -101,9 +108,13 @@ def worker(name: str, path: str, out: Path) -> None:
     (out / "record.json").write_text(json.dumps(rec, indent=2))
 
 
-def run_all(names):
+def run_all(names, paths=None, old=()):
+    """``paths``: only these solvers, the rest of each dataset's rows kept
+    from ``old`` (the JSON) -- the agreement still needs `wtilde`'s model."""
     records = []
+    paths = paths or PATHS
     for name in names:
+        records += [r for r in old if r["dataset"] == name and r["path"] not in paths]
         # build the streamed terms once, untimed: every fit below reuses them
         prime = OUT / name / "prime"
         prime.mkdir(parents=True, exist_ok=True)
@@ -112,7 +123,7 @@ def run_all(names):
                        capture_output=True, text=True)
         pass_s = time.time() - t0
         print(f"{name:<11} streaming pass + priming fit {pass_s:.0f} s", flush=True)
-        for path in PATHS:
+        for path in paths:
             out = OUT / name / path
             out.mkdir(parents=True, exist_ok=True)
             t0 = time.time()
@@ -158,16 +169,17 @@ def plot(records):
 
     fs.use_paper_style()
     names = [n for n in DATASETS if any(r["dataset"] == n and "failed" not in r for r in records)]
-    colours = {"wtilde": "#2a78d6", "wtilde_free": "#8fb8ea", "matfree": "#eb6834"}
+    colours = {"wtilde": "#2a78d6", "wtilde_free": "#8fb8ea", "matfree": "#f4a582",
+               "matfree_pos": "#d6501f"}
     labels = {"wtilde": "w-tilde (positive)", "wtilde_free": "w-tilde (unconstrained)",
-              "matfree": "matrix-free"}
+              "matfree": "matrix-free (unconstrained)", "matfree_pos": "matrix-free (positive)"}
     panels = [("fit time [s]", lambda r: r["wall_s"], True),
               ("peak memory [GB]", lambda r: r["max_rss_gb"], False),
               ("peak residual [σ]", lambda r: r["peak_residual_sigma"], False),
               ("model vs w-tilde at the beam\n[rms, % of peak]", lambda r: 100 * r.get("diff_vs_wtilde", np.nan), False)]
     fig, axes = plt.subplots(1, len(panels), figsize=(fs.TWO_COLUMN, fs.TWO_COLUMN * 0.30))
     x = np.arange(len(names))
-    w = 0.26
+    w = 0.8 / len(PATHS)
     for k, path in enumerate(PATHS):
         for ax, (lab, fn, logy) in zip(axes, panels):
             vals = []
@@ -175,15 +187,16 @@ def plot(records):
                 r = next((r for r in records if r["dataset"] == n and r["path"] == path
                           and "failed" not in r), None)
                 vals.append(fn(r) if r else np.nan)
-            ax.bar(x + (k - 1) * w, vals, w, color=colours[path], label=labels[path])
+            ax.bar(x + (k - (len(PATHS) - 1) / 2) * w, vals, w, color=colours[path], label=labels[path])
             ax.set_ylabel(lab, fontsize=6.5)
             if logy:
                 ax.set_yscale("log")
     for ax in axes:
         ax.set_xticks(x)
         ax.set_xticklabels(names, rotation=40, ha="right", fontsize=6)
-    axes[0].legend(fontsize=5.5, frameon=False)
-    fig.tight_layout()
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", ncol=len(PATHS), fontsize=6, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
     for q in fs.save(fig, "bench_real_solvers"):
         print("wrote", q)
 
@@ -192,6 +205,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--worker", nargs=3, metavar=("NAME", "PATH", "OUT"))
     ap.add_argument("--only", nargs="+", default=None)
+    ap.add_argument("--paths", nargs="+", default=None, choices=PATHS)
     ap.add_argument("--plot", action="store_true")
     a = ap.parse_args()
     if a.worker:
@@ -202,10 +216,11 @@ def main():
         records = json.loads(js.read_text())
     else:
         names = a.only or list(DATASETS)
-        records = run_all(names)
-        if a.only and js.exists():                     # keep the others' rows
-            old = [r for r in json.loads(js.read_text()) if r["dataset"] not in names]
-            records = old + records
+        old = json.loads(js.read_text()) if js.exists() else []
+        records = run_all(names, a.paths, old if a.paths else ())
+        records = [r for r in old if r["dataset"] not in names] + records
+        order = {n: i for i, n in enumerate(DATASETS)}
+        records.sort(key=lambda r: (order.get(r["dataset"], 99), PATHS.index(r["path"])))
         js.parent.mkdir(exist_ok=True)
         js.write_text(json.dumps(records, indent=2))
     plot(records)

@@ -91,6 +91,32 @@ def test_preconditioned_cg_and_evidence_match_dense(small, weighted):
         assert system.log_evidence(sol) == pytest.approx(lnz, rel=3e-3)
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+def test_the_positive_solve_is_the_nnls_solution(small, weighted):
+    """Projected Newton against the exact non-negative least squares
+    solution of the same quadratic (A = L L^T: min |L^T s - L^-1 D|^2)."""
+    from scipy.optimize import nnls
+
+    data, F = small["data"], small["F"]
+    w = None
+    if weighted:
+        w = 0.01 + 0.99 * np.random.default_rng(3).random(F.shape[0])
+    prior = matfree.SparseMaternPrior(small["order"], small["shape"], small["pix"], 0.3, weights=w)
+    system = matfree.MatrixFreeSystem(data, prior)
+    for lam in (1e5, 1e7, 1e9):
+        A = F + lam * prior.Qw.toarray()
+        L = np.linalg.cholesky(A)
+        ref, _ = nnls(L.T, np.linalg.solve(L, data.D), maxiter=50 * F.shape[0])
+        sol = system.solve(lam, positive=True)
+        assert sol.s.min() >= 0
+        assert 0 < (ref == 0).mean() < 1                     # constraints active
+        # the same support (exact zeros), and the values to CG's accuracy on
+        # this ill-conditioned mock (condition number up to ~1e7)
+        assert ((sol.s == 0) != (ref == 0)).mean() < 0.02
+        np.testing.assert_allclose(sol.s, ref, rtol=0, atol=1e-3 * ref.max())
+        assert sol.chi_squared == pytest.approx(data.chi_squared(ref), rel=1e-6)
+
+
 def test_run_takes_the_matrix_free_path_above_the_switch(small, tmp_path, monkeypatch, caplog):
     import logging
 
@@ -108,6 +134,13 @@ def test_run_takes_the_matrix_free_path_above_the_switch(small, tmp_path, monkey
     assert res.parameters["fit_quality"]["chi_squared"] / (2 * small["uvd"].n_samples) < 1.5
     assert res.scan["solver"] == "matrix-free"
     assert (tmp_path / "mf" / "model.fits").exists()
+    # positive by default, as on the dense path; unconstrained on request
+    assert res.parameters["solver"]["positive_only"] and p.model_mesh.min() >= 0
+    free = api.run(small["uvd"], fov=3.0, mesh_shape=(16, 16), out=tmp_path / "free",
+                   reg="adaptive", streaming=True, pb_correction=False, positive_only=False,
+                   uncertainty="none")
+    assert not free.parameters["solver"]["positive_only"]
+    assert free.products[0].model_mesh.min() < 0
     with pytest.raises(NotImplementedError, match="point components"):
         api.run(small["uvd"], fov=3.0, mesh_shape=(16, 16), out=tmp_path / "p",
                 streaming=True, point_sources=True, write=False)

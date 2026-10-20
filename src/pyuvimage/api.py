@@ -1379,17 +1379,18 @@ def run_streamed(
         logger.info(
             "mesh of %d pixels > %d: matrix-free solve (w-tilde FFT, sparse "
             "SPDE Matern prior with nu = 1, conjugate gradients with Powell et "
-            "al. 2021's sparse preconditioner). Unconstrained: no positivity "
-            "on this path.", n_pix, matfree.MATRIX_FREE_MIN_MESH_PIXELS)
+            "al. 2021's sparse preconditioner)%s.", n_pix,
+            matfree.MATRIX_FREE_MIN_MESH_PIXELS,
+            ", non-negative (interior point)" if positive_only else ", unconstrained")
         if uncertainty != "none":
             logger.warning("--uncertainty %s is not available on the matrix-free "
                            "path yet; no uncertainty.fits or snr.fits", uncertainty)
             uncertainty = "none"
-        positive_only = False
         mfs_fit = matfree.fit_matrix_free(
             terms, geometry, mask, stub, imager, reg_kind=reg, criterion=criterion,
             scale=beam_scale, nu=nu, envelope=envelope, chi2_target=chi2_target,
             coefficient=None if coefficient == "auto" else float(coefficient),
+            positive_only=positive_only,
         )
     else:
         mfs_fit = fitting.fit_dataset(
@@ -2527,7 +2528,7 @@ def _fit_streamed_channel(task: dict) -> dict:
             criterion=task["criterion"], scale=frozen["scale"], nu=task["nu"],
             envelope=task["envelope"],
             coefficient=None if task.get("per_channel_prior") else frozen["coefficient"],
-            chi2_target=task["chi2_target"],
+            chi2_target=task["chi2_target"], positive_only=task["positive_only"],
         )
     else:
         geometry, envelope = _channel_geometry(task, stub_c, geometry, task["envelope"])
