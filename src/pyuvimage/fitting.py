@@ -2283,7 +2283,10 @@ def fit_at(
 # it is 1.3 GB, and the sparse inversion's data vector built it twice over
 # (`np.hstack` copies): 5.4 GB for an inversion whose curvature matrix is
 # 42 MB, which is what killed those fits. At a 192 x 192 mesh it would be
-# 43 GB. Everything here uses the sparse form instead.
+# 43 GB. Everything here uses the sparse form instead. autoarray's own sparse
+# data vector has been built from sparse triplets since 2026.10.18.1 (it was
+# patched here before); its `mapped_reconstructed_data_dict` still uses the
+# dense matrix, which pyuvimage never asks it for.
 
 
 def sparse_mapping(mapper) -> "sp.csr_matrix":
@@ -2343,35 +2346,6 @@ def diag_quadratic(M, C: np.ndarray) -> np.ndarray:
     wts[rows, pos] = M.data
     return np.einsum("na,nb,nab->n", wts, wts, C[idx[:, :, None], idx[:, None, :]])
 
-
-def _patch_sparse_data_vector() -> None:
-    """D = L^T d~ on autoarray's sparse interferometer inversion through the
-    sparse mapping, not its dense `mapping_matrix` (see above). Same numbers;
-    linear-function objects keep autoarray's product."""
-    try:
-        from autoarray.inversion.inversion.interferometer.sparse import (
-            InversionInterferometerSparse as _Sparse,
-        )
-        from autonerves.tools.decorators import cached_property as _cached
-    except ImportError:          # pragma: no cover - older autoarray
-        return
-    if getattr(_Sparse, "_pyuvimage_patched", False):
-        return
-
-    def data_vector(self):
-        dirty = getattr(self.dataset, "sparse_dirty_image", None)
-        if dirty is None:
-            dirty = self.dataset.sparse_operator.dirty_image
-        dirty = np.asarray(dirty)
-        parts = [np.asarray(mesh_mapping(obj).T @ dirty).ravel()
-                 for obj in self.linear_obj_list]
-        return np.concatenate(parts)
-
-    _Sparse.data_vector = _cached(data_vector)
-    _Sparse._pyuvimage_patched = True
-
-
-_patch_sparse_data_vector()
 
 @dataclass
 class Trial:
@@ -2573,13 +2547,34 @@ class LinearSystem:
     #: one n_mesh vector, so this is kilobytes
     WARM_START_POOL = 64
 
+    def _solve_unconstrained(self, curvature_reg: np.ndarray) -> np.ndarray:
+        """(F + H)^-1 D the way autoarray's NumPy inversion does it (since
+        2026.10.18.1, PyAutoArray#633): one Cholesky factor, shared there
+        with the log determinant, and its LU solve only when the factor fails
+        or is not finite -- so a `Trial` stays the framework fit to the bit."""
+        import scipy.linalg
+
+        from autoarray.inversion.inversion import inversion_util
+
+        try:
+            factor = scipy.linalg.cho_factor(
+                np.asarray(curvature_reg), lower=True, overwrite_a=False,
+                check_finite=False)
+        except np.linalg.LinAlgError:
+            factor = None
+        if factor is not None and np.all(np.isfinite(np.diag(factor[0]))):
+            return scipy.linalg.cho_solve(factor, np.asarray(self.D), check_finite=False)
+        return inversion_util.reconstruction_positive_negative_from(
+            data_vector=self.D, curvature_reg_matrix=curvature_reg, xp=np
+        )
+
     def solve(
         self, H: np.ndarray, positive: bool, warm_start: bool = False
     ) -> np.ndarray:
         """s = (F + H)^-1 D, unconstrained or non-negative.
 
-        The two solver functions are autoarray's own
-        (`inversion_util.reconstruction_positive_negative_from` and
+        The solvers are autoarray's own (its Cholesky route for the
+        unconstrained solve, `_solve_unconstrained`, and
         `reconstruction_positive_only_from`), called on the same arrays the
         framework would pass them, so a `Trial` and a framework fit at the same
         prior are the same solve. Both raise on failure -- a `LinAlgError` for
@@ -2618,9 +2613,7 @@ class LinearSystem:
 
         curvature_reg = np.add(self.F, H)
         if not positive:
-            return inversion_util.reconstruction_positive_negative_from(
-                data_vector=self.D, curvature_reg_matrix=curvature_reg, xp=np
-            )
+            return self._solve_unconstrained(curvature_reg)
         key = self._strength_key(H)
         counts = self.__dict__.setdefault(
             "solve_counts", {"cold": 0, "warm": 0, "warm_failed": 0}

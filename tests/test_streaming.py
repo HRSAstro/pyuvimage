@@ -804,8 +804,11 @@ def test_streamed_recentred_fit_matches_the_in_memory_one(ragged, tmp_path):
 def test_the_nufft_accumulation_matches_the_per_chunk_dft(ragged):
     """The fast path (type-1 NUFFTs over batches of `NUFFT_BATCH`) against the
     per-chunk DFT it replaced -- 54x faster on Teresa's 112x112 grid, where
-    the DFT pass would have taken ~6 h. Errors scale with each image's peak."""
+    the DFT pass would have taken ~6 h. Errors scale with each image's peak.
+    On pooled noise: the fast path pools unequal sigmas (see below), the DFT
+    path keeps them apart."""
     uvd, _, geom = ragged
+    uvd = with_pooled_noise(uvd)
     mask = fitting.make_mask(geom, "square")
     slow = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=False)
     fast = stm.TermsAccumulator(geom, mask, ag.TransformerDFT, fast=True)
@@ -829,14 +832,10 @@ def test_point_grids_need_the_fast_path_and_an_even_oversample(ragged):
             stm.TermsAccumulator(geom, mask, ag.TransformerDFT, point_oversample=3)
 
 
-@pytest.mark.skipif(not stm.nufftax_available() or stm.autoarray_streaming() is None,
-                    reason="needs nufftax and autoarray >= AUTOARRAY_STREAMING_RELEASE")
-def test_the_fast_path_is_autoarrays_streaming_and_matches_our_own(ragged, monkeypatch, caplog):
-    """With pooled noise every batch goes through autoarray's
-    `sparse_terms_from_chunks`; pyuvimage's own type-1 accumulation (what an
-    older autoarray falls back to) gives the same terms to rounding."""
-    import logging
-
+@pytest.mark.skipif(not stm.nufftax_available(), reason="needs nufftax")
+def test_the_fast_path_is_autoarrays_streaming(ragged, monkeypatch):
+    """Every batch goes through autoarray's `sparse_terms_from_chunks` at one
+    compiled length (the padded last batch included)."""
     uvd, _, geom = ragged
     mask = fitting.make_mask(geom, "square")
     upstream = stm.autoarray_streaming()
@@ -847,19 +846,41 @@ def test_the_fast_path_is_autoarrays_streaming_and_matches_our_own(ragged, monke
         calls.append(len(chunks[0][1]))
         return upstream(chunks, **kw)
 
+    spy.__module__ = upstream.__module__
     monkeypatch.setattr(stm, "autoarray_streaming", lambda: spy)
-    theirs = stm.accumulate_sparse_terms(
+    fast = stm.accumulate_sparse_terms(
         stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
     # every batch, the padded last one included, has the one compiled length
     assert calls and set(calls) == {stm.NUFFT_BATCH}
+    assert fast.n_vis == int(sum(len(c) for c in stm.iter_uvdata_chunks(uvd, CHUNK)))
 
-    monkeypatch.setattr(stm, "autoarray_streaming", lambda: None)
-    monkeypatch.setattr(stm, "_WARNED_OLD_AUTOARRAY", False)
-    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
-        ours = stm.accumulate_sparse_terms(
-            stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=True)
-    assert "pip install --force-reinstall" in caplog.text
+
+@pytest.mark.skipif(not stm.nufftax_available(), reason="needs nufftax")
+def test_unequal_sigmas_are_pooled_on_the_fast_path(ragged):
+    """The w-tilde kernel holds one weight per sample, so a chunk whose
+    sigma_re and sigma_im differ is pooled first -- every term, scalars too,
+    as if the data had been pooled beforehand."""
+    uvd, _, geom = ragged
+    mask = fitting.make_mask(geom, "square")
+    assert not np.array_equal(uvd.noise.real, uvd.noise.imag)
+    unpooled = stm.accumulate_sparse_terms(
+        stm.iter_uvdata_chunks(uvd, CHUNK), geom, mask, ag.TransformerDFT, pool_noise=False)
+    pooled = stm.accumulate_sparse_terms(
+        stm.iter_uvdata_chunks(with_pooled_noise(uvd), CHUNK), geom, mask, ag.TransformerDFT)
     for name in ("kernel", "dirty_image", "beam_raw", "data_dirty_raw"):
-        x, y = getattr(ours, name), getattr(theirs, name)
-        np.testing.assert_allclose(y, x, rtol=0, atol=1e-11 * np.abs(x).max(), err_msg=name)
-    assert theirs.data_term == ours.data_term and theirs.n_vis == ours.n_vis
+        np.testing.assert_array_equal(getattr(unpooled, name), getattr(pooled, name), err_msg=name)
+    for name in ("data_term", "noise_normalization", "sum_weights"):
+        assert getattr(unpooled, name) == getattr(pooled, name), name
+
+
+def test_an_autoarray_without_the_fine_grids_is_refused(monkeypatch):
+    from autoarray.inversion.inversion.interferometer import (
+        inversion_interferometer_util as su,
+    )
+
+    def old(chunks, *, real_space_mask, eps=None):      # 2026.10.2.1's options
+        raise AssertionError("not to be called")
+
+    monkeypatch.setattr(su, "sparse_terms_from_chunks", old)
+    with pytest.raises(RuntimeError, match=stm.AUTOARRAY_STREAMING_RELEASE):
+        stm.autoarray_streaming()

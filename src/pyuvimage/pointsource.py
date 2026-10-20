@@ -43,6 +43,14 @@ DEFAULT_SIGNIFICANCE = 5.0
 DEFAULT_MAX_POINTS = 5
 
 
+def _dense(block):
+    """A column block of the mapping as a dense array (autoarray's operators
+    take one); the full mapping stays sparse."""
+    import scipy.sparse as sp
+
+    return block.toarray() if sp.issparse(block) else np.asarray(block)
+
+
 @dataclass
 class PointSource:
     """One fitted point component."""
@@ -226,7 +234,10 @@ class SparseMesh:
                 "the sparse bordered system expects exactly one mapper in the "
                 f"inversion, found {len(mappers)}"
             )
-        self.mapping_matrix = np.asarray(mappers[0].mapping_matrix)
+        from .fitting import mesh_mapping
+
+        # sparse (image slim x mesh): the dense one is n_image x n_mesh
+        self.mapping_matrix = mesh_mapping(mappers[0])
         self.transformer = dataset.transformer
         self.mask = self.transformer.grid.mask
         self.n_vis = int(np.asarray(dataset.data).shape[0])
@@ -379,7 +390,7 @@ class SparseMesh:
             hi = min(lo + batch, n_mesh)
             out[lo:hi] = np.asarray(
                 self.sparse_operator.operated_matrix_slim_from(
-                    matrix_slim=self.mapping_matrix[:, lo:hi],
+                    matrix_slim=_dense(self.mapping_matrix[:, lo:hi]),
                     extent_index_for_masked_pixel=extent,
                 )
             ).T
@@ -1533,7 +1544,9 @@ class PointAugmentedFit:
 
         for obj, _ in self._sf.fit.inversion.reconstruction_dict.items():
             if type(obj).__name__ == "Mapper":
-                slim = np.asarray(obj.mapping_matrix) @ np.asarray(mesh_values)
+                from .fitting import mesh_mapping
+
+                slim = mesh_mapping(obj) @ np.asarray(mesh_values)
                 return np.asarray(
                     ag.Array2D(
                         values=slim, mask=self._sf.fit.dataset.real_space_mask

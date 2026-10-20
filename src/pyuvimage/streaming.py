@@ -73,10 +73,8 @@ NUFFT_EPS = 1.0e-12
 def _nufftax():
     """The nufftax module, or None.
 
-    Imported directly rather than through autoarray's private loader, which
-    not every autoarray release has (Hannah's did not: collection failed on
-    `su._load_nufftax`). Its only extra is a vmap shim this module never
-    needs -- every transform here is a single unbatched call.
+    Only asked whether it imports: the fast path's NUFFTs are autoarray's
+    (`sparse_terms_from_chunks`), which need it.
     """
     try:
         import nufftax
@@ -89,120 +87,52 @@ def nufftax_available() -> bool:
     return _nufftax() is not None
 
 
-#: the first autoarray release with `sparse_terms_from_chunks` /
-#: `Interferometer.from_stream` (PyAutoLabs discussion #13)
-AUTOARRAY_STREAMING_RELEASE = "2026.10.2.1"
+#: the autoarray release whose `sparse_terms_from_chunks` the fast path
+#: needs: streaming (2026.10.2.1, PyAutoLabs discussion #13) plus
+#: `pool_noise_map` and the `oversample` fine grids for point components
+AUTOARRAY_STREAMING_RELEASE = "2026.10.18.1"
 
 
 def autoarray_streaming():
-    """autoarray's `sparse_terms_from_chunks`, or None on an older release."""
+    """autoarray's `sparse_terms_from_chunks`. Raises on a release without the
+    `oversample` / `pool_noise_map` options (pyproject requires one with)."""
+    import inspect
+
     try:
         from autoarray.inversion.inversion.interferometer import (
             inversion_interferometer_util as su,
         )
+        fn = su.sparse_terms_from_chunks
+        params = inspect.signature(fn).parameters
     except Exception:  # pragma: no cover
-        return None
-    return getattr(su, "sparse_terms_from_chunks", None)
+        fn, params = None, {}
+    if fn is None or "oversample" not in params or "pool_noise_map" not in params:
+        raise RuntimeError(
+            f"the streamed path needs autoarray >= {AUTOARRAY_STREAMING_RELEASE} "
+            "(sparse_terms_from_chunks with oversample / pool_noise_map). Install "
+            f"it with: pip install --force-reinstall --no-deps \"autoarray>="
+            f"{AUTOARRAY_STREAMING_RELEASE}\" \"autogalaxy>={AUTOARRAY_STREAMING_RELEASE}\" "
+            "(--force-reinstall because an autoarray installed from git reports "
+            "version 9999.0.0.dev0, which pip treats as newer than any release)")
+    return fn
 
 
-_WARNED_OLD_AUTOARRAY = False
+_NOTED_POOLED_CHUNK = False
 
 
-def _warn_old_autoarray() -> None:
-    global _WARNED_OLD_AUTOARRAY
-    if _WARNED_OLD_AUTOARRAY:
-        return
-    _WARNED_OLD_AUTOARRAY = True
-    logger.warning(
-        "this autoarray has no streaming accumulation (sparse_terms_from_chunks, "
-        "autoarray >= %s); using pyuvimage's own, which gives the same terms "
-        "about 25%% slower. To use autoarray's: pip install --force-reinstall "
-        "--no-deps \"autoarray>=%s\" (--force-reinstall because an autoarray "
-        "installed from git reports version 9999.0.0.dev0, which pip treats as "
-        "newer than any release).",
-        AUTOARRAY_STREAMING_RELEASE, AUTOARRAY_STREAMING_RELEASE,
-    )
-
-
-def type1_image(uv: np.ndarray, values: np.ndarray, shape: tuple[int, int],
-                pixel_scale_arcsec: float, centred: bool = False,
-                eps: float = NUFFT_EPS) -> np.ndarray:
-    """``Re sum_k c_k exp(+2 pi i (u_k x + v_k y))`` on a uniform grid, by a
-    type-1 NUFFT -- the adjoint of the forward transform, on its plain
-    mathematical scale.
-
-    ``centred=False`` (an image): the grid is autoarray's native image grid,
-    row 0 at +y, pixel centres at ``y = ((Ny-1)/2 - row) pix`` and
-    ``x = (col - (Nx-1)/2) pix`` -- half-integer multiples of the pixel for
-    the even sizes pyuvimage builds. This is what `fitting.adjoint_image`
-    returns through a DFT, at O(n_vis nspread^2 + N log N) instead of
-    O(n_vis N); `tests/test_streaming_nufft.py` pins the two together.
-
-    ``centred=True``: samples at integer multiples of the pixel, ``y =
-    (Ny/2 - row) pix`` and ``x = (col - Nx/2) pix`` -- zero at
-    ``[Ny/2, Nx/2]``. Used for the oversampled grids point components are
-    interpolated from, whose samples should include the origin.
-
-    nufftax returns ``f[m2, m1] = sum c exp(i (m1 x_k + m2 y_k))`` on centred
-    modes ``m in [-N/2, N/2)``; rows run toward -y, so ``y_k`` enters with a
-    minus sign, and the half-pixel offset of an image grid is a phase on c.
-    """
-    import jax.numpy as jnp
-
-    nufftax = _nufftax()
-    if nufftax is None:
-        raise RuntimeError("type1_image needs nufftax")
-    ny, nx = (int(v) for v in shape)
-    if ny % 2 or nx % 2:
-        raise ValueError(f"type1_image needs even sizes, got {shape}")
-    pix = float(pixel_scale_arcsec) * ARCSEC_TO_RAD_STREAM
-    u = np.asarray(uv[:, 0], dtype=np.float64)
-    v = np.asarray(uv[:, 1], dtype=np.float64)
-    c = np.asarray(values, dtype=np.complex128)
-    if not centred:
-        # x = (m1 + 1/2) pix, y = -(m2 + 1/2) pix
-        c = c * np.exp(1j * np.pi * pix * (u - v))
-    f = nufftax.nufft2d1(
-        jnp.asarray(2.0 * np.pi * u * pix), jnp.asarray(-2.0 * np.pi * v * pix),
-        jnp.asarray(c), (nx, ny), eps, 1,
-    )
-    return np.asarray(np.real(f), dtype=np.float64)
-
-
-def kernel_image(uv: np.ndarray, weights: np.ndarray, shape: tuple[int, int],
-                 pixel_scale_arcsec: float, eps: float = NUFFT_EPS,
-                 zero_nyquist: bool = True) -> np.ndarray:
-    """The w-tilde preload K(lag) = sum w cos(2 pi u.lag), (2Ny, 2Nx), in
-    autoarray's FFT-wrapped order: index (i, j) is the lag (dy, dx) = (+i, -j)
-    pixels, wrapped. `nufft_precision_operator_from`'s array, by one type-1
-    NUFFT -- built here so the fast path depends on no particular autoarray
-    release's builder signature, only on nufftax.
-
-    K is even, so (+i, -j) reads the same as (-i, +j), which on the centred
-    grid of `type1_image` is row Ny + i, column Nx + j; `ifftshift` moves that
-    to (i, j).
-
-    autoarray leaves the lag of exactly +-N pixels (row Ny, column Nx) at
-    zero -- it is ambiguous, and no pixel pair in the image is that far
-    apart -- and ``zero_nyquist`` matches it. The point grids keep it: their
-    spline reads across it.
-    """
-    ny, nx = (int(v) for v in shape)
-    centred = type1_image(uv, np.asarray(weights, dtype=np.complex128),
-                          (2 * ny, 2 * nx), pixel_scale_arcsec, centred=True, eps=eps)
-    out = np.fft.ifftshift(centred)
-    if zero_nyquist:
-        out[ny, :] = 0.0
-        out[:, nx] = 0.0
-    return out
+def _note_pooled_chunk() -> None:
+    global _NOTED_POOLED_CHUNK
+    if not _NOTED_POOLED_CHUNK:
+        _NOTED_POOLED_CHUNK = True
+        logger.info("some streamed samples have sigma_re != sigma_im: pooling them "
+                    "in quadrature for the w-tilde terms, as the in-memory sparse "
+                    "path does")
 
 
 #: the fine kernel's lag margin beyond one field width, as a fraction of it
 #: (see `TermsAccumulator`); a quarter covers 4 sigma of the widest Gaussian
 #: the unresolved test tries (1.5 beam sigma) once the field is ~4 beams
 POINT_KERNEL_PAD = 0.25
-
-ARCSEC_TO_RAD_STREAM = np.pi / (180.0 * 3600.0)
 
 
 @dataclass
@@ -604,7 +534,7 @@ class SparseTerms:
     # image on a grid `oversample` times finer than the image, from which
     # both are interpolated at sub-pixel positions. None when not asked for.
     kernel_fine: np.ndarray | None = None   # (2 (Ny+pad) q, ...), wraparound, as `kernel`
-    dirty_fine: np.ndarray | None = None    # (2 Ny q, 2 Nx q), centred (`type1_image`)
+    dirty_fine: np.ndarray | None = None    # (2 Ny q, 2 Nx q), centred (autoarray's `dirty_image_fine`)
     oversample: int = 0
 
     @property
@@ -734,21 +664,22 @@ class TermsAccumulator:
     type-1 NUFFT builder, the dirty image and beam through a
     `TransformerNUFFT` over the batch. Compared on ALMaQUEST CO(1-0) (1.34M
     samples) it matched pyuvimage's own type-1 accumulation to 3e-13 of the
-    peak and ran 25% faster (`scripts/compare_from_stream.py`,
-    `claude/autoarray-from-stream-comparison.md`), so it is used whenever
-    the installed autoarray has it (>= `AUTOARRAY_STREAMING_RELEASE`). The
+    peak and ran 25% faster (`scripts/compare_from_stream.py`, since removed;
+    `claude/autoarray-from-stream-comparison.md`); it is now the only fast
+    accumulation (autoarray >= `AUTOARRAY_STREAMING_RELEASE` required). The
     last batch is padded to full length with samples of infinite sigma --
     zero weight, so they add exactly nothing -- so JAX compiles one batch
     shape per run rather than one per remainder (one per channel in cube
     mode).
 
-    pyuvimage's own type-1 accumulation (`kernel_image`, `type1_image`) is
-    still used for the oversampled point-component grids, which autoarray
-    does not build, and for any batch whose sigma_re and sigma_im differ
-    (autoarray refuses those: its kernel is built from sigma_re alone; the
-    sparse path pools them, so this is only an unpooled caller's case). On
-    an autoarray older than `AUTOARRAY_STREAMING_RELEASE` it does the whole
-    job, with a one-time warning naming the pip command.
+    Since autoarray 2026.10.18.1 it does the whole job: the oversampled
+    point-component grids too (`oversample`, `oversample_pad`: its
+    `precision_operator_fine` / `dirty_image_fine` are the layout pyuvimage
+    used, equal to 5e-15 of the peak), and samples whose sigma_re and
+    sigma_im differ are pooled in quadrature first (`uvdata.pooled_noise`,
+    autoarray's `noise_map_pooled_from`), as the in-memory sparse path pools
+    them -- every term then describes one noise model. pyuvimage's own
+    type-1 accumulation, which covered those two cases, is gone.
 
     **The slow path** (`fast=False`): per chunk a transformer is built over that chunk's uv (the DFT here is
     n_image x chunk_k, freed with the chunk) and three adjoints are taken:
@@ -804,21 +735,21 @@ class TermsAccumulator:
         if self.q:
             if self.q % 2:
                 raise ValueError("point_oversample must be even")
-            fine = (shape[0] * self.q, shape[1] * self.q)
-            # The kernel's lags reach one field width -- every pixel pair --
-            # plus a margin: a Gaussian-widened column convolves K with the
-            # width, and a pair nearly a field apart would otherwise read the
-            # circular wrap (3e-3 of B for a 0.2" width in a 3" field)
-            pad = int(np.ceil(POINT_KERNEL_PAD * max(shape)))
-            self.kernel_fine_shape = ((shape[0] + pad) * self.q, (shape[1] + pad) * self.q)
-            self.kernel_fine = np.zeros(
-                (2 * self.kernel_fine_shape[0], 2 * self.kernel_fine_shape[1]),
-                dtype=np.float64)
-            # twice the field, like the kernel: a Gaussian-widened column near
-            # the field's edge convolves Dd with values from beyond it, and
-            # the circular convolution must find the sky there, not the
-            # opposite edge (3.5% on Dp at 0.27" from the edge of a 3" field)
-            self.dirty_fine = np.zeros((2 * fine[0], 2 * fine[1]), dtype=np.float64)
+            from autoarray.inversion.inversion.interferometer.inversion_interferometer_util import (
+                fine_grid_shapes_from,
+            )
+
+            # autoarray's layout (`sparse_terms_from_chunks`, "Fine grids"):
+            # the kernel's lags reach one field width -- every pixel pair --
+            # plus a margin, since a Gaussian-widened column convolves K with
+            # the width and a pair nearly a field apart would otherwise read
+            # the circular wrap (3e-3 of B for a 0.2" width in a 3" field);
+            # the dirty grid is twice the field, so a widened column near the
+            # edge finds the sky beyond it, not the opposite edge (3.5% on Dp
+            # at 0.27" from the edge of a 3" field)
+            k_shape, d_shape = fine_grid_shapes_from(shape, self.q, POINT_KERNEL_PAD)
+            self.kernel_fine = np.zeros(k_shape, dtype=np.float64)
+            self.dirty_fine = np.zeros(d_shape, dtype=np.float64)
         self._buf: list = []
         self._buf_n = 0
 
@@ -840,6 +771,12 @@ class TermsAccumulator:
         uv, d, s = ch.uv, ch.data, ch.noise
         self.asym += float(np.sum(np.abs(s.real - s.imag) / (0.5 * (s.real + s.imag))))
         if self.pool_noise:
+            s = pooled_noise(s)
+        elif self.fast and not np.array_equal(s.real, s.imag):
+            # the w-tilde kernel holds one weight per sample: pool, as the
+            # in-memory sparse path does, so every term (scalars included)
+            # describes the same noise model
+            _note_pooled_chunk()
             s = pooled_noise(s)
         sr, si = s.real, s.imag
         if self.fast:
@@ -901,37 +838,16 @@ class TermsAccumulator:
             self._buf, self._buf_n = [], 0
 
     def _flush_batch(self, uv, d, sr, si) -> None:
-        pix = float(self.geometry.pixel_scale)
-        w = sr ** -2.0
-        weighted = d.real * sr ** -2.0 + 1j * d.imag * si ** -2.0
-        upstream = autoarray_streaming()
-        if upstream is not None and np.array_equal(sr, si):
-            self._add_upstream(upstream, uv, d, sr)
-        else:
-            if upstream is None:
-                _warn_old_autoarray()
-            self.kernel += kernel_image(uv, w, self.shape, pix)
-            dirty = type1_image(uv, weighted, self.shape, pix)
-            self.dirty += dirty
-            self.beam += type1_image(uv, w.astype(complex), self.shape, pix)
-            # with equal sigma_re and sigma_im the products' weighting is the
-            # fit's, and the two images are one
-            self.data_dirty += (dirty if np.array_equal(sr, si)
-                                else type1_image(uv, d * w, self.shape, pix))
-        if self.q:
-            self.kernel_fine += kernel_image(
-                uv, w, self.kernel_fine_shape, pix / self.q, zero_nyquist=False)
-            self.dirty_fine += type1_image(
-                uv, weighted, self.dirty_fine.shape, pix / self.q, centred=True)
-
-    def _add_upstream(self, sparse_terms_from_chunks, uv, d, sigma) -> None:
-        """One batch through autoarray's `sparse_terms_from_chunks`.
+        """One batch through autoarray's `sparse_terms_from_chunks` (the
+        fine grids too when point components are asked for).
 
         Only its image terms are taken: the scalars are pyuvimage's own
         (`_add_scalars`, identical sums), and padding would put infinities in
-        its noise normalisation. With sigma_re == sigma_im the data dirty
-        image of the products (weight 1/sigma_re^2) is the fit's dirty image.
+        its noise normalisation. sigma_re == sigma_im here (`add` pools), so
+        the data dirty image of the products (weight 1/sigma_re^2) is the
+        fit's dirty image.
         """
+        sparse_terms_from_chunks = autoarray_streaming()
         n = len(d)
         if n < NUFFT_BATCH:
             # zero-weight padding: 1/inf^2 is exactly 0, so every term gains
@@ -939,12 +855,19 @@ class TermsAccumulator:
             pad = NUFFT_BATCH - n
             uv = np.concatenate([uv, np.zeros((pad, 2))])
             d = np.concatenate([d, np.zeros(pad, dtype=complex)])
-            sigma = np.concatenate([sigma, np.full(pad, np.inf)])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            t = sparse_terms_from_chunks(
-                [(uv, d, sigma * (1 + 1j))], real_space_mask=self.mask,
-                eps=NUFFT_EPS,
-            )
+            sr = np.concatenate([sr, np.full(pad, np.inf)])
+        fine = dict(oversample=self.q, oversample_pad=POINT_KERNEL_PAD) if self.q else {}
+        aa_log = logging.getLogger(sparse_terms_from_chunks.__module__)
+        level = aa_log.level
+        aa_log.setLevel(logging.WARNING)       # its fine-grid memory line, once per batch
+        try:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t = sparse_terms_from_chunks(
+                    [(uv, d, sr * (1 + 1j))], real_space_mask=self.mask,
+                    eps=NUFFT_EPS, **fine,
+                )
+        finally:
+            aa_log.setLevel(level)
         kernel = np.asarray(t.nufft_precision_operator, dtype=np.float64)
         if kernel.shape != self.kernel.shape:
             raise RuntimeError(
@@ -956,6 +879,9 @@ class TermsAccumulator:
         self.dirty += dirty
         self.beam += np.asarray(t.dirty_beam_native, dtype=np.float64)
         self.data_dirty += dirty
+        if self.q:
+            self.kernel_fine += np.asarray(t.precision_operator_fine, dtype=np.float64)
+            self.dirty_fine += np.asarray(t.dirty_image_fine, dtype=np.float64)
 
     def finish(self) -> SparseTerms:
         self._flush()

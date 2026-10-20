@@ -12,7 +12,7 @@ prior whose hyperparameters are optimised automatically.
 ## Install
 
 ```bash
-pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see docs/install.md)
+pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.18.1, see docs/install.md)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax (optional)
 pip install -e ".[mask]"    # + regions, to read CASA/DS9 region files for --mask

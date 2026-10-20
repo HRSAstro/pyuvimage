@@ -913,14 +913,20 @@ def pooled_noise(noise: np.ndarray) -> np.ndarray:
     in the estimator, and pooling doubles its sample size. See
     `_report_reim_asymmetry`.
 
-    Used in two places -- by `shift_image_centre`, where a phase rotation mixes
+    autoarray's `noise_map_pooled_from`, which leaves samples whose two sigmas
+    already agree untouched. Used by `shift_image_centre`, where a phase rotation mixes
     the real and imaginary parts so the separate sigmas no longer describe the
     rotated visibility, and by the sparse inversion, whose W~ reduction assumes
     the two are equal.
     """
+    from autoarray.inversion.inversion.interferometer.inversion_interferometer_util import (
+        noise_map_pooled_from,
+    )
+
+    # autoarray's own (the formula the sparse terms' `pool_noise_map` uses);
+    # it flattens, so the shape is put back
     a = np.asarray(noise)
-    s = np.sqrt(0.5 * (a.real**2 + a.imag**2))
-    return s + 1j * s
+    return noise_map_pooled_from(a).reshape(a.shape)
 
 
 def with_pooled_noise(

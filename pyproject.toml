@@ -15,12 +15,14 @@ dependencies = [
     "scipy",
     "astropy",
     "matplotlib",
-    # PyAutoLabs releases in lockstep; 2026.10.2.1 is the first with both the
-    # streaming accumulation the streamed path uses (`sparse_terms_from_chunks`)
-    # and the in-place non-negative solver with its warm-start memo (J0116
-    # solves 72-109 s -> 1-2 s). See docs/install.md.
-    "autogalaxy>=2026.10.2.1",
-    "autoarray>=2026.10.2.1",
+    # PyAutoLabs releases in lockstep. 2026.10.2.1 brought the streaming
+    # accumulation (`sparse_terms_from_chunks`) and the in-place non-negative
+    # solver with its warm-start memo (J0116 solves 72-109 s -> 1-2 s);
+    # 2026.10.18.1 adds its noise pooling and the oversampled point-component
+    # grids, which replace pyuvimage's own, and a sparse data vector. See
+    # docs/install.md.
+    "autogalaxy>=2026.10.18.1",
+    "autoarray>=2026.10.18.1",
     # the same solver's Cholesky-update kernels are numba; without it they run
     # as pure Python and every positive-only solve is several times slower
     "numba",

@@ -3,7 +3,7 @@
 [← back to the README](../README.md)
 
 ```bash
-pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.2.1, see below)
+pip install -e .            # core (numpy backend; numba and autoarray >= 2026.10.18.1, see below)
 pip install -e ".[ms]"      # + python-casacore, to read measurement sets
 pip install -e ".[jax]"     # + JAX/nufftax
 ```
@@ -25,23 +25,26 @@ decorator is a no-op and the kernels run as pure Python — 9 s of a 44 s cold
 solve when profiled. pyuvimage warns at the start of a run if numba is
 missing; `pip install numba` is the whole fix.
 
-**autoarray 2026.10.2.1** is the minimum. It is the first release with the
-solver rewrite below, and the first with autoarray's own streaming
-accumulation (`sparse_terms_from_chunks` / `Interferometer.from_stream`),
-which the streamed path now uses: on ALMaQUEST CO(1-0) it matched
-pyuvimage's own accumulation to 3e-13 and ran 25% faster. `pip install -e .`
-pulls it in. One trap: an autoarray installed earlier from git (which the
+**autoarray 2026.10.18.1** is the minimum. 2026.10.2.1 brought the solver
+rewrite below and autoarray's own streaming accumulation
+(`sparse_terms_from_chunks` / `Interferometer.from_stream`), which the
+streamed path uses: on ALMaQUEST CO(1-0) it matched pyuvimage's own
+accumulation to 3e-13 and ran 25% faster. 2026.10.18.1 adds the two pieces
+that accumulation lacked -- pooling of unequal real/imaginary sigmas and the
+oversampled grids point components are interpolated from -- so pyuvimage's
+own accumulation is gone, and a sparse data vector for the sparse
+inversion. `pip install -e .` pulls it in. One trap: an autoarray installed earlier from git (which the
 previous version of these instructions asked for) reports version
 `9999.0.0.dev0`, which pip counts as newer than any release, so a plain
 upgrade leaves it in place. Replace it explicitly:
 
 ```bash
-pip install --force-reinstall --no-deps "autoarray>=2026.10.2.1" "autogalaxy>=2026.10.2.1"
-python -c "from autoarray.inversion.inversion.interferometer import inversion_interferometer_util as u; print(hasattr(u, 'sparse_terms_from_chunks'))"   # True
+pip install --force-reinstall --no-deps "autoarray>=2026.10.18.1" "autogalaxy>=2026.10.18.1"
+python -c "import inspect; from autoarray.inversion.inversion.interferometer import inversion_interferometer_util as u; print('oversample' in inspect.signature(u.sparse_terms_from_chunks).parameters)"   # True
 ```
 
-With an older autoarray the streamed path still runs, on pyuvimage's own
-accumulation, and says so once at the start.
+With an older autoarray the streamed path refuses to start, naming this
+command.
 
 The solver rewrite (September 2026, in that release): the factor is
 updated in place instead of being copied with `np.insert`/`np.delete` on every
