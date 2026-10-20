@@ -1,0 +1,524 @@
+[
+  {
+    "dataset": "pj0116",
+    "path": "wtilde",
+    "wall_s": 34.01017880439758,
+    "streaming_s": 2.2349867820739746,
+    "mesh": [
+      50,
+      50
+    ],
+    "n_samples": 5158,
+    "coefficient": 6097562.352214592,
+    "chi2_per_n": 1.0480319939734695,
+    "criterion": "discrepancy",
+    "structure_ratio": 0.8338688672149931,
+    "peak_residual_sigma": 3.647490229526423,
+    "flux_jy": 0.05418529512335843,
+    "min_model": -1.4570194538001975e-06,
+    "rms_jy_beam": 4.692781883857752e-05,
+    "beam": [
+      0.6672321255864558,
+      0.437237484629747,
+      84.12611338496208
+    ],
+    "pixel_scale": 0.08,
+    "max_rss_gb": 1.072,
+    "pass_s": 8.826539278030396,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 1.0
+  },
+  {
+    "dataset": "pj0116",
+    "path": "wtilde_free",
+    "wall_s": 18.151697158813477,
+    "streaming_s": 2.2349867820739746,
+    "mesh": [
+      50,
+      50
+    ],
+    "n_samples": 5158,
+    "coefficient": 330773.9122991996,
+    "chi2_per_n": 0.9998382462518702,
+    "criterion": "discrepancy",
+    "structure_ratio": 0.5134557689809635,
+    "peak_residual_sigma": 2.5237941789895535,
+    "flux_jy": 0.053320463767157836,
+    "min_model": -9.392595172199311e-06,
+    "rms_jy_beam": 4.692781883857752e-05,
+    "beam": [
+      0.6672321255864558,
+      0.437237484629747,
+      84.12611338496208
+    ],
+    "pixel_scale": 0.08,
+    "max_rss_gb": 0.898376,
+    "pass_s": 8.826539278030396,
+    "diff_vs_wtilde": 0.014929940449036679,
+    "corr_vs_wtilde": 0.9950574992673575
+  },
+  {
+    "dataset": "pj0116",
+    "path": "matfree",
+    "wall_s": 4.01174521446228,
+    "streaming_s": 2.2349867820739746,
+    "mesh": [
+      50,
+      50
+    ],
+    "n_samples": 5158,
+    "coefficient": 1000000.0,
+    "chi2_per_n": 1.0007708561611197,
+    "criterion": "discrepancy",
+    "structure_ratio": 0.5190309232302108,
+    "peak_residual_sigma": 2.544414206991102,
+    "flux_jy": 0.053375836960390666,
+    "min_model": -8.764934297394018e-06,
+    "rms_jy_beam": 4.692781883857752e-05,
+    "beam": [
+      0.6672321255864558,
+      0.437237484629747,
+      84.12611338496208
+    ],
+    "pixel_scale": 0.08,
+    "max_rss_gb": 0.37186,
+    "pass_s": 8.826539278030396,
+    "diff_vs_wtilde": 0.013441024425274072,
+    "corr_vs_wtilde": 0.9959875512314653
+  },
+  {
+    "dataset": "pj1446",
+    "path": "wtilde",
+    "wall_s": 14.946078300476074,
+    "streaming_s": 5.687022924423218,
+    "mesh": [
+      40,
+      40
+    ],
+    "n_samples": 82156,
+    "coefficient": 6097562.352214592,
+    "chi2_per_n": 1.021051174131908,
+    "criterion": "structure",
+    "structure_ratio": 0.9966909851819153,
+    "peak_residual_sigma": 4.721910446947741,
+    "flux_jy": 0.012033580727039075,
+    "min_model": -6.772615360155969e-07,
+    "rms_jy_beam": 2.5115944816439904e-05,
+    "beam": [
+      0.42621935782148707,
+      0.35797833400856394,
+      29.32451295852661
+    ],
+    "pixel_scale": 0.05,
+    "max_rss_gb": 0.654912,
+    "pass_s": 48.31991171836853,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 1.0
+  },
+  {
+    "dataset": "pj1446",
+    "path": "wtilde_free",
+    "wall_s": 7.166869640350342,
+    "streaming_s": 5.687022924423218,
+    "mesh": [
+      40,
+      40
+    ],
+    "n_samples": 82156,
+    "coefficient": 112403866.37720557,
+    "chi2_per_n": 1.021859290960691,
+    "criterion": "structure",
+    "structure_ratio": 1.0020713263543224,
+    "peak_residual_sigma": 5.860236696917895,
+    "flux_jy": 0.011245399463118207,
+    "min_model": -4.0444498421865784e-06,
+    "rms_jy_beam": 2.5115944816439904e-05,
+    "beam": [
+      0.42621935782148707,
+      0.35797833400856394,
+      29.32451295852661
+    ],
+    "pixel_scale": 0.05,
+    "max_rss_gb": 0.618812,
+    "pass_s": 48.31991171836853,
+    "diff_vs_wtilde": 0.009383360100000746,
+    "corr_vs_wtilde": 0.9982447046583608
+  },
+  {
+    "dataset": "pj1446",
+    "path": "matfree",
+    "wall_s": 2.195309638977051,
+    "streaming_s": 5.687022924423218,
+    "mesh": [
+      40,
+      40
+    ],
+    "n_samples": 82156,
+    "coefficient": 153992652.6059492,
+    "chi2_per_n": 1.0213955470650358,
+    "criterion": "structure",
+    "structure_ratio": 0.9943904284195985,
+    "peak_residual_sigma": 5.052299530444345,
+    "flux_jy": 0.011334850144528678,
+    "min_model": -5.298865466573595e-06,
+    "rms_jy_beam": 2.5115944816439904e-05,
+    "beam": [
+      0.42621935782148707,
+      0.35797833400856394,
+      29.32451295852661
+    ],
+    "pixel_scale": 0.05,
+    "max_rss_gb": 0.37394,
+    "pass_s": 48.31991171836853,
+    "diff_vs_wtilde": 0.00959523824323973,
+    "corr_vs_wtilde": 0.9980203459146523
+  },
+  {
+    "dataset": "ruby",
+    "path": "wtilde",
+    "wall_s": 9.289901494979858,
+    "streaming_s": 6.8320653438568115,
+    "mesh": [
+      36,
+      36
+    ],
+    "n_samples": 148477,
+    "coefficient": 457252.6698969311,
+    "chi2_per_n": 1.0212459480040181,
+    "criterion": "structure",
+    "structure_ratio": 0.9979445499201514,
+    "peak_residual_sigma": 4.818235531341956,
+    "flux_jy": 0.03247251045111359,
+    "min_model": -1.0560165839014815e-06,
+    "rms_jy_beam": 2.2656821045887726e-05,
+    "beam": [
+      0.5511330956387734,
+      0.3988486896022647,
+      34.26855766773224
+    ],
+    "pixel_scale": 0.05555555555555555,
+    "max_rss_gb": 0.565224,
+    "pass_s": 76.1746757030487,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 0.9999999999999999
+  },
+  {
+    "dataset": "ruby",
+    "path": "wtilde_free",
+    "wall_s": 4.383215665817261,
+    "streaming_s": 6.8320653438568115,
+    "mesh": [
+      36,
+      36
+    ],
+    "n_samples": 148477,
+    "coefficient": 7169167.874147956,
+    "chi2_per_n": 1.0222132646089688,
+    "criterion": "structure",
+    "structure_ratio": 1.010438471933023,
+    "peak_residual_sigma": 5.820068597065284,
+    "flux_jy": 0.031655417088267405,
+    "min_model": -3.1007367198866852e-06,
+    "rms_jy_beam": 2.2656821045887726e-05,
+    "beam": [
+      0.5511330956387734,
+      0.3988486896022647,
+      34.26855766773224
+    ],
+    "pixel_scale": 0.05555555555555555,
+    "max_rss_gb": 0.544072,
+    "pass_s": 76.1746757030487,
+    "diff_vs_wtilde": 0.004286314713876026,
+    "corr_vs_wtilde": 0.9997210075165134
+  },
+  {
+    "dataset": "ruby",
+    "path": "matfree",
+    "wall_s": 2.0729525089263916,
+    "streaming_s": 6.8320653438568115,
+    "mesh": [
+      36,
+      36
+    ],
+    "n_samples": 148477,
+    "coefficient": 15399265.26059492,
+    "chi2_per_n": 1.0219162660353862,
+    "criterion": "structure",
+    "structure_ratio": 0.9943140575410074,
+    "peak_residual_sigma": 4.9728865563316615,
+    "flux_jy": 0.031683139878782955,
+    "min_model": -2.963028702010126e-06,
+    "rms_jy_beam": 2.2656821045887726e-05,
+    "beam": [
+      0.5511330956387734,
+      0.3988486896022647,
+      34.26855766773224
+    ],
+    "pixel_scale": 0.05555555555555555,
+    "max_rss_gb": 0.373428,
+    "pass_s": 76.1746757030487,
+    "diff_vs_wtilde": 0.004175072101112395,
+    "corr_vs_wtilde": 0.9997339836358388
+  },
+  {
+    "dataset": "9io9",
+    "path": "wtilde",
+    "wall_s": 77.19592761993408,
+    "streaming_s": 8.705661535263062,
+    "mesh": [
+      58,
+      58
+    ],
+    "n_samples": 164262,
+    "coefficient": 1669768.446645562,
+    "chi2_per_n": 1.0318399666024118,
+    "criterion": "structure",
+    "structure_ratio": 0.9997722260981865,
+    "peak_residual_sigma": 4.304061162622617,
+    "flux_jy": 0.010600644626350074,
+    "min_model": -8.372004245302693e-07,
+    "rms_jy_beam": 9.733378146804007e-06,
+    "beam": [
+      0.6159508748674095,
+      0.45612209550390836,
+      56.51986685395241
+    ],
+    "pixel_scale": 0.06896551724137931,
+    "max_rss_gb": 1.463288,
+    "pass_s": 15.793357133865356,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 0.9999999999999998
+  },
+  {
+    "dataset": "9io9",
+    "path": "wtilde_free",
+    "wall_s": 33.99042320251465,
+    "streaming_s": 8.705661535263062,
+    "mesh": [
+      58,
+      58
+    ],
+    "n_samples": 164262,
+    "coefficient": 22266720.10351919,
+    "chi2_per_n": 1.0311285993665646,
+    "criterion": "structure",
+    "structure_ratio": 0.9990318830422377,
+    "peak_residual_sigma": 3.6771916402991938,
+    "flux_jy": 0.008599641921294643,
+    "min_model": -2.2192055353404104e-06,
+    "rms_jy_beam": 9.733378146804007e-06,
+    "beam": [
+      0.6159508748674095,
+      0.45612209550390836,
+      56.51986685395241
+    ],
+    "pixel_scale": 0.06896551724137931,
+    "max_rss_gb": 1.307828,
+    "pass_s": 15.793357133865356,
+    "diff_vs_wtilde": 0.01137841046456672,
+    "corr_vs_wtilde": 0.997621363250168
+  },
+  {
+    "dataset": "9io9",
+    "path": "matfree",
+    "wall_s": 4.4459922313690186,
+    "streaming_s": 8.705661535263062,
+    "mesh": [
+      58,
+      58
+    ],
+    "n_samples": 164262,
+    "coefficient": 48696752.51658631,
+    "chi2_per_n": 1.0311198585809085,
+    "criterion": "structure",
+    "structure_ratio": 1.0014374296577624,
+    "peak_residual_sigma": 3.6754679810510416,
+    "flux_jy": 0.008637704097316318,
+    "min_model": -2.513726518311706e-06,
+    "rms_jy_beam": 9.733378146804007e-06,
+    "beam": [
+      0.6159508748674095,
+      0.45612209550390836,
+      56.51986685395241
+    ],
+    "pixel_scale": 0.06896551724137931,
+    "max_rss_gb": 0.37736,
+    "pass_s": 15.793357133865356,
+    "diff_vs_wtilde": 0.010948222825523388,
+    "corr_vs_wtilde": 0.9978981820076926
+  },
+  {
+    "dataset": "rebels25",
+    "path": "wtilde",
+    "wall_s": 68.5047459602356,
+    "streaming_s": 57.322492361068726,
+    "mesh": [
+      54,
+      54
+    ],
+    "n_samples": 1490400,
+    "coefficient": 922239565.1044235,
+    "chi2_per_n": 1.0090204270295573,
+    "criterion": "structure",
+    "structure_ratio": 1.0004099161153568,
+    "peak_residual_sigma": 4.931089401898311,
+    "flux_jy": 0.0035253933433044785,
+    "min_model": -1.1039525253639149e-07,
+    "rms_jy_beam": 2.556514396356903e-05,
+    "beam": [
+      0.2676792836772502,
+      0.21748939193981567,
+      -55.102919071912766
+    ],
+    "pixel_scale": 0.032407407407407406,
+    "max_rss_gb": 1.210808,
+    "pass_s": 103.50342988967896,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 0.9999999999999998
+  },
+  {
+    "dataset": "rebels25",
+    "path": "wtilde_free",
+    "wall_s": 27.462128400802612,
+    "streaming_s": 57.322492361068726,
+    "mesh": [
+      54,
+      54
+    ],
+    "n_samples": 1490400,
+    "coefficient": 1715437896.3428788,
+    "chi2_per_n": 1.0090244366870862,
+    "criterion": "structure",
+    "structure_ratio": 1.0025500140046644,
+    "peak_residual_sigma": 4.1261991841886765,
+    "flux_jy": 0.002400671957486348,
+    "min_model": -9.465391401645275e-07,
+    "rms_jy_beam": 2.556514396356903e-05,
+    "beam": [
+      0.2676792836772502,
+      0.21748939193981567,
+      -55.102919071912766
+    ],
+    "pixel_scale": 0.032407407407407406,
+    "max_rss_gb": 1.080332,
+    "pass_s": 103.50342988967896,
+    "diff_vs_wtilde": 0.02791710569027402,
+    "corr_vs_wtilde": 0.9782481164054312
+  },
+  {
+    "dataset": "rebels25",
+    "path": "matfree",
+    "wall_s": 39.58982467651367,
+    "streaming_s": 57.322492361068726,
+    "mesh": [
+      54,
+      54
+    ],
+    "n_samples": 1490400,
+    "coefficient": 2738419634.2643614,
+    "chi2_per_n": 1.0090210685841159,
+    "criterion": "structure",
+    "structure_ratio": 1.001854786771279,
+    "peak_residual_sigma": 4.0629149499653225,
+    "flux_jy": 0.0027242179800894303,
+    "min_model": -3.556134814437425e-07,
+    "rms_jy_beam": 2.556514396356903e-05,
+    "beam": [
+      0.2676792836772502,
+      0.21748939193981567,
+      -55.102919071912766
+    ],
+    "pixel_scale": 0.032407407407407406,
+    "max_rss_gb": 0.373336,
+    "pass_s": 103.50342988967896,
+    "diff_vs_wtilde": 0.03137596785908155,
+    "corr_vs_wtilde": 0.9605542000626675
+  },
+  {
+    "dataset": "ngc4274_64",
+    "path": "wtilde",
+    "wall_s": 429.1544096469879,
+    "streaming_s": 96.1397852897644,
+    "mesh": [
+      64,
+      64
+    ],
+    "n_samples": 2601100,
+    "coefficient": 330773.9122991996,
+    "chi2_per_n": 1.3546130477983753,
+    "criterion": "structure",
+    "structure_ratio": 1.006727295693292,
+    "peak_residual_sigma": 6.015878845460621,
+    "flux_jy": 2.055230836195128,
+    "min_model": -9.0503367344655e-05,
+    "rms_jy_beam": 0.00011076495254703935,
+    "beam": [
+      1.341967594652629,
+      0.7660666782940699,
+      -10.901975929737091
+    ],
+    "pixel_scale": 0.2734375,
+    "max_rss_gb": 1.99902,
+    "pass_s": 111.40581727027893,
+    "diff_vs_wtilde": 0.0,
+    "corr_vs_wtilde": 1.0
+  },
+  {
+    "dataset": "ngc4274_64",
+    "path": "wtilde_free",
+    "wall_s": 74.08693671226501,
+    "streaming_s": 96.1397852897644,
+    "mesh": [
+      64,
+      64
+    ],
+    "n_samples": 2601100,
+    "coefficient": 173093.6954659055,
+    "chi2_per_n": 1.3545774727215345,
+    "criterion": "structure",
+    "structure_ratio": 0.991394212056551,
+    "peak_residual_sigma": 5.640838257860254,
+    "flux_jy": 1.425681444542218,
+    "min_model": -0.00014719239582068204,
+    "rms_jy_beam": 0.00011076495254703935,
+    "beam": [
+      1.341967594652629,
+      0.7660666782940699,
+      -10.901975929737091
+    ],
+    "pixel_scale": 0.2734375,
+    "max_rss_gb": 1.74112,
+    "pass_s": 111.40581727027893,
+    "diff_vs_wtilde": 0.07395711960540044,
+    "corr_vs_wtilde": 0.8203795934565472
+  },
+  {
+    "dataset": "ngc4274_64",
+    "path": "matfree",
+    "wall_s": 11.507372617721558,
+    "streaming_s": 96.1397852897644,
+    "mesh": [
+      64,
+      64
+    ],
+    "n_samples": 2601100,
+    "coefficient": 205352.50264571462,
+    "chi2_per_n": 1.354621369049046,
+    "criterion": "structure",
+    "structure_ratio": 0.998568199106265,
+    "peak_residual_sigma": 5.452820127389363,
+    "flux_jy": 1.15256231642328,
+    "min_model": -0.00010577017455037913,
+    "rms_jy_beam": 0.00011076495254703935,
+    "beam": [
+      1.341967594652629,
+      0.7660666782940699,
+      -10.901975929737091
+    ],
+    "pixel_scale": 0.2734375,
+    "max_rss_gb": 0.379984,
+    "pass_s": 111.40581727027893,
+    "diff_vs_wtilde": 0.07618380243841638,
+    "corr_vs_wtilde": 0.8544397120551174
+  }
+]
