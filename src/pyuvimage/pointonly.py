@@ -1284,8 +1284,9 @@ def run_points(
     if np.isfinite(rho) and rho > 1.0 + STRUCTURE_WARN_SIGMAS * rho_sigma:
         logger.warning(
             "the residual near the components has structure they do not describe: "
-            "structure ratio %.3f, %.1f sigma above 1 (chi^2/N %.4f). The statistical "
-            "errors assume the model is right; look at residual.fits", rho,
+            "structure ratio %.3f, %.1f sigma above 1 (chi^2/N %.4f). The errors are "
+            "statistical and assume the model is right, so they may be too small; "
+            "look at residual.fits", rho,
             (rho - 1.0) / rho_sigma, fit.chi2_per_n)
     restored = restore_points(geometry.shape_native, geometry.pixel_scale, fit.points, beam)
     restored = restore_gaussians(geometry.shape_native, geometry.pixel_scale, fit.gaussians,

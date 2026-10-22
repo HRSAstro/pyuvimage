@@ -367,8 +367,16 @@ grows (excess over noise in units of each statistic's own sigma;
 | 8 mJy | +3.7 sigma | +24 sigma | 672 |
 | 16 mJy | -0.3 sigma | +8.6 sigma | |
 
-The right model gives -1.6 and -0.3 sigma. The errors are still scaled by
-chi^2/N only.
+The right model gives -1.6 and -0.3 sigma.
+
+The errors are scaled by chi^2/N only (which corrects noise that is off by
+one factor everywhere), **not** by the structure ratio: a high ratio raises a
+warning instead. Inflating by it was tested (20 realisations at 1, 4 and 8
+mJy): it restored the coverage when a faint companion was missed, but over-
+covered parameters the misfit hardly touches, and could not rescue a source
+fitted with the wrong shape (a Gaussian fitted as a point kept 4.9 of 10 mJy,
+11-29 inflated errors from the truth). The warning, and the residual, are the
+useful answer there.
 
 Limits: in memory only (the streamed grids would need an anisotropic
 smoothing of the oversampled kernel per trial shape); a Gaussian's
