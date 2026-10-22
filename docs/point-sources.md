@@ -336,17 +336,39 @@ data at all*: chi^2/N is a poor judge with many visibilities (it is
 dominated by the ones that only see noise, sigma(chi^2/N) = sqrt(2/N)), so
 every components-only fit also reports the residual map's **structure ratio**
 (`fit_quality.structure_ratio`, with its noise sigma), and warns when it is
-more than 3 sigma above 1. Measured on the mock above with the Gaussian
-wrongly fitted as a point, as the noise grows:
+more than 3 sigma above 1.
+
+It is measured **within two restoring-beam FWHM of each component** (plus half
+a Gaussian's major FWHM; `STRUCTURE_RADIUS_BEAMS`). Components-only fits are
+meant for compact sources, and empty sky far from them would dilute the
+residual left at the source; the whole-field value is kept as
+`structure_ratio_field`. Two details make the local value calibrated:
+
+- its noise sigma comes from the region itself: the residual of pure noise is
+  correlated like the dirty beam B, so the mean square over the region has
+  variance 2 sum_pq m_p m_q B(p-q)^2 / n^2 (m the region mask, n its pixels),
+  one convolution of the mask with B^2;
+- each fitted parameter absorbs one independent piece of the noise near the
+  components, so for a right model the ratio is divided by
+  sqrt(1 - k / n_eff), with k the fitted parameters and n_eff = 1 / (2
+  sigma^2) the independent noise values in the region. Over 30 realisations
+  of the Gaussian + point mock (9 parameters, n_eff ~ 63) the raw ratio was
+  0.923 +- 0.071 against 0.926 expected; corrected, 0.997, and 0.987 for the
+  two-point mock. The predicted sigma is ~20% conservative.
+
+On the mock above with the Gaussian wrongly fitted as a point, as the noise
+grows (excess over noise in units of each statistic's own sigma;
+`scripts/figure_structure_vs_chi2.py`):
 
 | noise | chi^2/N | structure ratio | Delta chi^2, point -> Gaussian |
 |---|---|---|---|
-| 1 mJy | 6.50 (+348 sigma) | 6.97 (+97 sigma) | 44215 |
-| 4 mJy | 1.32 (+20 sigma) | 3.93 (+47 sigma) | 2732 |
-| 8 mJy | 1.06 (+3.7 sigma) | 2.30 (+21 sigma) | 672 |
+| 1 mJy | +348 sigma | +101 sigma | 44215 |
+| 4 mJy | +20 sigma | +51 sigma | 2732 |
+| 8 mJy | +3.7 sigma | +24 sigma | 672 |
+| 16 mJy | -0.3 sigma | +8.6 sigma | |
 
-The right model gives chi^2/N 0.97 and a structure ratio 0.91 (-1.5 sigma)
-at every noise level. The errors are still scaled by chi^2/N only.
+The right model gives -1.6 and -0.3 sigma. The errors are still scaled by
+chi^2/N only.
 
 Limits: in memory only (the streamed grids would need an anisotropic
 smoothing of the oversampled kernel per trial shape); a Gaussian's

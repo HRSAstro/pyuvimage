@@ -97,7 +97,8 @@ def test_the_residual_structure_ratio_flags_a_missing_size(uvd, fitted, caplog):
                       point_sources=[(-GAUSS["dra"], GAUSS["ddec"]), (-POINT[0], POINT[1])])
     fq = bad.parameters["fit_quality"]
     assert fq["structure_ratio"] > 1 + 3 * fq["structure_ratio_noise_sigma"]
-    assert "structure the components do not describe" in caplog.text
+    assert "structure they do not describe" in caplog.text
+    assert fq["structure_region_pixels"] < 0.5 * np.prod(bad.residual.shape)
 
 
 def test_the_jacobian_is_the_derivative(uvd):

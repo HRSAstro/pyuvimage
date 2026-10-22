@@ -77,6 +77,68 @@ POSSIBLY_UNRESOLVED_MINOR = "possibly unresolved along the minor axis"
 #: a residual structure ratio this many of its noise sigmas above 1 is
 #: reported as structure the components do not describe
 STRUCTURE_WARN_SIGMAS = 3.0
+#: the structure ratio is measured within this many restoring-beam FWHM of
+#: each component (plus half a Gaussian's major FWHM): components-only fits
+#: are meant for compact sources, and empty sky far from them would dilute
+#: the residual left at the source
+STRUCTURE_RADIUS_BEAMS = 2.0
+
+
+def structure_region(shape, pixel_scale, components, beam_fwhm,
+                     radius_beams=STRUCTURE_RADIUS_BEAMS) -> np.ndarray:
+    """Pixels within ``radius_beams`` beams of any component (native array,
+    row 0 at the top). ``components`` are (dRA, dDec, extra_radius) arcsec."""
+    n_y, n_x = (int(v) for v in shape)
+    iy, ix = np.mgrid[0:n_y, 0:n_x]
+    x = (ix - (n_x - 1) / 2.0) * pixel_scale          # grid x = -dRA
+    y = ((n_y - 1) / 2.0 - iy) * pixel_scale
+    inside = np.zeros((n_y, n_x), bool)
+    for d_ra, d_dec, extra in components:
+        r = radius_beams * beam_fwhm + extra
+        inside |= (x + d_ra) ** 2 + (y - d_dec) ** 2 <= r * r
+    return inside
+
+
+def structure_ratio_in(residual, rms, chi2, n_data, inside, n_fitted=0,
+                       noise_sigma=None) -> float:
+    """rms of the residual map [sigma] over ``inside``, over sqrt(chi^2/N).
+
+    Each of the ``n_fitted`` parameters absorbs one independent piece of the
+    noise near the components, so for a right model the residual's mean
+    square there is 1 - n_fitted / n_eff of the noise's, with n_eff the
+    number of independent noise values in the region, 1 / (2 noise_sigma^2)
+    (`structure_scatter_in`). The ratio is divided by the root of that, so a
+    right model gives 1: on the Gaussian + point mock (9 parameters, ~63
+    independent values) the raw ratio was 0.923 +- 0.071 over 30
+    realisations, against 0.926 expected.
+    """
+    r = np.asarray(residual, dtype=float)[inside] / rms
+    if r.size < 2:
+        return float("nan")
+    rho = float(np.std(r) / np.sqrt(chi2 / n_data))
+    if n_fitted and noise_sigma and np.isfinite(noise_sigma):
+        rho /= np.sqrt(max(1.0 - 2.0 * n_fitted * noise_sigma ** 2, 0.25))
+    return rho
+
+
+def structure_scatter_in(dirty_beam, inside) -> float:
+    """1-sigma scatter of `structure_ratio_in` from noise alone.
+
+    The residual of pure noise is a Gaussian field correlated like the dirty
+    beam B, so its mean square over the n pixels of a region has variance
+    2 sum_pq m_p m_q B(p - q)^2 / n^2 (m the region mask), and the rms half
+    that relative error. The double sum is one convolution of the mask with
+    B^2. Over the whole grid this is `fitting.structure_ratio_scatter`.
+    """
+    from scipy.signal import fftconvolve
+
+    m = np.asarray(inside, dtype=float)
+    n = m.sum()
+    if n < 2:
+        return float("nan")
+    b2 = np.nan_to_num(np.asarray(dirty_beam, dtype=float)) ** 2
+    pairs = float(np.sum(m * fftconvolve(m, b2, mode="same")))
+    return float(0.5 * np.sqrt(2.0 * pairs) / n)
 
 
 # ---------------------------------------------------------------------------
@@ -1208,13 +1270,22 @@ def run_points(
     # goodness of fit in the image plane: chi^2/N is dominated by the many
     # visibilities that see only noise, while the residual map's rms against
     # what white noise of this chi^2 would give shows the structure left behind
-    rho = fitting._structure_ratio_from_map(residual, fit.chi_squared, imager, fit.n_data)
-    rho_sigma = fitting.structure_ratio_scatter(imager)
+    # -- measured near the components, where a missing size or a missed
+    # companion leaves its residual (`structure_region`)
+    region = structure_region(
+        residual.shape, geometry.pixel_scale,
+        [(p.d_ra, p.d_dec, 0.0) for p in fit.points]
+        + [(g.d_ra, g.d_dec, 0.5 * g.fwhm_major) for g in fit.gaussians],
+        float(np.sqrt(beam.bmaj_arcsec * beam.bmin_arcsec)))
+    rho_sigma = structure_scatter_in(imager.dirty_beam, region)
+    rho = structure_ratio_in(residual, rms, fit.chi_squared, fit.n_data, region,
+                             n_fitted=int(np.shape(fit.covariance)[0]), noise_sigma=rho_sigma)
+    rho_field = fitting._structure_ratio_from_map(residual, fit.chi_squared, imager, fit.n_data)
     if np.isfinite(rho) and rho > 1.0 + STRUCTURE_WARN_SIGMAS * rho_sigma:
         logger.warning(
-            "the residual has structure the components do not describe: structure "
-            "ratio %.3f, %.1f sigma above 1 (chi^2/N %.4f). The statistical errors "
-            "assume the model is right; look at residual.fits", rho,
+            "the residual near the components has structure they do not describe: "
+            "structure ratio %.3f, %.1f sigma above 1 (chi^2/N %.4f). The statistical "
+            "errors assume the model is right; look at residual.fits", rho,
             (rho - 1.0) / rho_sigma, fit.chi2_per_n)
     restored = restore_points(geometry.shape_native, geometry.pixel_scale, fit.points, beam)
     restored = restore_gaussians(geometry.shape_native, geometry.pixel_scale, fit.gaussians,
@@ -1267,6 +1338,9 @@ def run_points(
                         "chi2_per_n": fit.chi2_per_n,
                         "structure_ratio": float(rho),
                         "structure_ratio_noise_sigma": float(rho_sigma),
+                        "structure_radius_beams": STRUCTURE_RADIUS_BEAMS,
+                        "structure_region_pixels": int(region.sum()),
+                        "structure_ratio_field": float(rho_field),
                         "residual_peak_sigma": float(np.nanmax(np.abs(residual))) / rms},
         "uncertainty": {
             "type": "statistical",

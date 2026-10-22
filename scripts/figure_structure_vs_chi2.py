@@ -14,7 +14,8 @@ Columns, one row per noise level:
   1, 2  residual dirty image [sigma] of the wrong / right model, with chi^2/N and
         the structure ratio rho and their excesses over noise:
             chi^2/N:  (chi^2/N - 1) / sqrt(2/N)
-            rho:      (rho - 1) / sigma_rho   (`fitting.structure_ratio_scatter`)
+            rho:      (rho - 1) / sigma_rho, measured within two beams of the
+                      components (`pointonly.structure_region`)
   3     |r / sigma|^2 / 2 against uv distance in bins (1 for noise). A point's
         flux is a compromise between the short baselines, which see all of the
         Gaussian, and the long ones, which see less: too low on one end, too
