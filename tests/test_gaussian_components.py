@@ -79,10 +79,25 @@ def test_a_point_fitted_as_a_gaussian_is_unresolved():
     res = api.run(uvd, fov=4.0, points_only=True, write=False,
                   gaussians=[(-0.53, -0.31, 0.3)], point_sources=[(0.92, 0.74)])
     (g,) = res.fit.gaussians
-    assert g.resolved == "no"
+    assert g.resolved == pointonly.POSSIBLY_UNRESOLVED == "possibly unresolved"
     assert g.delta_chi2_vs_point < pointonly.RESOLVED_DELTA_CHI2
     assert 0 < g.fwhm_upper_limit < 0.2 * res.beam.bmaj_arcsec
-    assert g.as_dict()["resolved"] == "no"
+    assert g.as_dict()["resolved"] == "possibly unresolved"
+
+
+def test_the_residual_structure_ratio_flags_a_missing_size(uvd, fitted, caplog):
+    """A Gaussian fitted as a point leaves structure: the image-plane
+    structure ratio says so, where chi^2/N barely moves."""
+    import logging
+
+    fq = fitted.parameters["fit_quality"]
+    assert abs(fq["structure_ratio"] - 1) < 4 * fq["structure_ratio_noise_sigma"]
+    with caplog.at_level(logging.WARNING, logger="pyuvimage"):
+        bad = api.run(uvd, fov=4.0, points_only=True, write=False,
+                      point_sources=[(-GAUSS["dra"], GAUSS["ddec"]), (-POINT[0], POINT[1])])
+    fq = bad.parameters["fit_quality"]
+    assert fq["structure_ratio"] > 1 + 3 * fq["structure_ratio_noise_sigma"]
+    assert "structure the components do not describe" in caplog.text
 
 
 def test_the_jacobian_is_the_derivative(uvd):

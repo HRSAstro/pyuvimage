@@ -70,6 +70,13 @@ SIZE_FLOOR_PIXELS = 1e-3
 RESOLVED_DELTA_CHI2 = 9.0
 #: Delta chi^2 that sets a one-sided 95% upper limit on an unresolved size
 UPPER_LIMIT_DELTA_CHI2 = 2.706
+#: `FittedGaussian.resolved` when the likelihood cannot tell the Gaussian
+#: from a point, or its minor axis from zero
+POSSIBLY_UNRESOLVED = "possibly unresolved"
+POSSIBLY_UNRESOLVED_MINOR = "possibly unresolved along the minor axis"
+#: a residual structure ratio this many of its noise sigmas above 1 is
+#: reported as structure the components do not describe
+STRUCTURE_WARN_SIGMAS = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +531,9 @@ class FittedGaussian:
     fwhm_minor_error: float
     pa_deg: float                # major axis, east of north, [0, 180)
     pa_error_deg: float
-    #: "yes", "major axis only" or "no" (consistent with a point); see
-    #: `resolution_test`. Sizes and their errors mean little when "no".
+    #: "yes", "possibly unresolved along the minor axis" or "possibly
+    #: unresolved" (the data cannot tell it from a point); see
+    #: `resolution_test`. Sizes and their errors mean little when not "yes".
     resolved: str | None = None
     delta_chi2_vs_point: float | None = None     # Gaussian over point
     delta_chi2_vs_line: float | None = None      # over a zero minor axis
@@ -718,13 +726,18 @@ def resolution_test(backend, geometry, model, res, index, inflation, beam, notes
     boundary -- so the test is a likelihood ratio instead. With every other
     parameter of every component re-fitted each time:
 
-    * Delta chi^2 (point -> Gaussian) below `RESOLVED_DELTA_CHI2`: **not
-      resolved**, and the 95% upper limit on a circular FWHM is where chi^2
-      rises `UPPER_LIMIT_DELTA_CHI2` above the point fit's;
+    * Delta chi^2 (point -> Gaussian) below `RESOLVED_DELTA_CHI2`: **possibly
+      unresolved** -- the likelihood cannot tell it from a point -- and the 95%
+      upper limit on a circular FWHM is where chi^2 rises
+      `UPPER_LIMIT_DELTA_CHI2` above the point fit's;
     * else Delta chi^2 (line -> Gaussian), the minor axis held at zero, below
-      it: **resolved along the major axis only**, with a 95% upper limit on
-      the minor axis the same way;
-    * else **resolved**.
+      it: **possibly unresolved along the minor axis**, with a 95% upper limit
+      on the minor axis the same way;
+    * else **resolved** ("yes").
+
+    The likelihood ratio carries both things that decide whether a size
+    below the beam can be measured -- the source's S/N and this
+    observation's uv coverage -- so no beam-fraction rule is needed.
 
     Delta chi^2 are divided by the chi^2/N inflation, as the errors are
     multiplied by it. Returns (resolved, d_point, d_line, fwhm_limit,
@@ -771,12 +784,12 @@ def resolution_test(backend, geometry, model, res, index, inflation, beam, notes
     beam_sigma = float(beam) / FWHM_PER_SIGMA
     limit = minor_limit = None
     if d_point < RESOLVED_DELTA_CHI2:
-        resolved = "no"
+        resolved = POSSIBLY_UNRESOLVED
         limit = upper_limit(
             lambda sig: chi2_with("gaussian", {0: sig, 1: sig, 2: 0.0}), chi_point,
             max(shape[major], 0.25 * beam_sigma))
     elif d_line < RESOLVED_DELTA_CHI2:
-        resolved = "major axis only"
+        resolved = POSSIBLY_UNRESOLVED_MINOR
         minor_limit = upper_limit(
             lambda sig: chi2_with("gaussian", {1 - major: sig}), base,
             max(shape[1 - major], 0.25 * beam_sigma))
@@ -1192,6 +1205,17 @@ def run_points(
             [None] * len(fit.grid_positions) + [c[1] for c in fit.gaussian_components])
     else:
         residual = backend.residual_image(fit.grid_positions, fit.amplitudes)
+    # goodness of fit in the image plane: chi^2/N is dominated by the many
+    # visibilities that see only noise, while the residual map's rms against
+    # what white noise of this chi^2 would give shows the structure left behind
+    rho = fitting._structure_ratio_from_map(residual, fit.chi_squared, imager, fit.n_data)
+    rho_sigma = fitting.structure_ratio_scatter(imager)
+    if np.isfinite(rho) and rho > 1.0 + STRUCTURE_WARN_SIGMAS * rho_sigma:
+        logger.warning(
+            "the residual has structure the components do not describe: structure "
+            "ratio %.3f, %.1f sigma above 1 (chi^2/N %.4f). The statistical errors "
+            "assume the model is right; look at residual.fits", rho,
+            (rho - 1.0) / rho_sigma, fit.chi2_per_n)
     restored = restore_points(geometry.shape_native, geometry.pixel_scale, fit.points, beam)
     restored = restore_gaussians(geometry.shape_native, geometry.pixel_scale, fit.gaussians,
                                  beam, existing=restored)
@@ -1214,13 +1238,15 @@ def run_points(
                     i + 1, g.d_ra, g.d_dec, 1e3 * g.d_ra_error, 1e3 * g.d_dec_error, g.flux,
                     g.flux_error, g.fwhm_major, g.fwhm_major_error, g.fwhm_minor,
                     g.fwhm_minor_error, g.pa_deg, g.pa_error_deg, pb)
-        if g.resolved == "no":
-            logger.info("    not resolved: consistent with a point (Delta chi^2 %.1f over a "
-                        "point); FWHM < %.4g\" (95%%)", g.delta_chi2_vs_point,
+        if g.resolved == POSSIBLY_UNRESOLVED:
+            logger.info("    the source might be unresolved: a point fits the data as well "
+                        "(Delta chi^2 %.1f < %g); FWHM < %.4g\" (95%%)", g.delta_chi2_vs_point,
+                        RESOLVED_DELTA_CHI2,
                         g.fwhm_upper_limit if g.fwhm_upper_limit is not None else float("nan"))
-        elif g.resolved == "major axis only":
-            logger.info("    resolved along the major axis only (Delta chi^2 %.1f over a "
-                        "line); minor FWHM < %.4g\" (95%%)", g.delta_chi2_vs_line,
+        elif g.resolved == POSSIBLY_UNRESOLVED_MINOR:
+            logger.info("    resolved along the major axis; the minor axis might be "
+                        "unresolved (Delta chi^2 %.1f over a line < %g); minor FWHM < "
+                        "%.4g\" (95%%)", g.delta_chi2_vs_line, RESOLVED_DELTA_CHI2,
                         g.fwhm_minor_upper_limit if g.fwhm_minor_upper_limit is not None
                         else float("nan"))
         else:
@@ -1239,6 +1265,8 @@ def run_points(
         "rms_jy_beam": rms,
         "fit_quality": {"chi_squared": fit.chi_squared, "n_data": fit.n_data,
                         "chi2_per_n": fit.chi2_per_n,
+                        "structure_ratio": float(rho),
+                        "structure_ratio_noise_sigma": float(rho_sigma),
                         "residual_peak_sigma": float(np.nanmax(np.abs(residual))) / rms},
         "uncertainty": {
             "type": "statistical",

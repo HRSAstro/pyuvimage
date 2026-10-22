@@ -310,23 +310,48 @@ other parameter of every component re-fitted each time
 
 | `resolved` | test (Delta chi^2 / inflation) | limit reported |
 |---|---|---|
-| `no` (consistent with a point) | point -> Gaussian < 9 | `fwhm_upper_limit`: circular FWHM where chi^2 is 2.71 above the point fit (95%, one-sided) |
-| `major axis only` | line (minor axis 0) -> Gaussian < 9 | `fwhm_minor_upper_limit` the same way |
+| `possibly unresolved` (the likelihood cannot tell it from a point) | point -> Gaussian < 9 | `fwhm_upper_limit`: circular FWHM where chi^2 is 2.71 above the point fit (95%, one-sided) |
+| `possibly unresolved along the minor axis` | line (minor axis 0) -> Gaussian < 9 | `fwhm_minor_upper_limit` the same way |
 | `yes` | both >= 9 | -- |
+
+Whether a size below the beam can be measured depends on the source's S/N
+*and* the observation's uv coverage; the likelihood ratio carries both, so no
+rule in beam fractions is applied.
 
 `delta_chi2_vs_point` and `delta_chi2_vs_line` are reported, and
 `summary.png` draws an unresolved or one-axis Gaussian's ellipse dashed.
 Calibrated on mocks (a 92 sigma source under a 0.7" beam, 60 and 40 noise
 realisations): for a true point, Delta chi^2 over a point has median 0.6,
 95th percentile 4.7 and 99th 7.9 (none of 60 called resolved); a 0.05"
-Gaussian was called unresolved every time with limits (median 0.11") above
+Gaussian was called possibly unresolved every time with limits (median 0.11") above
 the truth in 40 of 40; a circular 0.15" Gaussian was resolved along one
 axis (34 of 40) or both (6), and its minor-axis limit covered the truth in
 97%.
+
+**Is the fit good?** Two different questions, two statistics. *Which of two
+nested models* (point or Gaussian): the chi^2 difference, which is the
+likelihood ratio -- the noise of the visibilities that see no source cancels
+in it, so it is the most sensitive test there is. *Does the model describe the
+data at all*: chi^2/N is a poor judge with many visibilities (it is
+dominated by the ones that only see noise, sigma(chi^2/N) = sqrt(2/N)), so
+every components-only fit also reports the residual map's **structure ratio**
+(`fit_quality.structure_ratio`, with its noise sigma), and warns when it is
+more than 3 sigma above 1. Measured on the mock above with the Gaussian
+wrongly fitted as a point, as the noise grows:
+
+| noise | chi^2/N | structure ratio | Delta chi^2, point -> Gaussian |
+|---|---|---|---|
+| 1 mJy | 6.50 (+348 sigma) | 6.97 (+97 sigma) | 44215 |
+| 4 mJy | 1.32 (+20 sigma) | 3.93 (+47 sigma) | 2732 |
+| 8 mJy | 1.06 (+3.7 sigma) | 2.30 (+21 sigma) | 672 |
+
+The right model gives chi^2/N 0.97 and a structure ratio 0.91 (-1.5 sigma)
+at every noise level. The errors are still scaled by chi^2/N only.
 
 Limits: in memory only (the streamed grids would need an anisotropic
 smoothing of the oversampled kernel per trial shape); a Gaussian's
 primary-beam correction uses the PB at its centre; a source with no
 measurable size is still fitted at a size that noise alone pushes above
 zero (a 270 sigma point: 0.069 +- 0.015"), so read `resolved` before the size
--- that point is reported as not resolved (Delta chi^2 5.3) with FWHM < 0.052".
+-- that point is reported as possibly unresolved (Delta chi^2 5.3) with FWHM <
+0.052".
