@@ -230,7 +230,12 @@ corrected, and RA/Dec are given.
 ```bash
 pyuvimage fit mydata/ --fov 3.0 --points-only                 # detect
 pyuvimage fit mydata/ --fov 3.0 --points-only --point 0.70,0.80
+pyuvimage fit mydata/ --fov 3.0 --points-only --gaussian 0.2,-0.1,0.4 --point 0.7,0.8
 ```
+
+`--gaussian x,y[,fwhm[,fwhm_min,pa]]` adds an elliptical Gaussian (you give
+it; it is never detected): position, size, PA and flux are fitted jointly with
+any points, and all get statistical errors. Fitted in memory.
 
 Details: [docs/point-sources.md](docs/point-sources.md).
 

@@ -80,13 +80,14 @@ def _lookup(parser: argparse.ArgumentParser) -> dict[str, argparse.Action]:
 
 
 def _pair_text(value: Any) -> Any:
-    """``[x, y]`` -> ``"x,y"`` so the flag's own parser reads it."""
+    """``[x, y]`` -> ``"x,y"`` so the flag's own parser reads it; likewise
+    the 3 or 5 numbers of a ``--gaussian``."""
     if (
-        isinstance(value, (list, tuple)) and len(value) == 2
+        isinstance(value, (list, tuple)) and 2 <= len(value) <= 5
         and all(isinstance(v, (int, float)) and not isinstance(v, bool)
                 for v in value)
     ):
-        return f"{value[0]},{value[1]}"
+        return ",".join(str(v) for v in value)
     return value
 
 
@@ -225,8 +226,9 @@ INPUT_RECORD = "input_parameters.json"
 
 
 def _pair_value(text: str) -> list[float]:
-    x, y = (float(v) for v in str(text).replace("(", "").replace(")", "").split(","))
-    return [x, y]
+    """"x,y" (or a --gaussian's 3 or 5 numbers) -> a list of floats."""
+    return [float(v) for v in str(text).replace("(", "").replace(")", "").split(",")
+            if v.strip()]
 
 
 def config_from_args(

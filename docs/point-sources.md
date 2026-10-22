@@ -264,5 +264,46 @@ the products' WCS, flux and errors, the primary-beam response at the position
 and the PB-corrected flux (when the dish diameter is known), and the full
 covariance; `model.fits` (each flux in its nearest pixel), `model_reconvolved
 .fits` (the points restored with the fitted beam), `dirty_image.fits`,
-`residual.fits` (sigma) and `summary.png`. MFS only; no Gaussian widths (a
-resolved source shows up as residual structure and chi^2/N > 1).
+`residual.fits` (sigma) and `summary.png`. MFS only.
+
+### Gaussian components (`--gaussian`)
+
+User-given only: `--gaussian x,y` (start at half the beam), `x,y,fwhm` or
+`x,y,fwhm_major,fwhm_minor,pa` [arcsec, degrees east of north], repeatable.
+An elliptical Gaussian of flux F and covariance S has the visibilities
+`F exp(-2 pi i u.mu) exp(-2 pi^2 u^T S u)`, with
+`u^T S u = s_maj^2 u_maj^2 + s_min^2 u_min^2`, `u_maj = v cos PA - u sin PA`,
+`u_min = u cos PA + v sin PA` (the major axis turned from north toward east).
+
+Everything is fitted jointly -- each Gaussian's flux, position, ln s_a,
+ln s_b and theta, and each point's flux and position (held with
+`--fixed-points`) -- by trust-region least squares
+(`scipy.optimize.least_squares`) on the noise-weighted visibility residual,
+with an analytic Jacobian (pinned against finite differences). Errors:
+`(J^T J)^-1` at the solution (the Gauss-Newton inverse Fisher matrix) times
+`max(1, chi^2/N)`; reported as FWHM major/minor and PA with their errors
+(the axes are swapped and PA moved by 90 deg if the fit turns the minor axis
+into the major), and the full covariance in `point_sources.json` in the
+fitted parameters (labelled).
+
+Points are detected as well only with `--point-sources`: the Gaussians are
+fitted first, points searched with their geometry held (their fluxes
+re-fitted), then everything refitted together; a detected point that falls
+below `--point-significance` once the Gaussians are free again is dropped.
+
+Measured on an elliptical Gaussian (FWHM 0.6" x 0.3", PA 30 deg, 10 mJy)
+plus a 3 mJy point, drawn in the image plane with the PA written out by hand,
+under a 0.5" beam, started round, too small and shifted: over 50 noise
+realisations the pulls of all nine parameters have widths 0.87-1.10 and means
+within 0.22. `model.fits` holds each Gaussian integrated over the pixels and
+`model_reconvolved.fits` each one convolved with the restoring beam (flux to
+1e-3); `summary.png` draws their FWHM ellipses.
+
+Limits: in memory only (the streamed grids would need an anisotropic
+smoothing of the oversampled kernel per trial shape); a Gaussian's
+primary-beam correction uses the PB at its centre; a source with no
+measurable size is fitted at a size that noise alone pushes above zero, with
+errors that do not describe that boundary: a 270 sigma point under a 0.7" beam
+came back with a major axis of 0.069 +- 0.015" and its minor axis at the
+1e-3-pixel floor. Sizes well below the beam / S/N are not detections of a
+size; fit a point there.

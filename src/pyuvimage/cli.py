@@ -78,6 +78,21 @@ def _parse_spw(text: str):
     return ids[0] if len(ids) == 1 else sorted(set(ids))
 
 
+def _parse_gaussian(text: str) -> tuple:
+    """--gaussian x,y[,fwhm[,fwhm_min,pa]] -> (x, y, fwhm_maj, fwhm_min, pa)."""
+    parts = [q for q in text.replace("(", "").replace(")", "").split(",") if q.strip()]
+    try:
+        vals = [float(q) for q in parts]
+    except ValueError:
+        raise SystemExit(f"--gaussian: {text!r} is not x,y[,fwhm[,fwhm_min,pa]]")
+    if len(vals) not in (2, 3, 5):
+        raise SystemExit(f"--gaussian: {text!r}: give x,y, x,y,fwhm or "
+                         "x,y,fwhm_major,fwhm_minor,pa")
+    if len(vals) == 3:
+        vals += [vals[2], None]
+    return tuple(vals) + (None,) * (5 - len(vals))
+
+
 def _hint_negative_centre(argv: list[str]) -> None:
     """argparse reads `--image-centre -2.3,0.3` as a missing argument.
 
@@ -87,7 +102,8 @@ def _hint_negative_centre(argv: list[str]) -> None:
     it before argparse does.
     """
     for i, a in enumerate(argv):
-        if a in ("--image-centre", "--point", "--envelope-centre", "--centre") and i + 1 < len(argv):
+        if a in ("--image-centre", "--point", "--gaussian", "--envelope-centre",
+                 "--centre") and i + 1 < len(argv):
             nxt = argv[i + 1]
             if nxt.startswith("-") and "," in nxt:
                 raise SystemExit(
@@ -480,6 +496,15 @@ def main(argv: list[str] | None = None) -> int:
              "1). MFS only",
     )
     p_fit.add_argument(
+        "--gaussian", action="append", metavar="x,y[,fwhm[,fwhm_min,pa]]", default=None,
+        help="with --points-only: an elliptical Gaussian component starting at "
+             "image offset x,y [arcsec] (axes as --point), optionally with a "
+             "FWHM, or major and minor FWHM [arcsec] and PA [deg east of "
+             "north]. Position, size, PA and flux are all fitted, with "
+             "statistical errors; fitted in memory. Repeatable. Points are "
+             "detected too only with --point-sources",
+    )
+    p_fit.add_argument(
         "--fixed-points", action="store_true",
         help="with --points-only and --point: keep the given positions fixed "
              "(flux errors only)",
@@ -668,6 +693,7 @@ def main(argv: list[str] | None = None) -> int:
             point_sources = [_parse_pair(p, "--point") for p in args.point]
         else:
             point_sources = bool(args.point_sources)
+        gaussians = [_parse_gaussian(g) for g in args.gaussian] if args.gaussian else None
         run(
             args.dataset,
             fov=args.fov,
@@ -729,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             max_points=args.max_points,
             point_retune=not args.no_point_retune,
             points_only=args.points_only,
+            gaussians=gaussians,
             point_refine=not args.fixed_points,
             # what was asked for, in --config form: written to
             # input_parameters.json so the run can be repeated exactly

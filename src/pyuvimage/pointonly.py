@@ -68,9 +68,31 @@ GRAM_RIDGE = 1e-10
 # the two sources of C and Dp
 # ---------------------------------------------------------------------------
 
-def _stacked_columns(uv, ys, xs) -> np.ndarray:
-    """``[Re; Im]`` of unit points at grid (ys, xs) arcsec, (2 n_vis, k);
-    the convention of `pointsource.point_visibilities`."""
+FWHM_PER_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def gaussian_uv_terms(uv, shape):
+    """(taper, u_maj, u_min) of an elliptical Gaussian ``shape`` = (sigma_maj,
+    sigma_min [arcsec], theta [rad, the major axis's PA east of north]).
+
+    A Gaussian of covariance S has the taper exp(-2 pi^2 u^T S u). The major
+    axis points along (y, x) = (cos theta, -sin theta) on the grid (north up,
+    east = -x), and grid y pairs with v, x with u, so u_maj = v cos - u sin,
+    u_min = u cos + v sin.
+    """
+    s_a, s_b, th = shape
+    c, sn = np.cos(th), np.sin(th)
+    u_maj = uv[:, 1] * c - uv[:, 0] * sn
+    u_min = uv[:, 0] * c + uv[:, 1] * sn
+    a, b = s_a * ARCSEC_TO_RAD, s_b * ARCSEC_TO_RAD
+    taper = np.exp(-2.0 * np.pi ** 2 * (a * a * u_maj ** 2 + b * b * u_min ** 2))
+    return taper, u_maj, u_min
+
+
+def _stacked_columns(uv, ys, xs, shapes=None) -> np.ndarray:
+    """``[Re; Im]`` of unit components at grid (ys, xs) arcsec, (2 n_vis, k):
+    points, or Gaussians where ``shapes[j]`` is not None; the convention of
+    `pointsource.point_visibilities`."""
     ys = np.asarray(ys, dtype=float).ravel()
     xs = np.asarray(xs, dtype=float).ravel()
     n = uv.shape[0]
@@ -80,6 +102,11 @@ def _stacked_columns(uv, ys, xs) -> np.ndarray:
     out = np.empty((2 * n, ys.size))
     np.cos(phase, out=out[:n])
     np.sin(phase, out=out[n:])
+    for j, shape in enumerate(shapes or []):
+        if shape is not None:
+            t = gaussian_uv_terms(uv, shape)[0]
+            out[:n, j] *= t
+            out[n:, j] *= t
     return out
 
 
@@ -105,8 +132,9 @@ class VisibilityPoints:
         #: C_jj of a point anywhere: exact for equal sigmas, their mean otherwise
         self.k0 = float(0.5 * np.sum(self.w_re + self.w_im))
 
-    def terms(self, positions) -> tuple[np.ndarray, np.ndarray]:
-        P = _stacked_columns(self.uv, [p[0] for p in positions], [p[1] for p in positions])
+    def terms(self, positions, shapes=None) -> tuple[np.ndarray, np.ndarray]:
+        P = _stacked_columns(self.uv, [p[0] for p in positions], [p[1] for p in positions],
+                             shapes)
         return P.T @ (self.w_stack[:, None] * P), P.T @ self.wd_stack
 
     def _image(self, c) -> np.ndarray:
@@ -118,17 +146,18 @@ class VisibilityPoints:
         """Dp at every image pixel: the adjoint of the weighted data."""
         return self._image(self.w_re * self.data.real + 1j * self.w_im * self.data.imag)
 
-    def lattice_cross(self, ys, xs, position) -> np.ndarray:
-        """C between every image pixel and a point at `position`."""
-        P = _stacked_columns(self.uv, [position[0]], [position[1]])[:, 0]
+    def lattice_cross(self, ys, xs, position, shape=None) -> np.ndarray:
+        """C between every image pixel and a component at `position`."""
+        P = _stacked_columns(self.uv, [position[0]], [position[1]], [shape])[:, 0]
         n = self.uv.shape[0]
         return self._image(self.w_re * P[:n] + 1j * self.w_im * P[n:])
 
-    def residual_image(self, positions, amplitudes) -> np.ndarray:
+    def residual_image(self, positions, amplitudes, shapes=None) -> np.ndarray:
         """Dirty image of the residual visibilities [Jy/beam]."""
         model = np.zeros(self.uv.shape[0], dtype=complex)
         if len(positions):
-            P = _stacked_columns(self.uv, [p[0] for p in positions], [p[1] for p in positions])
+            P = _stacked_columns(self.uv, [p[0] for p in positions], [p[1] for p in positions],
+                                 shapes)
             n = self.uv.shape[0]
             model = (P[:n] + 1j * P[n:]) @ np.asarray(amplitudes, dtype=float)
         return np.asarray(self.imager.dirty_image(self.data - model))
@@ -147,7 +176,9 @@ class GridPoints:
         self.n_data = 2 * int(terms.n_vis)
         self.k0 = float(self.grids.kernel(0.0, 0.0))
 
-    def terms(self, positions) -> tuple[np.ndarray, np.ndarray]:
+    def terms(self, positions, shapes=None) -> tuple[np.ndarray, np.ndarray]:
+        if shapes is not None and any(sh is not None for sh in shapes):
+            raise NotImplementedError("Gaussian components are fitted in memory only")
         ys = np.array([p[0] for p in positions], dtype=float)
         xs = np.array([p[1] for p in positions], dtype=float)
         C = self.grids.kernel(ys[:, None] - ys[None, :], xs[:, None] - xs[None, :])
@@ -159,7 +190,7 @@ class GridPoints:
     def lattice_cross(self, ys, xs, position) -> np.ndarray:
         return np.asarray(self.grids.kernel(ys - position[0], xs - position[1]), dtype=float)
 
-    def residual_image(self, positions, amplitudes) -> np.ndarray:
+    def residual_image(self, positions, amplitudes, shapes=None) -> np.ndarray:
         """dirty(data) - sum a_k K(x - p_k) / sum w [Jy/beam]."""
         ny, nx = self.sparse_terms.shape_native
         pix = float(self.sparse_terms.pixel_scale)
@@ -182,22 +213,34 @@ class PointOnlySystem:
     `chi_squared(positions)` is what `pointsource.refine_position` asks for.
     """
 
-    def __init__(self, backend):
+    def __init__(self, backend, fixed=None):
         self.backend = backend
         self.n_data = backend.n_data
         self.chi2_const = backend.chi2_const
+        #: components whose geometry is held while points are searched
+        #: [((y, x), shape or None)], fluxes re-fitted with the points'
+        self.fixed = list(fixed or [])
         self._cross: dict = {}
 
+    def _terms(self, positions):
+        pos = list(positions) + [c[0] for c in self.fixed]
+        shapes = [None] * len(positions) + [c[1] for c in self.fixed]
+        if not self.fixed:
+            return self.backend.terms(pos)
+        return self.backend.terms(pos, shapes)
+
     def solve(self, positions):
-        """(fluxes, their covariance C^-1, chi^2) at fixed positions."""
+        """(fluxes, their covariance C^-1, chi^2) at fixed positions; with
+        `fixed` components their fluxes are fitted too and marginalised."""
         positions = list(positions)
-        if not positions:
+        k = len(positions)
+        if not positions and not self.fixed:
             return np.zeros(0), np.zeros((0, 0)), float(self.chi2_const)
-        C, Dp = self.backend.terms(positions)
-        C = C + np.eye(len(positions)) * GRAM_RIDGE * max(np.trace(C), 1e-30)
+        C, Dp = self._terms(positions)
+        C = C + np.eye(C.shape[0]) * GRAM_RIDGE * max(np.trace(C), 1e-30)
         cov = np.linalg.inv(C)
         a = cov @ Dp
-        return a, cov, float(self.chi2_const - a @ Dp)
+        return a[:k], cov[:k, :k], float(self.chi2_const - a @ Dp)
 
     def chi_squared(self, positions) -> float:
         return self.solve(positions)[2]
@@ -218,21 +261,25 @@ class PointOnlySystem:
         """
         r = self.backend.lattice_dirty(ys, xs).copy()
         s = np.full(r.shape, self.backend.k0)
-        if accepted:
-            Kc = np.stack([self._lattice_cross(ys, xs, p) for p in accepted], axis=1)
-            C, Dp = self.backend.terms(accepted)
-            C = C + np.eye(len(accepted)) * GRAM_RIDGE * max(np.trace(C), 1e-30)
+        comps = [(p, None) for p in accepted] + self.fixed
+        if comps:
+            Kc = np.stack([self._lattice_cross(ys, xs, p, sh) for p, sh in comps], axis=1)
+            C, Dp = self._terms(accepted)
+            C = C + np.eye(C.shape[0]) * GRAM_RIDGE * max(np.trace(C), 1e-30)
             Ci = np.linalg.inv(C)
             r -= Kc @ (Ci @ Dp)
             s -= np.einsum("ij,jk,ik->i", Kc, Ci, Kc)
         s = np.maximum(s, 1e-30 * self.backend.k0)
         return r / s, r / np.sqrt(s)
 
-    def _lattice_cross(self, ys, xs, position):
-        key = (float(position[0]), float(position[1]))
+    def _lattice_cross(self, ys, xs, position, shape=None):
+        key = (float(position[0]), float(position[1]),
+               None if shape is None else tuple(float(v) for v in shape))
         hit = self._cross.get(key)
         if hit is None:
-            hit = self._cross[key] = self.backend.lattice_cross(ys, xs, position)
+            hit = self._cross[key] = (
+                self.backend.lattice_cross(ys, xs, position) if shape is None
+                else self.backend.lattice_cross(ys, xs, position, shape))
             if len(self._cross) > 64:
                 self._cross.pop(next(iter(self._cross)))
         return hit
@@ -325,6 +372,11 @@ class PointOnlyFit:
     chi2_inflation: float
     positions_fitted: bool
     log: list = field(default_factory=list)
+    #: `fit_with_gaussians` only
+    gaussians: list = field(default_factory=list)
+    gaussian_components: list = field(default_factory=list)   # [((y, x), shape)]
+    gaussian_amplitudes: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    covariance_labels: list | None = None
 
     @property
     def chi2_per_n(self) -> float:
@@ -410,7 +462,7 @@ def fit_points_only(
     a, cov_a, chi2 = system.solve(accepted)
     inflation = max(1.0, chi2 / system.n_data)
     cov = None
-    if refine and accepted:
+    if refine and accepted and not system.fixed:
         cov = system.fisher_covariance(accepted, a, beam, pix)
         if cov is None:
             notes.append("the chi^2 Hessian is not positive definite at the fitted "
@@ -440,6 +492,353 @@ def fit_points_only(
     return PointOnlyFit(points=points, grid_positions=accepted, amplitudes=a,
                         covariance=cov, chi_squared=chi2, n_data=system.n_data,
                         chi2_inflation=inflation, positions_fitted=fitted, log=notes)
+
+
+# ---------------------------------------------------------------------------
+# Gaussian components (user-given; in memory)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FittedGaussian:
+    """One elliptical Gaussian component: its intrinsic (deconvolved) shape,
+    since the fit is to the visibilities."""
+
+    d_ra: float
+    d_dec: float
+    flux: float                  # Jy, total, apparent
+    flux_error: float
+    d_ra_error: float
+    d_dec_error: float
+    ra_dec_correlation: float
+    fwhm_major: float            # arcsec
+    fwhm_major_error: float
+    fwhm_minor: float
+    fwhm_minor_error: float
+    pa_deg: float                # major axis, east of north, [0, 180)
+    pa_error_deg: float
+    d_ra_phase_centre: float | None = None
+    d_dec_phase_centre: float | None = None
+    ra_deg: float | None = None
+    dec_deg: float | None = None
+    primary_beam: float | None = None
+    flux_pbcor: float | None = None
+    flux_error_pbcor: float | None = None
+
+    @property
+    def significance(self) -> float:
+        return abs(self.flux) / self.flux_error if self.flux_error > 0 else np.inf
+
+    @property
+    def shape(self):
+        """(sigma_maj, sigma_min [arcsec], theta [rad]) for the uv taper."""
+        return (self.fwhm_major / FWHM_PER_SIGMA, self.fwhm_minor / FWHM_PER_SIGMA,
+                np.radians(self.pa_deg))
+
+    def as_dict(self) -> dict:
+        out = {k: (None if v is None else float(v)) for k, v in asdict(self).items()}
+        out["significance"] = float(self.significance)
+        return out
+
+
+class JointModel:
+    """All components at once, for the joint least-squares fit.
+
+    Parameters, per component in order: flux, y, x [arcsec] (the position
+    omitted for a fixed point), then for a Gaussian ln sigma_a, ln sigma_b
+    [arcsec] and theta [rad]. The residual is the noise-weighted
+    ``[Re; Im](d - model)``, so chi^2 = |r|^2, and the Jacobian is analytic.
+    """
+
+    def __init__(self, backend, kinds, fixed_position):
+        self.uv = backend.uv
+        self.sw = np.sqrt(backend.w_stack)
+        self.d = np.concatenate([backend.data.real, backend.data.imag])
+        self.kinds = list(kinds)                     # "point" / "gaussian"
+        self.fixed_position = list(fixed_position)
+        self.slices, self.held, i = [], [], 0
+        for kind, fixed in zip(self.kinds, self.fixed_position):
+            n = 1 + (0 if fixed else 2) + (3 if kind == "gaussian" else 0)
+            self.slices.append(slice(i, i + n))
+            i += n
+        self.n_params = i
+        self._held_pos = [None] * len(self.kinds)
+
+    def pack(self, comps) -> np.ndarray:
+        """comps: [(flux, (y, x), shape or None)] -> parameter vector."""
+        out = []
+        for (a, (y, x), shape), fixed, kind in zip(comps, self.fixed_position, self.kinds):
+            out.append(a)
+            if not fixed:
+                out += [y, x]
+            if kind == "gaussian":
+                out += [np.log(shape[0]), np.log(shape[1]), shape[2]]
+        self._held_pos = [c[1] for c in comps]
+        return np.array(out, dtype=float)
+
+    def unpack(self, theta):
+        comps = []
+        for sl, fixed, kind, held in zip(self.slices, self.fixed_position, self.kinds,
+                                         self._held_pos):
+            q = theta[sl]
+            a, j = q[0], 1
+            if fixed:
+                pos = held
+            else:
+                pos, j = (q[1], q[2]), 3
+            shape = ((float(np.exp(q[j])), float(np.exp(q[j + 1])), float(q[j + 2]))
+                     if kind == "gaussian" else None)
+            comps.append((float(a), (float(pos[0]), float(pos[1])), shape))
+        return comps
+
+    def _parts(self, theta):
+        n = self.uv.shape[0]
+        out = []
+        for a, (y, x), shape in self.unpack(theta):
+            ph = -2.0 * np.pi * ARCSEC_TO_RAD * (self.uv[:, 0] * x + self.uv[:, 1] * y)
+            c, sn = np.cos(ph), np.sin(ph)
+            t = um = un = None
+            if shape is not None:
+                t, um, un = gaussian_uv_terms(self.uv, shape)
+            out.append((a, ph, c, sn, t, um, un, shape))
+        return n, out
+
+    def residual(self, theta) -> np.ndarray:
+        n, parts = self._parts(theta)
+        m = np.zeros(2 * n)
+        for a, _, c, sn, t, *_ in parts:
+            tt = 1.0 if t is None else t
+            m[:n] += a * tt * c
+            m[n:] += a * tt * sn
+        return self.sw * (self.d - m)
+
+    def jacobian(self, theta) -> np.ndarray:
+        n, parts = self._parts(theta)
+        J = np.empty((2 * n, self.n_params))
+        two_pi_arc = 2.0 * np.pi * ARCSEC_TO_RAD
+        for (a, _, c, sn, t, um, un, shape), sl, fixed in zip(parts, self.slices,
+                                                                 self.fixed_position):
+            tt = np.ones(n) if t is None else t
+            col = np.concatenate([tt * c, tt * sn])           # d model / d flux
+            k = sl.start
+            J[:, k] = col
+            k += 1
+            if not fixed:
+                dphase = np.concatenate([-tt * sn, tt * c])  # d[cos; sin]/d phase
+                J[:, k] = a * dphase * np.tile(-two_pi_arc * self.uv[:, 1], 2)   # y
+                J[:, k + 1] = a * dphase * np.tile(-two_pi_arc * self.uv[:, 0], 2)  # x
+                k += 2
+            if shape is not None:
+                sa, sb = shape[0] * ARCSEC_TO_RAD, shape[1] * ARCSEC_TO_RAD
+                f2 = -4.0 * np.pi ** 2
+                J[:, k] = a * col * np.tile(f2 * sa * sa * um ** 2, 2)
+                J[:, k + 1] = a * col * np.tile(f2 * sb * sb * un ** 2, 2)
+                J[:, k + 2] = a * col * np.tile(f2 * (sb * sb - sa * sa) * um * un, 2)
+        return -self.sw[:, None] * J
+
+
+def fit_with_gaussians(
+    backend,
+    geometry,
+    gaussians,
+    positions=None,
+    detect: bool = False,
+    significance: float = DEFAULT_SIGNIFICANCE,
+    max_points: int = DEFAULT_MAX_POINTS,
+    refine: bool = True,
+    beam_fwhm: float | None = None,
+) -> PointOnlyFit:
+    """Gaussian components (and any points), all parameters fitted jointly.
+
+    ``gaussians``: [(dRA, dDec, fwhm_major or None, fwhm_minor or None, pa_deg
+    or None)] -- starting values; a missing size starts at half the beam.
+    ``positions``: points as in `fit_points_only` (held fixed when ``refine``
+    is False). ``detect``: also look for points, with the Gaussians' (and
+    given points') geometry held while searching, then everything refitted.
+
+    Joint Levenberg-Marquardt (`scipy.optimize.least_squares`, trust region)
+    on the noise-weighted visibility residual with an analytic Jacobian; the
+    covariance is (J^T J)^-1 at the solution (the Gauss-Newton inverse
+    Fisher matrix), times max(1, chi^2/N).
+    """
+    from scipy.optimize import least_squares
+
+    beam = float(beam_fwhm) if beam_fwhm else 2.0 * float(geometry.pixel_scale)
+    notes: list = []
+    pts = [sky_to_grid(*p) for p in (positions or [])]
+    gauss0 = []
+    for g in gaussians:
+        d_ra, d_dec = g[0], g[1]
+        maj = g[2] if len(g) > 2 and g[2] else 0.5 * beam
+        mnr = g[3] if len(g) > 3 and g[3] else maj
+        maj, mnr = max(maj, mnr), min(maj, mnr)
+        mnr = min(mnr, 0.9 * maj)              # off round, so theta is not degenerate
+        pa = g[4] if len(g) > 4 and g[4] is not None else 0.0
+        gauss0.append((sky_to_grid(d_ra, d_dec),
+                       (maj / FWHM_PER_SIGMA, mnr / FWHM_PER_SIGMA, np.radians(pa))))
+
+    def joint(points, point_user, gauss):
+        kinds = ["point"] * len(points) + ["gaussian"] * len(gauss)
+        fixed = [not refine and u for u in point_user] + [False] * len(gauss)
+        model = JointModel(backend, kinds, fixed)
+        pos = list(points) + [g[0] for g in gauss]
+        shapes = [None] * len(points) + [g[1] for g in gauss]
+        C, Dp = backend.terms(pos, shapes)
+        a0 = np.linalg.solve(C + np.eye(len(pos)) * GRAM_RIDGE * np.trace(C), Dp)
+        theta0 = model.pack(list(zip(a0, pos, shapes)))
+        lo = np.full(model.n_params, -np.inf)
+        floor = np.log(1e-3 * float(geometry.pixel_scale))
+        for sl, kind in zip(model.slices, kinds):
+            if kind == "gaussian":
+                lo[sl.stop - 3: sl.stop - 1] = floor
+        theta0 = np.maximum(theta0, lo + 1e-9)
+        res = least_squares(model.residual, theta0, jac=model.jacobian, method="trf",
+                            bounds=(lo, np.inf), x_scale="jac", xtol=1e-12, ftol=1e-12,
+                            gtol=1e-12, max_nfev=500)
+        if not res.success:
+            notes.append(f"joint fit: {res.message}")
+        return model, res
+
+    user = [True] * len(pts)
+    model, res = joint(pts, user, gauss0)
+    comps = model.unpack(res.x)
+    if detect:
+        k0 = len(pts)
+        held = [(c[1], c[2]) for c in comps]
+        system = PointOnlySystem(backend, fixed=held)
+        found = fit_points_only(system, geometry, positions=None, significance=significance,
+                                max_points=max_points, refine=refine, beam_fwhm=beam)
+        notes += found.log
+        new = list(found.grid_positions)
+        pts = [c[1] for c in comps[:k0]] + new
+        user = user + [False] * len(new)
+        gauss0 = [(c[1], c[2]) for c in comps[k0:]]
+        model, res = joint(pts, user, gauss0)
+        comps = model.unpack(res.x)
+        # with every geometry free, a detected point can lose its flux to a
+        # Gaussian it was compensating for: drop the weakest below the cut
+        while True:
+            J = res.jac
+            cov = np.linalg.pinv(J.T @ J) * max(1.0, float(res.fun @ res.fun) / backend.n_data)
+            snr = [(comps[i][0] / np.sqrt(cov[model.slices[i].start, model.slices[i].start]), i)
+                   for i in range(len(pts)) if not user[i]]
+            if not snr or min(snr)[0] >= significance:
+                break
+            weak, i = min(snr)
+            notes.append(f"point at {grid_to_sky(*comps[i][1])} dropped: {weak:.1f} sigma "
+                         "once the Gaussians were refitted")
+            pts = [c[1] for j, c in enumerate(comps[:len(pts)]) if j != i]
+            user = [u for j, u in enumerate(user) if j != i]
+            gauss0 = [(c[1], c[2]) for c in comps[len(pts) + 1:]]
+            model, res = joint(pts, user, gauss0)
+            comps = model.unpack(res.x)
+
+    r = res.fun
+    chi2 = float(r @ r)
+    inflation = max(1.0, chi2 / backend.n_data)
+    J = res.jac
+    try:
+        cov = np.linalg.inv(J.T @ J) * inflation
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(J.T @ J) * inflation
+        notes.append("J^T J is singular: errors from its pseudo-inverse")
+
+    points, gaussians_out = [], []
+    labels = []
+    for i, ((a, (y, x), shape), sl, kind, fixed) in enumerate(
+            zip(comps, model.slices, model.kinds, model.fixed_position)):
+        c = cov[sl, sl]
+        d_ra, d_dec = grid_to_sky(y, x)
+        if fixed:
+            sy = sx = rho = None
+        else:
+            sy, sx = np.sqrt(c[1, 1]), np.sqrt(c[2, 2])
+            rho = -c[1, 2] / (sy * sx) if sy > 0 and sx > 0 else 0.0
+        if kind == "point":
+            labels += [f"point{i}:flux"] + ([] if fixed else [f"point{i}:y", f"point{i}:x"])
+            points.append(FittedPoint(
+                d_ra=d_ra, d_dec=d_dec, flux=a, flux_error=float(np.sqrt(c[0, 0])),
+                d_ra_error=None if sx is None else float(sx),
+                d_dec_error=None if sy is None else float(sy),
+                ra_dec_correlation=None if rho is None else float(rho),
+                user_supplied=user[i]))
+            continue
+        labels += [f"gaussian{i}:{q}" for q in ("flux", "y", "x", "ln_sigma_a",
+                                                 "ln_sigma_b", "theta")]
+        sa, sb, th = shape
+        e_a, e_b, e_t = np.sqrt(np.diag(c)[3:6])
+        if sb > sa:                                   # b is the major axis
+            sa, sb, e_a, e_b, th = sb, sa, e_b, e_a, th + np.pi / 2.0
+        gaussians_out.append(FittedGaussian(
+            d_ra=d_ra, d_dec=d_dec, flux=a, flux_error=float(np.sqrt(c[0, 0])),
+            d_ra_error=float(sx), d_dec_error=float(sy), ra_dec_correlation=float(rho),
+            fwhm_major=float(FWHM_PER_SIGMA * sa),
+            fwhm_major_error=float(FWHM_PER_SIGMA * sa * e_a),
+            fwhm_minor=float(FWHM_PER_SIGMA * sb),
+            fwhm_minor_error=float(FWHM_PER_SIGMA * sb * e_b),
+            pa_deg=float(np.degrees(th) % 180.0), pa_error_deg=float(np.degrees(e_t))))
+    point_comps = [c for c, kind in zip(comps, model.kinds) if kind == "point"]
+    gauss_comps = [c for c, kind in zip(comps, model.kinds) if kind == "gaussian"]
+    fit = PointOnlyFit(
+        points=points, grid_positions=[c[1] for c in point_comps],
+        amplitudes=np.array([c[0] for c in point_comps]), covariance=cov,
+        chi_squared=chi2, n_data=backend.n_data, chi2_inflation=inflation,
+        positions_fitted=True, log=notes, gaussians=gaussians_out,
+        gaussian_components=[(c[1], c[2]) for c in gauss_comps],
+        gaussian_amplitudes=np.array([c[0] for c in gauss_comps]),
+        covariance_labels=labels)
+    return fit
+
+
+def restore_gaussians(image_shape, pixel_scale, gaussians, beam, existing=None):
+    """Add Gaussians, convolved with the restoring beam, to an image [Jy/beam]:
+    F (2 pi s_b1 s_b2) N(r; mu, S_g + S_b) -- a point (S_g = 0) peaks at F."""
+    ny, nx = image_shape
+    out = np.zeros(image_shape) if existing is None else np.array(existing, dtype=float)
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    gy = ((ny - 1) / 2.0 - yy) * pixel_scale
+    gx = (xx - (nx - 1) / 2.0) * pixel_scale
+    sb = (beam.bmaj_arcsec / FWHM_PER_SIGMA, beam.bmin_arcsec / FWHM_PER_SIGMA,
+          np.radians(beam.bpa_deg))
+    area = 2.0 * np.pi * sb[0] * sb[1]
+    S_b = _cov_yx(sb)
+    for g in gaussians:
+        S = S_b + _cov_yx(g.shape)
+        out += g.flux * area * _normal(gy + 0.0, gx, (g.d_dec, -g.d_ra), S)
+    return out
+
+
+def gaussian_model_image(image_shape, pixel_scale, gaussians, supersample: int = 5):
+    """Each Gaussian's flux on the pixel grid [Jy/pixel], averaged over
+    ``supersample``^2 points per pixel."""
+    ny, nx = image_shape
+    out = np.zeros(image_shape)
+    off = (np.arange(supersample) + 0.5) / supersample - 0.5
+    yy, xx = np.mgrid[0:ny, 0:nx].astype(float)
+    for g in gaussians:
+        S = _cov_yx(g.shape)
+        acc = np.zeros(image_shape)
+        for dy in off:
+            for dx in off:
+                gy = ((ny - 1) / 2.0 - (yy + dy)) * pixel_scale
+                gx = ((xx + dx) - (nx - 1) / 2.0) * pixel_scale
+                acc += _normal(gy, gx, (g.d_dec, -g.d_ra), S)
+        out += g.flux * acc / supersample ** 2 * pixel_scale ** 2
+    return out
+
+
+def _cov_yx(shape) -> np.ndarray:
+    """Covariance in grid (y, x) arcsec^2 of (sigma_maj, sigma_min, theta)."""
+    s_a, s_b, th = shape
+    e_a = np.array([np.cos(th), -np.sin(th)])
+    e_b = np.array([np.sin(th), np.cos(th)])
+    return s_a ** 2 * np.outer(e_a, e_a) + s_b ** 2 * np.outer(e_b, e_b)
+
+
+def _normal(gy, gx, mu, S) -> np.ndarray:
+    Si = np.linalg.inv(S)
+    dy, dx = gy - mu[0], gx - mu[1]
+    q = Si[0, 0] * dy * dy + 2 * Si[0, 1] * dy * dx + Si[1, 1] * dx * dx
+    return np.exp(-0.5 * q) / (2.0 * np.pi * np.sqrt(np.linalg.det(S)))
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +907,8 @@ def run_points(
     oversample: int = 2,
     image_centre="0,0",
     positions=None,
+    gaussians=None,
+    detect: bool | None = None,
     significance: float = DEFAULT_SIGNIFICANCE,
     max_points: int = DEFAULT_MAX_POINTS,
     refine: bool = True,
@@ -525,7 +926,11 @@ def run_points(
     """`run(..., points_only=True)`: see the module notes.
 
     ``positions`` are image (x, y) offsets [arcsec] (the `--point`
-    convention), or None to detect.
+    convention), or None to detect. ``gaussians``: [(x, y[, fwhm_major[,
+    fwhm_minor, pa_deg]])] in the same axes, starting values for elliptical
+    Gaussian components (`fit_with_gaussians`; in memory). ``detect``: look
+    for points as well; by default only when neither points nor Gaussians
+    are given.
     """
     import autogalaxy as ag
 
@@ -542,10 +947,17 @@ def run_points(
     if streaming is True and not stm.nufftax_available():
         raise RuntimeError("streamed point components need nufftax; --no-streaming "
                            "fits them from the visibilities in memory")
-    stream = (streaming is True or (streaming == "auto" and on_disk
+    if gaussians and streaming is True:
+        raise NotImplementedError("Gaussian components are fitted in memory only: "
+                                  "drop --streaming")
+    stream = (streaming is True or (streaming == "auto" and on_disk and not gaussians
                                     and stm.nufftax_available()))
     if streaming == "auto" and on_disk and not stream:
-        logger.info("streaming auto -> in memory: nufftax is not installed")
+        logger.info("streaming auto -> in memory: %s",
+                    "Gaussian components need the visibilities" if gaussians
+                    else "nufftax is not installed")
+    if detect is None:
+        detect = not positions and not gaussians
 
     if stream:
         from .uvdata import describe_pooling, reim_asymmetry
@@ -602,28 +1014,49 @@ def run_points(
     beam_fwhm = float(np.sqrt(beam.bmaj_arcsec * beam.bmin_arcsec))
     rms = float(imager.rms)
     sky_positions = [image_to_sky(*q) for q in positions] if positions else None
-    logger.info("fitting point components only (%s)...",
-                "user positions" if sky_positions else
-                f"auto-detect above {significance:.1f} sigma, at most {max_points}")
-    system = PointOnlySystem(backend)
-    fit = fit_points_only(system, geometry, positions=sky_positions,
-                          significance=significance, max_points=max_points,
-                          refine=refine, beam_fwhm=beam_fwhm)
+    sky_gaussians = [(*image_to_sky(g[0], g[1]), *g[2:]) for g in (gaussians or [])]
+    what = []
+    if sky_positions:
+        what.append(f"{len(sky_positions)} given point(s)")
+    if sky_gaussians:
+        what.append(f"{len(sky_gaussians)} Gaussian(s)")
+    if detect:
+        what.append(f"points detected above {significance:.1f} sigma, at most {max_points}")
+    logger.info("fitting components only: %s...", ", ".join(what))
+    if sky_gaussians:
+        fit = fit_with_gaussians(backend, geometry, sky_gaussians, positions=sky_positions,
+                                 detect=detect, significance=significance,
+                                 max_points=max_points, refine=refine, beam_fwhm=beam_fwhm)
+    else:
+        system = PointOnlySystem(backend)
+        fit = fit_points_only(system, geometry,
+                              positions=None if detect else sky_positions,
+                              significance=significance, max_points=max_points,
+                              refine=refine, beam_fwhm=beam_fwhm)
     for note in fit.log:
         logger.info("  %s", note)
     dish = dish_diameter or meta.get("dish_diameter_m")
     if pb_correction and not dish:
         logger.warning("no dish diameter known: point fluxes are not primary-beam "
                        "corrected (pass dish_diameter=... to enable)")
-    pb_fwhm = _locate(fit.points, geometry, meta, freq, dish if pb_correction else None,
-                      pb_factor)
+    pb_fwhm = _locate(fit.points + fit.gaussians, geometry, meta, freq,
+                      dish if pb_correction else None, pb_factor)
 
     from .pointsource import restore_points
 
-    residual = backend.residual_image(fit.grid_positions, fit.amplitudes)
+    if fit.gaussians:
+        residual = backend.residual_image(
+            list(fit.grid_positions) + [c[0] for c in fit.gaussian_components],
+            np.concatenate([fit.amplitudes, fit.gaussian_amplitudes]),
+            [None] * len(fit.grid_positions) + [c[1] for c in fit.gaussian_components])
+    else:
+        residual = backend.residual_image(fit.grid_positions, fit.amplitudes)
     restored = restore_points(geometry.shape_native, geometry.pixel_scale, fit.points, beam)
-    logger.info("points only: %d point(s), chi2/N %.4f%s, residual peak %.1f sigma, %.0f s",
-                len(fit.points), fit.chi2_per_n,
+    restored = restore_gaussians(geometry.shape_native, geometry.pixel_scale, fit.gaussians,
+                                 beam, existing=restored)
+    logger.info("components only: %d point(s), %d Gaussian(s), chi2/N %.4f%s, residual "
+                "peak %.1f sigma, %.0f s",
+                len(fit.points), len(fit.gaussians), fit.chi2_per_n,
                 f" (errors inflated x{np.sqrt(fit.chi2_inflation):.3f})"
                 if fit.chi2_inflation > 1 else "",
                 float(np.nanmax(np.abs(residual))) / rms, time.time() - t0)
@@ -633,9 +1066,16 @@ def run_points(
         pb = "" if p.flux_pbcor is None else f"; PB-corrected {p.flux_pbcor:.5g} +- {p.flux_error_pbcor:.2g} Jy"
         logger.info("  point %d: (dRA, dDec) = (%.4f, %.4f)\"%s, %.5g +- %.2g Jy (%.1f sigma)%s",
                     i + 1, p.d_ra, p.d_dec, pos_err, p.flux, p.flux_error, p.significance, pb)
+    for i, g in enumerate(fit.gaussians):
+        pb = "" if g.flux_pbcor is None else f"; PB-corrected {g.flux_pbcor:.5g} Jy"
+        logger.info("  Gaussian %d: (dRA, dDec) = (%.4f, %.4f)\" +- (%.2f, %.2f) mas, %.5g "
+                    "+- %.2g Jy, FWHM %.4f +- %.4f x %.4f +- %.4f\", PA %.1f +- %.1f deg%s",
+                    i + 1, g.d_ra, g.d_dec, 1e3 * g.d_ra_error, 1e3 * g.d_dec_error, g.flux,
+                    g.flux_error, g.fwhm_major, g.fwhm_major_error, g.fwhm_minor,
+                    g.fwhm_minor_error, g.pa_deg, g.pa_error_deg, pb)
 
     parameters = {
-        "model": "points only",
+        "model": "points and Gaussians" if fit.gaussians else "points only",
         "data": {"n_samples": n_vis, "n_data": fit.n_data, "streamed": bool(stream),
                  "central_frequency_hz": freq},
         "geometry": {"fov_arcsec": float(geometry.fov_arcsec),
@@ -649,7 +1089,9 @@ def run_points(
                         "residual_peak_sigma": float(np.nanmax(np.abs(residual))) / rms},
         "uncertainty": {
             "type": "statistical",
-            "method": ("inverse Fisher matrix of chi^2 in flux and position"
+            "method": ("(J^T J)^-1 of the joint least-squares fit (Gauss-Newton inverse "
+                       "Fisher matrix)" if fit.gaussians else
+                       "inverse Fisher matrix of chi^2 in flux and position"
                        if fit.positions_fitted else "flux covariance at fixed positions"),
             "chi2_inflation": fit.chi2_inflation,
         },
@@ -661,12 +1103,17 @@ def run_points(
             "n_points": len(fit.points),
             "total_flux_jy": float(sum(p.flux for p in fit.points)),
             "points": [p.as_dict() for p in fit.points],
-            "covariance_order": (["flux"] * len(fit.points) + ["y"] * len(fit.points)
-                                 + ["x"] * len(fit.points)) if fit.positions_fitted
-            else ["flux"] * len(fit.points),
+            "covariance_order": fit.covariance_labels or (
+                (["flux"] * len(fit.points) + ["y"] * len(fit.points)
+                 + ["x"] * len(fit.points)) if fit.positions_fitted
+                else ["flux"] * len(fit.points)),
             "covariance": np.asarray(fit.covariance).tolist(),
         },
     }
+    if fit.gaussians:
+        parameters["point_sources"]["gaussians"] = [g.as_dict() for g in fit.gaussians]
+        parameters["point_sources"]["n_gaussians"] = len(fit.gaussians)
+        parameters["point_sources"]["total_flux_jy"] += float(sum(g.flux for g in fit.gaussians))
     written = {}
     if write:
         written = _write(out, geometry, meta, freq, beam, rms, dirty, residual, restored,
@@ -699,9 +1146,11 @@ def _write(out, geometry, meta, freq, beam, rms, dirty, residual, restored, fit,
                      header, overwrite=True)
         written[name] = out / name
 
-    model = add_points(np.zeros(geometry.shape_native), fit.points, pix)
-    w("model.fits", model, hdr("Jy/pixel", PTFLUX=(float(np.sum(fit.amplitudes)),
-                                                   "total point flux [Jy]")))
+    model = add_points(gaussian_model_image(geometry.shape_native, pix, fit.gaussians),
+                       fit.points, pix)
+    w("model.fits", model, hdr("Jy/pixel", PTFLUX=(
+        float(np.sum(fit.amplitudes) + np.sum(fit.gaussian_amplitudes)),
+        "total component flux [Jy]")))
     w("dirty_image.fits", dirty, hdr("Jy/beam"))
     w("model_reconvolved.fits", restored, hdr("Jy/beam", RMS=(rms, "image-plane rms [Jy/beam]")))
     w("residual.fits", residual / rms, hdr("sigma", RMS=(rms, "image-plane rms [Jy/beam]")))
@@ -728,7 +1177,9 @@ def _summary(path, geometry, dirty, restored, resid, fit, beam, rms) -> None:
     rmax = max(float(np.nanmax(np.abs(resid))), 1e-6)
     fig, axes = plt.subplots(1, 3, figsize=(13, 4.4), constrained_layout=True)
     panels = [(dirty, "dirty image", "Jy/beam", "inferno", None),
-              (restored, f"{len(fit.points)} point(s), restored", "Jy/beam", "inferno", None),
+              (restored, f"{len(fit.points)} point(s)"
+               + (f", {len(fit.gaussians)} Gaussian(s)" if fit.gaussians else "")
+               + ", restored", "Jy/beam", "inferno", None),
               (resid, f"residual (peak {rmax:.1f}$\\sigma$, rms {np.nanstd(resid):.2f}$\\sigma$)",
                r"$\sigma$", "RdBu_r", (-rmax, rmax))]
     for ax, (img, title, unit, cmap, clim) in zip(axes, panels):
@@ -737,12 +1188,20 @@ def _summary(path, geometry, dirty, restored, resid, fit, beam, rms) -> None:
             im.set_clim(*clim)
         for p in fit.points:
             ax.plot(p.d_ra, p.d_dec, "o", mfc="none", mec="cyan", ms=11, mew=1.3)
+        for g in fit.gaussians:
+            from matplotlib.patches import Ellipse
+
+            # FWHM ellipse in (dRA, dDec) data coordinates: the height (major)
+            # axis turned from north toward +dRA (east) by PA is a clockwise
+            # rotation in data space, hence -PA
+            ax.add_patch(Ellipse((g.d_ra, g.d_dec), g.fwhm_minor, g.fwhm_major,
+                                 angle=-g.pa_deg, fill=False, ec="lime", lw=1.2))
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("dRA [arcsec]")
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
         cb.set_label(unit, fontsize=9)
     axes[0].set_ylabel("dDec [arcsec]")
-    fig.suptitle(f"points only | beam {beam.bmaj_arcsec:.3g}\" x {beam.bmin_arcsec:.3g}\" "
+    fig.suptitle(f"{'components' if fit.gaussians else 'points'} only | beam {beam.bmaj_arcsec:.3g}\" x {beam.bmin_arcsec:.3g}\" "
                  f"pa {beam.bpa_deg:.0f} deg | rms {rms:.3g} Jy/beam | "
                  f"chi2/N {fit.chi2_per_n:.4f}", fontsize=10)
     fig.savefig(path, dpi=140)

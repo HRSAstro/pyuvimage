@@ -361,6 +361,7 @@ def run(
     point_retune: bool = True,
     points_only: bool = False,
     point_refine: bool = True,
+    gaussians: list | None = None,
     write: bool = True,
     streaming: bool | str = "auto",
     chunk_k: int | None = None,
@@ -465,6 +466,11 @@ def run(
             Returns a `pointonly.PointRunResult`.
         point_refine: with ``points_only`` and given positions, False keeps
             them fixed (flux errors only).
+        gaussians: with ``points_only``, elliptical Gaussian components:
+            [(x, y[, fwhm_major[, fwhm_minor, pa_deg]])], image axes as
+            ``point_sources``, arcsec and degrees east of north. Starting
+            values: position, size, PA and flux are all fitted (in memory).
+            Points are then detected only if ``point_sources`` is True.
         input_parameters: what to write to ``input_parameters.json`` in
             ``out``. The CLI passes its options in ``--config`` form, so a run
             can be repeated with ``pyuvimage fit --config``; a direct call
@@ -511,6 +517,9 @@ def run(
         )
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
+    if gaussians and not points_only:
+        raise NotImplementedError("Gaussian components are fitted with points_only "
+                                  "(--points-only) only")
     if points_only:
         if mode != "mfs":
             raise NotImplementedError("--points-only fits an MFS model only")
@@ -520,6 +529,7 @@ def run(
             dataset, fov, out=out, pixel_scale=pixel_scale, oversample=oversample,
             image_centre=image_centre,
             positions=point_sources if isinstance(point_sources, list) else None,
+            gaussians=gaussians, detect=True if point_sources is True else None,
             significance=point_significance, max_points=max_points,
             refine=point_refine, pb_correction=pb_correction,
             dish_diameter=dish_diameter, pb_factor=pb_factor, streaming=streaming,
