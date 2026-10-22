@@ -62,6 +62,14 @@ MIN_SEPARATION_BEAMS = 0.75
 REFINE_PASSES = 2
 #: a ridge on C, relative to its trace, so two coincident points stay solvable
 GRAM_RIDGE = 1e-10
+#: smallest Gaussian sigma the fit may reach, in image pixels
+SIZE_FLOOR_PIXELS = 1e-3
+#: Delta chi^2 (after the chi^2/N inflation) a Gaussian must gain over a point
+#: -- and over a line (zero minor axis) -- to count as resolved; as the mesh
+#: path's unresolved test (`pointsource.DEFAULT_RESOLVED_DELTA_CHI2`)
+RESOLVED_DELTA_CHI2 = 9.0
+#: Delta chi^2 that sets a one-sided 95% upper limit on an unresolved size
+UPPER_LIMIT_DELTA_CHI2 = 2.706
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +524,13 @@ class FittedGaussian:
     fwhm_minor_error: float
     pa_deg: float                # major axis, east of north, [0, 180)
     pa_error_deg: float
+    #: "yes", "major axis only" or "no" (consistent with a point); see
+    #: `resolution_test`. Sizes and their errors mean little when "no".
+    resolved: str | None = None
+    delta_chi2_vs_point: float | None = None     # Gaussian over point
+    delta_chi2_vs_line: float | None = None      # over a zero minor axis
+    fwhm_upper_limit: float | None = None        # 95%, circular; when unresolved
+    fwhm_minor_upper_limit: float | None = None  # 95%; when resolved along the major axis only
     d_ra_phase_centre: float | None = None
     d_dec_phase_centre: float | None = None
     ra_deg: float | None = None
@@ -535,7 +550,8 @@ class FittedGaussian:
                 np.radians(self.pa_deg))
 
     def as_dict(self) -> dict:
-        out = {k: (None if v is None else float(v)) for k, v in asdict(self).items()}
+        out = {k: (v if v is None or isinstance(v, str) else float(v))
+               for k, v in asdict(self).items()}
         out["significance"] = float(self.significance)
         return out
 
@@ -544,20 +560,26 @@ class JointModel:
     """All components at once, for the joint least-squares fit.
 
     Parameters, per component in order: flux, y, x [arcsec] (the position
-    omitted for a fixed point), then for a Gaussian ln sigma_a, ln sigma_b
-    [arcsec] and theta [rad]. The residual is the noise-weighted
-    ``[Re; Im](d - model)``, so chi^2 = |r|^2, and the Jacobian is analytic.
+    omitted for a fixed point), then for a Gaussian its free shape
+    parameters among ln sigma_a, ln sigma_b [arcsec] and theta [rad];
+    ``holds[i]`` = {index: value} fixes any of (sigma_a, sigma_b, theta) at a
+    value (sigma in arcsec) -- how the resolution tests ask for a Gaussian of
+    given size. The residual is the noise-weighted ``[Re; Im](d - model)``,
+    so chi^2 = |r|^2, and the Jacobian is analytic.
     """
 
-    def __init__(self, backend, kinds, fixed_position):
+    def __init__(self, backend, kinds, fixed_position, holds=None):
         self.uv = backend.uv
         self.sw = np.sqrt(backend.w_stack)
         self.d = np.concatenate([backend.data.real, backend.data.imag])
         self.kinds = list(kinds)                     # "point" / "gaussian"
         self.fixed_position = list(fixed_position)
-        self.slices, self.held, i = [], [], 0
-        for kind, fixed in zip(self.kinds, self.fixed_position):
-            n = 1 + (0 if fixed else 2) + (3 if kind == "gaussian" else 0)
+        self.holds = [dict(h or {}) for h in (holds or [None] * len(self.kinds))]
+        self.free_shape = [[k for k in range(3) if k not in h] if kind == "gaussian" else []
+                           for kind, h in zip(self.kinds, self.holds)]
+        self.slices, i = [], 0
+        for fixed, free in zip(self.fixed_position, self.free_shape):
+            n = 1 + (0 if fixed else 2) + len(free)
             self.slices.append(slice(i, i + n))
             i += n
         self.n_params = i
@@ -566,27 +588,34 @@ class JointModel:
     def pack(self, comps) -> np.ndarray:
         """comps: [(flux, (y, x), shape or None)] -> parameter vector."""
         out = []
-        for (a, (y, x), shape), fixed, kind in zip(comps, self.fixed_position, self.kinds):
+        for (a, (y, x), shape), fixed, free in zip(comps, self.fixed_position,
+                                                   self.free_shape):
             out.append(a)
             if not fixed:
                 out += [y, x]
-            if kind == "gaussian":
-                out += [np.log(shape[0]), np.log(shape[1]), shape[2]]
+            for k in free:
+                out.append(shape[k] if k == 2 else np.log(shape[k]))
         self._held_pos = [c[1] for c in comps]
         return np.array(out, dtype=float)
 
     def unpack(self, theta):
         comps = []
-        for sl, fixed, kind, held in zip(self.slices, self.fixed_position, self.kinds,
-                                         self._held_pos):
+        for sl, fixed, kind, held, free, hold in zip(
+                self.slices, self.fixed_position, self.kinds, self._held_pos,
+                self.free_shape, self.holds):
             q = theta[sl]
             a, j = q[0], 1
             if fixed:
                 pos = held
             else:
                 pos, j = (q[1], q[2]), 3
-            shape = ((float(np.exp(q[j])), float(np.exp(q[j + 1])), float(q[j + 2]))
-                     if kind == "gaussian" else None)
+            shape = None
+            if kind == "gaussian":
+                vals = dict(hold)
+                for k in free:
+                    vals[k] = float(q[j]) if k == 2 else float(np.exp(q[j]))
+                    j += 1
+                shape = (float(vals[0]), float(vals[1]), float(vals[2]))
             comps.append((float(a), (float(pos[0]), float(pos[1])), shape))
         return comps
 
@@ -615,8 +644,8 @@ class JointModel:
         n, parts = self._parts(theta)
         J = np.empty((2 * n, self.n_params))
         two_pi_arc = 2.0 * np.pi * ARCSEC_TO_RAD
-        for (a, _, c, sn, t, um, un, shape), sl, fixed in zip(parts, self.slices,
-                                                                 self.fixed_position):
+        for (a, _, c, sn, t, um, un, shape), sl, fixed, free in zip(
+                parts, self.slices, self.fixed_position, self.free_shape):
             tt = np.ones(n) if t is None else t
             col = np.concatenate([tt * c, tt * sn])           # d model / d flux
             k = sl.start
@@ -630,10 +659,130 @@ class JointModel:
             if shape is not None:
                 sa, sb = shape[0] * ARCSEC_TO_RAD, shape[1] * ARCSEC_TO_RAD
                 f2 = -4.0 * np.pi ** 2
-                J[:, k] = a * col * np.tile(f2 * sa * sa * um ** 2, 2)
-                J[:, k + 1] = a * col * np.tile(f2 * sb * sb * un ** 2, 2)
-                J[:, k + 2] = a * col * np.tile(f2 * (sb * sb - sa * sa) * um * un, 2)
+                d = {0: f2 * sa * sa * um ** 2, 1: f2 * sb * sb * un ** 2,
+                     2: f2 * (sb * sb - sa * sa) * um * un}
+                for q in free:
+                    J[:, k] = a * col * np.tile(d[q], 2)
+                    k += 1
         return -self.sw[:, None] * J
+
+
+def _joint_fit(backend, geometry, comps, kinds, fixed, holds=None, notes=None):
+    """Trust-region least squares of all components from ``comps`` =
+    [(flux or None, (y, x), shape or None)] (a missing flux starts at the
+    linear solution). Returns (model, result)."""
+    from scipy.optimize import least_squares
+
+    model = JointModel(backend, kinds, fixed, holds)
+    pos = [c[1] for c in comps]
+    shapes = []
+    for c, kind, h in zip(comps, kinds, model.holds):
+        if kind != "gaussian":
+            shapes.append(None)
+            continue
+        sh = list(c[2])
+        for k, v in h.items():
+            sh[k] = v
+        shapes.append(tuple(sh))
+    C, Dp = backend.terms(pos, shapes)
+    a_lin = np.linalg.solve(C + np.eye(len(pos)) * GRAM_RIDGE * np.trace(C), Dp)
+    a0 = [a_lin[i] if c[0] is None else c[0] for i, c in enumerate(comps)]
+    theta0 = model.pack(list(zip(a0, pos, shapes)))
+    lo = np.full(model.n_params, -np.inf)
+    floor = np.log(SIZE_FLOOR_PIXELS * float(geometry.pixel_scale))
+    for sl, fx, free in zip(model.slices, model.fixed_position, model.free_shape):
+        k = sl.start + 1 + (0 if fx else 2)
+        for q in free:
+            if q < 2:
+                lo[k] = floor
+            k += 1
+    theta0 = np.maximum(theta0, lo + 1e-9)
+    res = least_squares(model.residual, theta0, jac=model.jacobian, method="trf",
+                        bounds=(lo, np.inf), x_scale="jac", xtol=1e-12, ftol=1e-12,
+                        gtol=1e-12, max_nfev=500)
+    if not res.success and notes is not None:
+        notes.append(f"joint fit: {res.message}")
+    return model, res
+
+
+def resolution_test(backend, geometry, model, res, index, inflation, beam, notes=None):
+    """Is Gaussian `index` resolved, and if not, how large could it be?
+
+    CASA's imfit answers this in the image plane: it deconvolves the beam
+    from the fitted size and from the eight combinations of size and PA
+    shifted by their errors, flags a component that cannot be deconvolved
+    as consistent with a point (`ispoint`), and gives the largest of the
+    deconvolved trial sizes as an upper limit. Here the size is already
+    intrinsic (the fit is to the visibilities), but its Fisher errors are
+    wrong exactly where this question is asked -- at a size of zero, a
+    boundary -- so the test is a likelihood ratio instead. With every other
+    parameter of every component re-fitted each time:
+
+    * Delta chi^2 (point -> Gaussian) below `RESOLVED_DELTA_CHI2`: **not
+      resolved**, and the 95% upper limit on a circular FWHM is where chi^2
+      rises `UPPER_LIMIT_DELTA_CHI2` above the point fit's;
+    * else Delta chi^2 (line -> Gaussian), the minor axis held at zero, below
+      it: **resolved along the major axis only**, with a 95% upper limit on
+      the minor axis the same way;
+    * else **resolved**.
+
+    Delta chi^2 are divided by the chi^2/N inflation, as the errors are
+    multiplied by it. Returns (resolved, d_point, d_line, fwhm_limit,
+    fwhm_minor_limit).
+    """
+    comps = model.unpack(res.x)
+    kinds, fixed = list(model.kinds), list(model.fixed_position)
+    base = float(res.fun @ res.fun)
+    a, pos, shape = comps[index]
+    major = 0 if shape[0] >= shape[1] else 1
+    tiny = SIZE_FLOOR_PIXELS * float(geometry.pixel_scale)
+
+    def chi2_with(kind, hold=None):
+        k2 = list(kinds)
+        k2[index] = kind
+        holds = [None] * len(kinds)
+        holds[index] = hold
+        c2 = list(comps)
+        c2[index] = (a, pos, None if kind == "point" else shape)
+        _, r = _joint_fit(backend, geometry, c2, k2, fixed, holds)
+        return float(r.fun @ r.fun)
+
+    chi_point = chi2_with("point")
+    chi_line = chi2_with("gaussian", {1 - major: tiny})
+    d_point = (chi_point - base) / inflation
+    d_line = (chi_line - base) / inflation
+
+    def upper_limit(chi2_of, ref, start):
+        """Smallest FWHM at which chi^2 is `UPPER_LIMIT_DELTA_CHI2` above
+        ``ref``, by doubling then bisection on sigma."""
+        delta = lambda sig: (chi2_of(sig) - ref) / inflation - UPPER_LIMIT_DELTA_CHI2
+        lo, hi = 0.0, max(start, tiny * 10)
+        for _ in range(12):
+            if delta(hi) > 0:
+                break
+            lo, hi = hi, 2.0 * hi
+        else:
+            return None
+        for _ in range(14):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if delta(mid) < 0 else (lo, mid)
+        return float(FWHM_PER_SIGMA * hi)
+
+    beam_sigma = float(beam) / FWHM_PER_SIGMA
+    limit = minor_limit = None
+    if d_point < RESOLVED_DELTA_CHI2:
+        resolved = "no"
+        limit = upper_limit(
+            lambda sig: chi2_with("gaussian", {0: sig, 1: sig, 2: 0.0}), chi_point,
+            max(shape[major], 0.25 * beam_sigma))
+    elif d_line < RESOLVED_DELTA_CHI2:
+        resolved = "major axis only"
+        minor_limit = upper_limit(
+            lambda sig: chi2_with("gaussian", {1 - major: sig}), base,
+            max(shape[1 - major], 0.25 * beam_sigma))
+    else:
+        resolved = "yes"
+    return resolved, float(d_point), float(d_line), limit, minor_limit
 
 
 def fit_with_gaussians(
@@ -679,24 +828,8 @@ def fit_with_gaussians(
     def joint(points, point_user, gauss):
         kinds = ["point"] * len(points) + ["gaussian"] * len(gauss)
         fixed = [not refine and u for u in point_user] + [False] * len(gauss)
-        model = JointModel(backend, kinds, fixed)
-        pos = list(points) + [g[0] for g in gauss]
-        shapes = [None] * len(points) + [g[1] for g in gauss]
-        C, Dp = backend.terms(pos, shapes)
-        a0 = np.linalg.solve(C + np.eye(len(pos)) * GRAM_RIDGE * np.trace(C), Dp)
-        theta0 = model.pack(list(zip(a0, pos, shapes)))
-        lo = np.full(model.n_params, -np.inf)
-        floor = np.log(1e-3 * float(geometry.pixel_scale))
-        for sl, kind in zip(model.slices, kinds):
-            if kind == "gaussian":
-                lo[sl.stop - 3: sl.stop - 1] = floor
-        theta0 = np.maximum(theta0, lo + 1e-9)
-        res = least_squares(model.residual, theta0, jac=model.jacobian, method="trf",
-                            bounds=(lo, np.inf), x_scale="jac", xtol=1e-12, ftol=1e-12,
-                            gtol=1e-12, max_nfev=500)
-        if not res.success:
-            notes.append(f"joint fit: {res.message}")
-        return model, res
+        comps = ([(None, p, None) for p in points] + [(None, g[0], g[1]) for g in gauss])
+        return _joint_fit(backend, geometry, comps, kinds, fixed, notes=notes)
 
     user = [True] * len(pts)
     model, res = joint(pts, user, gauss0)
@@ -742,6 +875,11 @@ def fit_with_gaussians(
         cov = np.linalg.pinv(J.T @ J) * inflation
         notes.append("J^T J is singular: errors from its pseudo-inverse")
 
+    resolution = {}
+    for i, kind in enumerate(model.kinds):
+        if kind == "gaussian":
+            resolution[i] = resolution_test(backend, geometry, model, res, i, inflation,
+                                            beam, notes)
     points, gaussians_out = [], []
     labels = []
     for i, ((a, (y, x), shape), sl, kind, fixed) in enumerate(
@@ -775,7 +913,10 @@ def fit_with_gaussians(
             fwhm_major_error=float(FWHM_PER_SIGMA * sa * e_a),
             fwhm_minor=float(FWHM_PER_SIGMA * sb),
             fwhm_minor_error=float(FWHM_PER_SIGMA * sb * e_b),
-            pa_deg=float(np.degrees(th) % 180.0), pa_error_deg=float(np.degrees(e_t))))
+            pa_deg=float(np.degrees(th) % 180.0), pa_error_deg=float(np.degrees(e_t)),
+            resolved=resolution[i][0], delta_chi2_vs_point=resolution[i][1],
+            delta_chi2_vs_line=resolution[i][2], fwhm_upper_limit=resolution[i][3],
+            fwhm_minor_upper_limit=resolution[i][4]))
     point_comps = [c for c, kind in zip(comps, model.kinds) if kind == "point"]
     gauss_comps = [c for c, kind in zip(comps, model.kinds) if kind == "gaussian"]
     fit = PointOnlyFit(
@@ -1073,6 +1214,18 @@ def run_points(
                     i + 1, g.d_ra, g.d_dec, 1e3 * g.d_ra_error, 1e3 * g.d_dec_error, g.flux,
                     g.flux_error, g.fwhm_major, g.fwhm_major_error, g.fwhm_minor,
                     g.fwhm_minor_error, g.pa_deg, g.pa_error_deg, pb)
+        if g.resolved == "no":
+            logger.info("    not resolved: consistent with a point (Delta chi^2 %.1f over a "
+                        "point); FWHM < %.4g\" (95%%)", g.delta_chi2_vs_point,
+                        g.fwhm_upper_limit if g.fwhm_upper_limit is not None else float("nan"))
+        elif g.resolved == "major axis only":
+            logger.info("    resolved along the major axis only (Delta chi^2 %.1f over a "
+                        "line); minor FWHM < %.4g\" (95%%)", g.delta_chi2_vs_line,
+                        g.fwhm_minor_upper_limit if g.fwhm_minor_upper_limit is not None
+                        else float("nan"))
+        else:
+            logger.info("    resolved (Delta chi^2 %.1f over a point, %.1f over a line)",
+                        g.delta_chi2_vs_point, g.delta_chi2_vs_line)
 
     parameters = {
         "model": "points and Gaussians" if fit.gaussians else "points only",
@@ -1195,7 +1348,8 @@ def _summary(path, geometry, dirty, restored, resid, fit, beam, rms) -> None:
             # axis turned from north toward +dRA (east) by PA is a clockwise
             # rotation in data space, hence -PA
             ax.add_patch(Ellipse((g.d_ra, g.d_dec), g.fwhm_minor, g.fwhm_major,
-                                 angle=-g.pa_deg, fill=False, ec="lime", lw=1.2))
+                                 angle=-g.pa_deg, fill=False, ec="lime", lw=1.2,
+                                 ls="-" if g.resolved == "yes" else "--"))
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("dRA [arcsec]")
         cb = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)

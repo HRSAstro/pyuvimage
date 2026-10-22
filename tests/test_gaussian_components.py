@@ -63,6 +63,28 @@ def test_the_gaussian_and_the_point_are_recovered(fitted):
     assert np.abs(fitted.residual).max() / fitted.rms < 5
 
 
+def test_a_resolved_gaussian_says_so(fitted):
+    (g,) = fitted.fit.gaussians
+    assert g.resolved == "yes"
+    assert g.delta_chi2_vs_point > 100 and g.delta_chi2_vs_line > 100
+    assert g.fwhm_upper_limit is None and g.fwhm_minor_upper_limit is None
+
+
+def test_a_point_fitted_as_a_gaussian_is_unresolved():
+    """As imfit's `ispoint`: a true point is consistent with a point, and the
+    size gets a 95% upper limit rather than a value with an error."""
+    import test_points_only as T
+
+    uvd = T._dataset(1e-3, 1)
+    res = api.run(uvd, fov=4.0, points_only=True, write=False,
+                  gaussians=[(-0.53, -0.31, 0.3)], point_sources=[(0.92, 0.74)])
+    (g,) = res.fit.gaussians
+    assert g.resolved == "no"
+    assert g.delta_chi2_vs_point < pointonly.RESOLVED_DELTA_CHI2
+    assert 0 < g.fwhm_upper_limit < 0.2 * res.beam.bmaj_arcsec
+    assert g.as_dict()["resolved"] == "no"
+
+
 def test_the_jacobian_is_the_derivative(uvd):
     from pyuvimage import fitting
     from pyuvimage.grids import resolve_geometry

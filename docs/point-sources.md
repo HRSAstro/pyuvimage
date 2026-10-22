@@ -299,11 +299,34 @@ within 0.22. `model.fits` holds each Gaussian integrated over the pixels and
 `model_reconvolved.fits` each one convolved with the restoring beam (flux to
 1e-3); `summary.png` draws their FWHM ellipses.
 
+**Is it resolved?** CASA's imfit flags a component it cannot deconvolve
+from the beam as consistent with a point (`ispoint`) and gives upper limits
+from the largest of the deconvolved sizes over the eight combinations of
+size and PA shifted by their errors. Here the size is already intrinsic, but
+its Fisher errors are wrong exactly where the question is asked (a size of
+zero is a boundary), so each Gaussian is tested by likelihood ratio, every
+other parameter of every component re-fitted each time
+(`pointonly.resolution_test`):
+
+| `resolved` | test (Delta chi^2 / inflation) | limit reported |
+|---|---|---|
+| `no` (consistent with a point) | point -> Gaussian < 9 | `fwhm_upper_limit`: circular FWHM where chi^2 is 2.71 above the point fit (95%, one-sided) |
+| `major axis only` | line (minor axis 0) -> Gaussian < 9 | `fwhm_minor_upper_limit` the same way |
+| `yes` | both >= 9 | -- |
+
+`delta_chi2_vs_point` and `delta_chi2_vs_line` are reported, and
+`summary.png` draws an unresolved or one-axis Gaussian's ellipse dashed.
+Calibrated on mocks (a 92 sigma source under a 0.7" beam, 60 and 40 noise
+realisations): for a true point, Delta chi^2 over a point has median 0.6,
+95th percentile 4.7 and 99th 7.9 (none of 60 called resolved); a 0.05"
+Gaussian was called unresolved every time with limits (median 0.11") above
+the truth in 40 of 40; a circular 0.15" Gaussian was resolved along one
+axis (34 of 40) or both (6), and its minor-axis limit covered the truth in
+97%.
+
 Limits: in memory only (the streamed grids would need an anisotropic
 smoothing of the oversampled kernel per trial shape); a Gaussian's
 primary-beam correction uses the PB at its centre; a source with no
-measurable size is fitted at a size that noise alone pushes above zero, with
-errors that do not describe that boundary: a 270 sigma point under a 0.7" beam
-came back with a major axis of 0.069 +- 0.015" and its minor axis at the
-1e-3-pixel floor. Sizes well below the beam / S/N are not detections of a
-size; fit a point there.
+measurable size is still fitted at a size that noise alone pushes above
+zero (a 270 sigma point: 0.069 +- 0.015"), so read `resolved` before the size
+-- that point is reported as not resolved (Delta chi^2 5.3) with FWHM < 0.052".
