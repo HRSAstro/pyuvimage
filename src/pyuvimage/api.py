@@ -359,6 +359,8 @@ def run(
     point_significance: float = 5.0,
     max_points: int = 5,
     point_retune: bool = True,
+    points_only: bool = False,
+    point_refine: bool = True,
     write: bool = True,
     streaming: bool | str = "auto",
     chunk_k: int | None = None,
@@ -456,6 +458,13 @@ def run(
             points there (refined). ``(0, 0)`` is the phase centre -- a
             position, not "off": a bare pair used to be read as "auto-detect"
             and the position silently ignored.
+        points_only: fit point components alone -- no mesh, no prior
+            (`pointonly.run_points`). Positions from ``point_sources`` (a
+            list) or detected above ``point_significance``, at most
+            ``max_points``; statistical errors on flux and position. MFS only.
+            Returns a `pointonly.PointRunResult`.
+        point_refine: with ``points_only`` and given positions, False keeps
+            them fixed (flux errors only).
         input_parameters: what to write to ``input_parameters.json`` in
             ``out``. The CLI passes its options in ``--config`` form, so a run
             can be repeated with ``pyuvimage fit --config``; a direct call
@@ -502,6 +511,21 @@ def run(
         )
     if mode not in ("mfs", "cube"):
         raise ValueError("mode must be 'mfs' or 'cube'")
+    if points_only:
+        if mode != "mfs":
+            raise NotImplementedError("--points-only fits an MFS model only")
+        from .pointonly import run_points
+
+        return run_points(
+            dataset, fov, out=out, pixel_scale=pixel_scale, oversample=oversample,
+            image_centre=image_centre,
+            positions=point_sources if isinstance(point_sources, list) else None,
+            significance=point_significance, max_points=max_points,
+            refine=point_refine, pb_correction=pb_correction,
+            dish_diameter=dish_diameter, pb_factor=pb_factor, streaming=streaming,
+            chunk_k=chunk_k, kernel_cache=kernel_cache, reload=reload,
+            transformer=transformer, mask_shape=mask_shape, write=write,
+        )
     irregular = _check_mesh_options(mesh_type, emission_mask, positive_only, point_sources)
     if cube_mesh not in CUBE_MESH_MODES:
         raise ValueError(f"cube_mesh must be one of {CUBE_MESH_MODES}, not {cube_mesh!r}")

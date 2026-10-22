@@ -471,6 +471,19 @@ def main(argv: list[str] | None = None) -> int:
         "--max-points", type=int, default=5,
         help="most auto-detected point components to keep (default 5)",
     )
+    p_fit.add_argument(
+        "--points-only", action="store_true",
+        help="fit point components alone, with no mesh and no prior: the "
+             "--point positions, or peaks detected above --point-significance "
+             "(at most --max-points). Flux and position get statistical "
+             "errors (inverse Fisher matrix, inflated by chi^2/N when above "
+             "1). MFS only",
+    )
+    p_fit.add_argument(
+        "--fixed-points", action="store_true",
+        help="with --points-only and --point: keep the given positions fixed "
+             "(flux errors only)",
+    )
 
     p_mask = sub.add_parser(
         "mask", help="paint an emission mask over a FITS image (for --mask)")
@@ -715,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
             point_significance=args.point_significance,
             max_points=args.max_points,
             point_retune=not args.no_point_retune,
+            points_only=args.points_only,
+            point_refine=not args.fixed_points,
             # what was asked for, in --config form: written to
             # input_parameters.json so the run can be repeated exactly
             input_parameters=config_from_args(p_fit, args),

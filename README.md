@@ -218,6 +218,20 @@ chi^2 target, because the residual is then model error rather than sky.
 
 ![point sources](figures/point_sources.png)
 
+**Point sources alone.** `--points-only` drops the mesh and the prior: the
+model is the point components and nothing else, for a field you know to be
+unresolved sources (a calibrator check, quasars, compact continuum sources).
+Positions from `--point` (refined; `--fixed-points` keeps them) or detected
+above `--point-significance`. Fluxes and positions get statistical errors from
+the inverse Fisher matrix of chi^2, scaled up by chi^2/N when the points leave
+structure behind; with a dish diameter the fluxes are also primary-beam
+corrected, and RA/Dec are given.
+
+```bash
+pyuvimage fit mydata/ --fov 3.0 --points-only                 # detect
+pyuvimage fit mydata/ --fov 3.0 --points-only --point 0.70,0.80
+```
+
 Details: [docs/point-sources.md](docs/point-sources.md).
 
 ## Masks and adaptive meshes

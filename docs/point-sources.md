@@ -233,3 +233,36 @@ sitting on bright extended emission has an error bar that is only as good as
 the prior's description of that emission. Detection has no look-elsewhere
 correction: 5 sigma is per trial position, not per map. And the resolved-vs-
 unresolved threshold (delta chi^2 = 9) was set on mocks, not on real data.
+
+## Points only (`--points-only`)
+
+No mesh, no prior: the model is `V = sum_k a_k exp(-2 pi i (x_k u + y_k v))`
+(`pointonly.py`). The fluxes are linear and profiled out exactly
+(`a = C^-1 Dp`, with `C` and `Dp` the point columns' Gram matrix and data term:
+from the visibilities in memory, from the oversampled kernel and dirty image
+when streamed; the two agree to 1e-8 in chi^2). Positions are searched:
+
+- **given** (`--point x,y`): kept, refined unless `--fixed-points`;
+- **detected**: the most significant positive peak of the profile-likelihood
+  significance map on the image grid (the accepted points' fluxes re-fitted at
+  every pixel), refined (sub-pixel scan, then Nelder-Mead), kept if its flux
+  clears `--point-significance`, up to `--max-points`, at least 0.75 beams
+  apart; points that a later one leaves below the cut are dropped.
+
+**Uncertainties** are statistical. With free positions: the inverse Fisher
+matrix of the full chi^2 in (flux, y, x), `cov = 2 H^-1`, the Hessian by
+central differences (exact in the fluxes, which enter quadratically). With
+fixed positions: `C^-1`. Both are multiplied by `max(1, chi^2/N)` when the
+points do not describe the data to the noise -- a source that is not a point,
+or one not modelled -- as for the mesh fits. Over 60 noise realisations of a
+two-point mock (27 and 92 sigma) the pulls (estimate - truth) / error have
+widths 0.88-1.07 and means within 0.17 for both fluxes and both positions.
+
+Outputs: `point_sources.json` (and `fit_parameters.json`) with, per point,
+the offset from the image centre and from the phase centre, RA/Dec through
+the products' WCS, flux and errors, the primary-beam response at the position
+and the PB-corrected flux (when the dish diameter is known), and the full
+covariance; `model.fits` (each flux in its nearest pixel), `model_reconvolved
+.fits` (the points restored with the fitted beam), `dirty_image.fits`,
+`residual.fits` (sigma) and `summary.png`. MFS only; no Gaussian widths (a
+resolved source shows up as residual structure and chi^2/N > 1).
