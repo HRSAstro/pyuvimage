@@ -735,6 +735,7 @@ class TermsAccumulator:
         if self.q:
             if self.q % 2:
                 raise ValueError("point_oversample must be even")
+            autoarray_streaming()            # a clear message on an old autoarray
             from autoarray.inversion.inversion.interferometer.inversion_interferometer_util import (
                 fine_grid_shapes_from,
             )
